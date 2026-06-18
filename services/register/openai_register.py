@@ -581,6 +581,7 @@ class PlatformRegistrar:
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
             self._register_user(email, password, index)
+            mailbox["_code_requested_at"] = datetime.now(timezone.utc)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
             code = wait_for_code(mailbox)

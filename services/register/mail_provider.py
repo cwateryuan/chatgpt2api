@@ -365,6 +365,22 @@ def _message_tracking_ref(message: dict[str, Any]) -> str:
     return f"content:{provider}:{mailbox}:{received_value}:{digest}"
 
 
+def _mailbox_code_requested_at(mailbox: dict[str, Any]) -> datetime | None:
+    return _parse_received_at(mailbox.get("_code_requested_at"))
+
+
+def _message_after_code_request(message: dict[str, Any], mailbox: dict[str, Any], *, skew_seconds: int = 5) -> bool:
+    requested_at = _mailbox_code_requested_at(mailbox)
+    if not requested_at:
+        return True
+    received_at = message.get("received_at")
+    if not isinstance(received_at, datetime):
+        return True
+    if not received_at.tzinfo:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    return received_at.timestamp() >= requested_at.timestamp() - skew_seconds
+
+
 class BaseMailProvider:
     name = "unknown"
 
@@ -393,6 +409,9 @@ class BaseMailProvider:
         def extract_unseen_code(message: dict[str, Any]) -> str | None:
             ref = _message_tracking_ref(message)
             if ref in seen_refs:
+                return None
+            if not _message_after_code_request(message, mailbox):
+                seen_refs.add(ref)
                 return None
             code = _extract_code(message)
             if code:
@@ -1355,6 +1374,9 @@ class OutlookTokenProvider(BaseMailProvider):
             for message in self.fetch_recent_messages(mailbox):
                 ref = _message_tracking_ref(message)
                 if ref in seen_refs:
+                    continue
+                if not _message_after_code_request(message, mailbox):
+                    seen_refs.add(ref)
                     continue
                 code = _extract_code(message)
                 if code:
