@@ -49,6 +49,16 @@ def remove_tags(image_rel: str) -> None:
         save_tags(data)
 
 
+def remove_many_tags(image_rels: list[str] | set[str]) -> None:
+    data = load_tags()
+    changed = False
+    for image_rel in image_rels:
+        if data.pop(image_rel, None) is not None:
+            changed = True
+    if changed:
+        save_tags(data)
+
+
 def delete_tag(tag: str) -> int:
     """从所有图片中删除指定标签，返回受影响的图片数。"""
     data = load_tags()

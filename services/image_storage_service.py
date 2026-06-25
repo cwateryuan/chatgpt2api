@@ -337,22 +337,50 @@ class ImageStorageService:
 
     def delete(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
-        removed = False
-        path = _local_image_path(safe_rel)
-        if path.is_file():
-            path.unlink()
-            removed = True
+        return safe_rel in self.delete_many([safe_rel])
+
+    def delete_many(self, rels: list[str]) -> set[str]:
+        safe_rels: list[str] = []
+        seen: set[str] = set()
+        for rel in rels:
+            try:
+                safe_rel = _safe_relative_path(rel)
+            except HTTPException:
+                continue
+            if safe_rel in seen or not _is_image_rel(safe_rel):
+                continue
+            seen.add(safe_rel)
+            safe_rels.append(safe_rel)
+        if not safe_rels:
+            return set()
+
+        removed: set[str] = set()
         with self._index_lock:
             items = self._load_clean_index()
-            item = items.get(safe_rel, {})
-            if item.get("webdav"):
-                try:
-                    removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
-            if safe_rel in items:
-                items.pop(safe_rel, None)
+            changed = False
+            client: WebDAVClient | None = None
+            for safe_rel in safe_rels:
+                removed_local = False
+                path = _local_image_path(safe_rel)
+                if path.is_file():
+                    path.unlink()
+                    removed_local = True
+                    removed.add(safe_rel)
+
+                item = items.get(safe_rel, {})
+                if item.get("webdav"):
+                    try:
+                        if client is None:
+                            client = WebDAVClient(self.settings())
+                        if client.delete(safe_rel):
+                            removed.add(safe_rel)
+                    except ImageStorageError:
+                        if not removed_local:
+                            raise
+                if safe_rel in items:
+                    items.pop(safe_rel, None)
+                    changed = True
+            if changed:
                 self._save_index(items)
         return removed
 

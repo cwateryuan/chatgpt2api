@@ -13,7 +13,7 @@ from PIL import Image, ImageOps
 
 from services.config import config
 from services.image_storage_service import image_storage_service
-from services.image_tags_service import load_tags, remove_tags
+from services.image_tags_service import load_tags, remove_many_tags, remove_tags
 from utils.log import logger
 
 THUMBNAIL_SIZE = (320, 320)
@@ -21,6 +21,25 @@ THUMBNAIL_SIZE = (320, 320)
 
 def _cleanup_empty_dirs(root: Path) -> None:
     for path in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
+def _cleanup_parent_dirs(paths: set[Path], root: Path) -> None:
+    root = root.resolve()
+    candidates: set[Path] = set()
+    for path in paths:
+        current = path.parent.resolve()
+        while current != root:
+            try:
+                current.relative_to(root)
+            except ValueError:
+                break
+            candidates.add(current)
+            current = current.parent
+    for path in sorted(candidates, key=lambda p: len(p.parts), reverse=True):
         try:
             path.rmdir()
         except OSError:
@@ -149,8 +168,6 @@ def cleanup_image_thumbnails() -> int:
     return removed
 
 def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
-    config.cleanup_old_images()
-    cleanup_image_thumbnails()
     all_tags = load_tags()
     items = [
         {
@@ -169,26 +186,48 @@ def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict
 
 def delete_images(paths: list[str] | None = None, start_date: str = "", end_date: str = "", all_matching: bool = False) -> dict[str, int]:
     root = config.images_dir.resolve()
-    targets = [
+    thumbnails_root = config.image_thumbnails_dir.resolve()
+    raw_targets = [
         str(item["path"])
         for item in image_storage_service.list_items("", start_date=start_date, end_date=end_date)
     ] if all_matching else (paths or [])
-    removed = 0
-    for item in targets:
-        path = (root / item).resolve()
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for item in raw_targets:
         try:
+            rel = _safe_relative_path(item)
+            path = (root / rel).resolve()
             path.relative_to(root)
-        except ValueError:
+        except (HTTPException, ValueError):
             continue
-        if image_storage_service.delete(item):
-            removed += 1
-        for thumbnail in (_thumbnail_path(item), config.image_thumbnails_dir / _safe_relative_path(item)):
+        if rel not in seen:
+            seen.add(rel)
+            targets.append(rel)
+
+    removed_items = image_storage_service.delete_many(targets)
+    touched_image_paths: set[Path] = set()
+    touched_thumbnail_paths: set[Path] = set()
+    for item in removed_items:
+        touched_image_paths.add((root / item).resolve())
+        thumbnail_paths = (
+            _thumbnail_path(item),
+            config.image_thumbnails_dir / _safe_relative_path(item),
+        )
+        for thumbnail in thumbnail_paths:
+            try:
+                thumbnail = thumbnail.resolve()
+                thumbnail.relative_to(thumbnails_root)
+            except ValueError:
+                continue
+            touched_thumbnail_paths.add(thumbnail)
             if thumbnail.is_file():
                 thumbnail.unlink()
-        remove_tags(item)
-    _cleanup_empty_dirs(root)
-    _cleanup_empty_dirs(config.image_thumbnails_dir)
-    return {"removed": removed}
+
+    remove_many_tags(removed_items)
+    _cleanup_parent_dirs(touched_image_paths, root)
+    _cleanup_parent_dirs(touched_thumbnail_paths, thumbnails_root)
+    return {"removed": len(removed_items)}
 
 
 def download_images_zip(paths: list[str]) -> io.BytesIO:
