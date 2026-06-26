@@ -32,6 +32,7 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _ACCOUNT_CACHE_TTL_SECONDS = 2.0
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -53,6 +54,7 @@ class AccountService:
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._accounts = self._load_accounts()
+        self._last_full_reload_at = time.monotonic()
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -151,9 +153,46 @@ class AccountService:
         except Exception:
             return False
 
-    def _reload_accounts_locked(self) -> None:
+    def _reload_accounts_locked(self, *, force: bool = False) -> None:
         if self._database_features_enabled():
+            now = time.monotonic()
+            if not force and now - self._last_full_reload_at < self._ACCOUNT_CACHE_TTL_SECONDS:
+                return
             self._accounts = self._load_accounts()
+            self._last_full_reload_at = now
+
+    def _load_account_for_token_locked(self, access_token: str) -> tuple[str, dict | None]:
+        token = self._resolve_access_token_locked(access_token)
+        cached = self._accounts.get(token)
+        if not self._database_features_enabled():
+            return token, dict(cached) if cached else None
+        candidates = [token]
+        alias = runtime_state.get_alias(token)
+        if alias and alias not in candidates:
+            candidates.append(alias)
+        raw = str(access_token or "").strip()
+        if raw and raw not in candidates:
+            candidates.append(raw)
+        had_error = False
+        for candidate in candidates:
+            try:
+                loaded = self.storage.get_account(candidate)
+            except Exception:
+                had_error = True
+                loaded = None
+            account = self._normalize_account(loaded) if isinstance(loaded, dict) else None
+            if account is None:
+                continue
+            resolved = str(account.get("access_token") or candidate)
+            self._accounts[resolved] = account
+            if resolved != token:
+                self._accounts.pop(token, None)
+            return resolved, dict(account)
+        if had_error and cached:
+            return token, dict(cached)
+        if token:
+            self._accounts.pop(token, None)
+        return token, None
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -329,17 +368,12 @@ class AccountService:
 
     def _get_account_for_token(self, access_token: str) -> tuple[str, dict | None]:
         with self._lock:
-            self._reload_accounts_locked()
-            resolved = self._resolve_access_token_locked(access_token)
-            account = self._accounts.get(resolved)
-            return resolved, dict(account) if account else None
+            return self._load_account_for_token_locked(access_token)
 
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            self._reload_accounts_locked()
-            resolved = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(resolved)
+            resolved, current = self._load_account_for_token_locked(access_token)
             if current is None:
                 return
             next_item = dict(current)
@@ -943,15 +977,26 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
-        excluded = set(excluded_tokens or set())
+        excluded = {str(token or "").strip() for token in (excluded_tokens or set()) if str(token or "").strip()}
+        if self._database_features_enabled():
+            try:
+                items = [
+                    item
+                    for item in self.storage.list_image_candidate_accounts(excluded)
+                    if isinstance(item, dict)
+                ]
+            except Exception:
+                items = list(self._accounts.values())
+        else:
+            items = list(self._accounts.values())
         return [
             token
-            for item in self._accounts.values()
+            for item in items
             if self._is_image_account_available(item)
                and self._account_matches_plan_type(item, plan_type)
                and self._account_matches_any_plan_type(item, plan_types)
                and self._account_matches_source_type(item, source_type)
-               and (token := item.get("access_token") or "")
+               and (token := str(item.get("access_token") or ""))
                and token not in excluded
         ]
 
@@ -986,7 +1031,6 @@ class AccountService:
     ) -> str:
         with self._image_slot_condition:
             while True:
-                self._reload_accounts_locked()
                 ready_tokens = self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if not ready_tokens:
                     raise RuntimeError(
@@ -1074,9 +1118,7 @@ class AccountService:
         if not access_token:
             return
         with self._lock:
-            self._reload_accounts_locked()
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            access_token, current = self._load_account_for_token_locked(access_token)
             if current is None:
                 return
             next_item = dict(current)
@@ -1103,9 +1145,7 @@ class AccountService:
         if not access_token:
             return None
         with self._lock:
-            self._reload_accounts_locked()
-            access_token = self._resolve_access_token_locked(access_token)
-            account = self._accounts.get(access_token)
+            _resolved, account = self._load_account_for_token_locked(access_token)
             return dict(account) if account else None
 
     def list_accounts(self) -> list[dict]:
@@ -1260,9 +1300,7 @@ class AccountService:
         if not access_token:
             return None
         with self._lock:
-            self._reload_accounts_locked()
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            access_token, current = self._load_account_for_token_locked(access_token)
             if current is None:
                 return None
             account = self._normalize_account({**current, **updates, "access_token": access_token})
@@ -1283,9 +1321,7 @@ class AccountService:
 
     def _record_refresh_success(self, access_token: str) -> None:
         with self._lock:
-            self._reload_accounts_locked()
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            access_token, current = self._load_account_for_token_locked(access_token)
             if current is None:
                 return
             next_item = dict(current)
@@ -1321,9 +1357,7 @@ class AccountService:
     ) -> bool:
         now = datetime.now(timezone.utc)
         with self._lock:
-            self._reload_accounts_locked()
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            access_token, current = self._load_account_for_token_locked(access_token)
             if current is None:
                 return True
             should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
@@ -1350,9 +1384,7 @@ class AccountService:
             return None
         self.release_image_slot(access_token)
         with self._lock:
-            self._reload_accounts_locked()
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            access_token, current = self._load_account_for_token_locked(access_token)
             if current is None:
                 return None
             next_item = dict(current)
@@ -1394,12 +1426,14 @@ class AccountService:
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            result = OpenAIBackendAPI(active_token).get_user_info()
+            with OpenAIBackendAPI(active_token) as backend:
+                result = backend.get_user_info()
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    result = OpenAIBackendAPI(refreshed_token).get_user_info()
+                    with OpenAIBackendAPI(refreshed_token) as backend:
+                        result = backend.get_user_info()
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
                         refreshed_token,

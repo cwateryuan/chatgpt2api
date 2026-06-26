@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -200,6 +201,18 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "OpenAIBackendAPI":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -861,9 +874,9 @@ class OpenAIBackendAPI:
             candidate_path = Path(os.path.expanduser(image))
             if candidate_path.exists() and candidate_path.is_file():
                 file_name = candidate_path.name
-        image = Image.open(BytesIO(data))
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, "image/png")
+        with Image.open(BytesIO(data)) as image_obj:
+            width, height = image_obj.size
+            mime_type = Image.MIME.get(image_obj.format, "image/png")
         path = "/backend-api/files"
         response = self.session.post(
             self.base_url + path,
@@ -1245,10 +1258,10 @@ class OpenAIBackendAPI:
             mime_type = str(match.group(1) or "").strip().lower()
             payload = str(match.group(2) or "").strip()
         data = base64.b64decode(payload)
-        image = Image.open(BytesIO(data))
-        image.load()
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, mime_type or "image/png")
+        with Image.open(BytesIO(data)) as image:
+            image.load()
+            width, height = image.size
+            mime_type = Image.MIME.get(image.format, mime_type or "image/png")
         extension = mimetypes.guess_extension(mime_type) or ".png"
         return data, f"image_{index}{extension}", mime_type, width, height
 
@@ -1508,12 +1521,15 @@ class OpenAIBackendAPI:
         if not download_url:
             raise RuntimeError(f"download url not found for artifact: {artifact}")
         response = self.session.get(download_url, timeout=300)
-        ensure_ok(response, "artifact_download")
-        content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
-        file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
-        target_path = self._unique_editable_path(output_dir / file_name)
-        target_path.write_bytes(response.content)
-        return target_path
+        try:
+            ensure_ok(response, "artifact_download")
+            content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
+            file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
+            target_path = self._unique_editable_path(output_dir / file_name)
+            target_path.write_bytes(response.content)
+            return target_path
+        finally:
+            response.close()
 
     def _resolve_editable_download_url(self, conversation_id: str, artifact: EditableFileArtifact) -> str:
         ids: list[str] = []
@@ -2463,14 +2479,23 @@ class OpenAIBackendAPI:
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
-    def download_image_bytes(self, urls: list[str]) -> list[bytes]:
-        images = []
+    def iter_image_bytes(self, urls: list[str]) -> Iterator[bytes]:
+        seen_hashes: set[tuple[int, bytes]] = set()
         for url in urls:
             response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
-        return images
+            try:
+                ensure_ok(response, "image_download")
+                content = bytes(response.content)
+            finally:
+                response.close()
+            fingerprint = (len(content), hashlib.blake2b(content, digest_size=16).digest())
+            if fingerprint in seen_hashes:
+                continue
+            seen_hashes.add(fingerprint)
+            yield content
+
+    def download_image_bytes(self, urls: list[str]) -> list[bytes]:
+        return list(self.iter_image_bytes(urls))
 
     def stream_conversation(
             self,

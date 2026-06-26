@@ -32,19 +32,23 @@ def _composite_mask(
     result: list[tuple[bytes, str, str]] = []
     for i, (data, filename, mime_type) in enumerate(images):
         mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
-        img = Image.open(BytesIO(data)).convert("RGBA")
-        mask_img = Image.open(BytesIO(mask_data))
-        if mask_img.mode == "RGBA":
-            alpha = mask_img.split()[3]
-        elif mask_img.mode == "L":
-            alpha = mask_img
-        else:
-            alpha = mask_img.convert("L")
-        alpha = alpha.resize(img.size, Image.LANCZOS)
-        img.putalpha(alpha)
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        result.append((buf.getvalue(), filename, "image/png"))
+        with Image.open(BytesIO(data)) as source_img, Image.open(BytesIO(mask_data)) as mask_img:
+            img = source_img.convert("RGBA")
+            if mask_img.mode == "RGBA":
+                alpha = mask_img.split()[3]
+            elif mask_img.mode == "L":
+                alpha = mask_img.copy()
+            else:
+                alpha = mask_img.convert("L")
+            try:
+                alpha = alpha.resize(img.size, Image.LANCZOS)
+                img.putalpha(alpha)
+                with BytesIO() as buf:
+                    img.save(buf, format="PNG")
+                    result.append((buf.getvalue(), filename, "image/png"))
+            finally:
+                alpha.close()
+                img.close()
     return result
 
 

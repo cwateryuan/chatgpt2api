@@ -168,6 +168,8 @@ class ImageStorageService:
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
+        self._cleanup_lock = Lock()
+        self._last_save_cleanup_at = 0.0
 
     @staticmethod
     def _db_backend():
@@ -210,8 +212,16 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
-    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
+    def _cleanup_before_save(self) -> None:
+        now = time.monotonic()
+        with self._cleanup_lock:
+            if now - self._last_save_cleanup_at < 600:
+                return
+            self._last_save_cleanup_at = now
         config.cleanup_old_images()
+
+    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
+        self._cleanup_before_save()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "both"}:

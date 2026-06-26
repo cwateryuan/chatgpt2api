@@ -59,6 +59,14 @@ class StorageBackend(ABC):
     def get_account(self, access_token: str) -> dict[str, Any] | None:
         return None
 
+    def list_image_candidate_accounts(self, excluded_tokens: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
+        excluded = {str(token or "").strip() for token in (excluded_tokens or []) if str(token or "").strip()}
+        return [
+            item
+            for item in self.load_accounts()
+            if str(item.get("access_token") or item.get("accessToken") or "").strip() not in excluded
+        ]
+
     def save_image(self, item: dict[str, Any]) -> None:
         raise NotImplementedError
 

@@ -86,6 +86,7 @@ class AccountModel(Base):
     quota = Column(Integer, nullable=True)
     success = Column(Integer, nullable=True)
     fail = Column(Integer, nullable=True)
+    image_quota_unknown = Column(Boolean, default=False, nullable=False)
     last_used_at = Column(String(64), nullable=True)
     refresh_token = Column(Text, nullable=True)
     data = Column(Text, nullable=False)
@@ -268,6 +269,41 @@ class DatabaseStorageBackend(StorageBackend):
         try:
             row = session.query(AccountModel).filter(AccountModel.access_token == token).first()
             return self._account_from_row(row)
+        finally:
+            session.close()
+
+    def list_image_candidate_accounts(self, excluded_tokens: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
+        excluded = {_string(token) for token in (excluded_tokens or []) if _string(token)}
+        session = self.Session()
+        try:
+            query = session.query(
+                AccountModel.access_token,
+                AccountModel.status,
+                AccountModel.source_type,
+                AccountModel.type,
+                AccountModel.quota,
+                AccountModel.success,
+                AccountModel.fail,
+                AccountModel.image_quota_unknown,
+                AccountModel.last_used_at,
+            )
+            if excluded:
+                query = query.filter(~AccountModel.access_token.in_(excluded))
+            rows = query.order_by(AccountModel.id.asc()).all()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                items.append({
+                    "access_token": row.access_token,
+                    "status": row.status or "正常",
+                    "source_type": row.source_type or "web",
+                    "type": row.type or "free",
+                    "quota": int(row.quota or 0),
+                    "success": int(row.success or 0),
+                    "fail": int(row.fail or 0),
+                    "last_used_at": row.last_used_at,
+                    "image_quota_unknown": bool(row.image_quota_unknown),
+                })
+            return items
         finally:
             session.close()
 
@@ -699,6 +735,7 @@ class DatabaseStorageBackend(StorageBackend):
         row.quota = _int_or_none(account.get("quota"))
         row.success = _int_or_none(account.get("success"))
         row.fail = _int_or_none(account.get("fail"))
+        row.image_quota_unknown = bool(account.get("image_quota_unknown"))
         row.last_used_at = _string(account.get("last_used_at")) or None
         row.refresh_token = _string(account.get("refresh_token")) or None
         row.data = _json_dumps(account)
@@ -801,6 +838,7 @@ class DatabaseStorageBackend(StorageBackend):
                 "quota": "INTEGER",
                 "success": "INTEGER",
                 "fail": "INTEGER",
+                "image_quota_unknown": "BOOLEAN",
                 "last_used_at": "VARCHAR(64)",
                 "refresh_token": "TEXT",
                 "updated_at": timestamp_type,
@@ -820,6 +858,19 @@ class DatabaseStorageBackend(StorageBackend):
                     if column in existing:
                         continue
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
+            if "accounts" in table_columns:
+                try:
+                    rows = conn.execute(text("SELECT id, data FROM accounts WHERE image_quota_unknown IS NULL")).fetchall()
+                    for row_id, raw_data in rows:
+                        conn.execute(
+                            text("UPDATE accounts SET image_quota_unknown = :value WHERE id = :id"),
+                            {
+                                "value": bool(_as_dict(raw_data).get("image_quota_unknown")),
+                                "id": row_id,
+                            },
+                        )
+                except Exception:
+                    pass
 
             index_specs = [
                 ("idx_accounts_status", "accounts", "status"),

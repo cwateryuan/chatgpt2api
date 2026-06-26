@@ -91,8 +91,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/tasks/summary")
     async def get_task_summary(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        accounts = await run_in_threadpool(account_service.list_accounts)
-        image_inflight = sum(max(0, int(item.get("image_inflight") or 0)) for item in accounts)
+        image_inflight = await run_in_threadpool(runtime_state.image_inflight_total)
         return {
             "image_inflight": image_inflight,
             "total": image_inflight,

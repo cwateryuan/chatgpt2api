@@ -294,6 +294,19 @@ return current
             self._cleanup_memory_locked()
             return {token: int(self._memory_inflight.get(token, (0, 0.0))[0]) for token in cleaned}
 
+    def image_inflight_total(self) -> int:
+        if self._redis is not None:
+            try:
+                total = 0
+                for key in self._redis.scan_iter("account:image:inflight:*", count=1000):
+                    total += max(0, int(self._redis.get(key) or 0))
+                return total
+            except Exception:
+                return 0
+        with self._lock:
+            self._cleanup_memory_locked()
+            return sum(max(0, int(item[0])) for item in self._memory_inflight.values())
+
     def next_text_index(self) -> int:
         if self._redis is not None:
             try:

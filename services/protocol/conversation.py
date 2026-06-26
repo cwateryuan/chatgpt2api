@@ -13,6 +13,7 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
+from services.memory import trim_memory
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
@@ -265,7 +266,7 @@ def count_text_tokens(text: str, model: str) -> int:
 
 
 def format_image_result(
-    items: list[dict[str, Any]],
+    items: Iterable[dict[str, Any]],
     prompt: str,
     response_format: str,
     base_url: str | None = None,
@@ -275,24 +276,51 @@ def format_image_result(
     data: list[dict[str, Any]] = []
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
-        if not b64_json:
+        image_payload = item.get("image_bytes")
+        if isinstance(image_payload, bytearray):
+            image_payload = bytes(image_payload)
+        if not isinstance(image_payload, bytes):
+            if not b64_json:
+                continue
+            image_payload = base64.b64decode(b64_json)
+        if not image_payload:
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
+        url = save_image_bytes(image_payload, base_url)
         if response_format == "b64_json":
+            if not b64_json:
+                b64_json = base64.b64encode(image_payload).decode("ascii")
             data.append({
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": url,
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": url,
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if message and not data:
         result["message"] = message
     return result
+
+
+def format_downloaded_image_result(
+    backend: OpenAIBackendAPI,
+    image_urls: list[str],
+    prompt: str,
+    response_format: str,
+    base_url: str | None = None,
+    created: int | None = None,
+) -> dict[str, Any]:
+    return format_image_result(
+        ({"image_bytes": image_data} for image_data in backend.iter_image_bytes(image_urls)),
+        prompt,
+        response_format,
+        base_url,
+        created,
+    )
 
 
 @dataclass
@@ -681,12 +709,16 @@ def text_backend() -> OpenAIBackendAPI:
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
+    close_source_backend = getattr(backend, "close", None)
+    if callable(close_source_backend):
+        close_source_backend()
     emitted = False
     while True:
         if token and token in attempted_tokens:
             raise RuntimeError("no available text account")
         if token:
             attempted_tokens.add(token)
+        active_backend: OpenAIBackendAPI | None = None
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(active_backend, messages=request.messages, model=request.model, prompt=request.prompt):
@@ -710,6 +742,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 if token:
                     continue
             raise
+        finally:
+            if active_backend is not None:
+                active_backend.close()
 
 
 def collect_text(backend: OpenAIBackendAPI, request: ConversationRequest) -> str:
@@ -929,12 +964,9 @@ def stream_image_outputs(
     if image_urls:
         if request.progress_callback:
             request.progress_callback("receiving_image")
-        image_items = [
-            {"b64_json": base64.b64encode(image_data).decode("ascii")}
-            for image_data in backend.download_image_bytes(image_urls)
-        ]
-        data = format_image_result(
-            image_items,
+        data = format_downloaded_image_result(
+            backend,
+            image_urls,
             request.prompt,
             request.response_format,
             request.base_url,
@@ -1026,12 +1058,9 @@ def stream_image_outputs(
                 if image_urls:
                     if request.progress_callback:
                         request.progress_callback("receiving_image")
-                    image_items = [
-                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                        for image_data in backend.download_image_bytes(image_urls)
-                    ]
-                    data = format_image_result(
-                        image_items,
+                    data = format_downloaded_image_result(
+                        backend,
+                        image_urls,
                         request.prompt,
                         request.response_format,
                         request.base_url,
@@ -1138,12 +1167,9 @@ def stream_image_outputs(
             if image_urls:
                 if request.progress_callback:
                     request.progress_callback("receiving_image")
-                image_items = [
-                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
-                    for image_data in backend.download_image_bytes(image_urls)
-                ]
-                data = format_image_result(
-                    image_items,
+                data = format_downloaded_image_result(
+                    backend,
+                    image_urls,
                     request.prompt,
                     request.response_format,
                     request.base_url,
@@ -1266,6 +1292,7 @@ def _generate_single_image(
             "account_found": bool(account),
             "index": index,
         })
+        backend: OpenAIBackendAPI | None = None
         try:
             backend = OpenAIBackendAPI(access_token=token)
             if request.progress_callback:
@@ -1439,6 +1466,10 @@ def _generate_single_image(
                     time.sleep(wait_secs)
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+        finally:
+            if backend is not None:
+                backend.close()
+            trim_memory("image_generation")
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:

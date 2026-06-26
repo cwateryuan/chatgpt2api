@@ -564,40 +564,35 @@ class ImageTaskService:
         started = time.time()
         try:
             from services.openai_backend_api import OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            from services.protocol.conversation import format_downloaded_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
-            file_ids, sediment_ids = backend._poll_image_results(
-                conversation_id,
-                extra_timeout_secs,
-            )
-            if not file_ids and not sediment_ids:
-                raise RuntimeError(
-                    f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
+            backend = OpenAIBackendAPI()
+            try:
+                file_ids, sediment_ids = backend._poll_image_results(
+                    conversation_id,
+                    extra_timeout_secs,
                 )
+                if not file_ids and not sediment_ids:
+                    raise RuntimeError(
+                        f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
+                    )
 
-            image_urls = backend.resolve_conversation_image_urls(
-                conversation_id, file_ids, sediment_ids, poll=False,
-            )
-            if not image_urls:
-                raise RuntimeError("图片 URL 解析失败")
+                image_urls = backend.resolve_conversation_image_urls(
+                    conversation_id, file_ids, sediment_ids, poll=False,
+                )
+                if not image_urls:
+                    raise RuntimeError("图片 URL 解析失败")
 
-            image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                for image_data in backend.download_image_bytes(image_urls)
-            ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
-            with self._lock:
-                task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
-            data = format_image_result(
-                image_items,
-                "",  # prompt 已不重要，结果已经拿到了
-                "b64_json",
-                "",
-                int(time.time()),
-            )["data"]
+                data = format_downloaded_image_result(
+                    backend,
+                    image_urls,
+                    "",  # prompt 已不重要，结果已经拿到了
+                    "b64_json",
+                    "",
+                    int(time.time()),
+                )["data"]
+            finally:
+                backend.close()
             self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
             self._log_call(
                 identity,

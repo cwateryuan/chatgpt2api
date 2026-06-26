@@ -76,6 +76,14 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertTrue((self.images_dir / stored.rel).is_file())
         self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
 
+    def test_save_cleanup_is_rate_limited(self):
+        service = self.service()
+
+        service.save(png_bytes(), "http://app.test")
+        service.save(png_bytes(), "http://app.test")
+
+        self.assertEqual(self.mock_config.cleanup_old_images.call_count, 1)
+
     def test_webdav_mode_uploads_without_local_file(self):
         self.settings.update({
             "enabled": True,

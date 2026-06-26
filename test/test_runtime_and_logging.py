@@ -9,7 +9,7 @@ from starlette.datastructures import Headers
 
 from api.support import resolve_client_ip
 from services.protocol.conversation import build_image_prompt
-from services.runtime_config import configure_threadpool_tokens
+from services.runtime_config import configure_thread_stack_size, configure_threadpool_tokens
 
 
 class _Client:
@@ -50,6 +50,14 @@ class RuntimeAndLoggingTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"APP_THREADPOOL_TOKENS": "7"}):
             self.assertEqual(anyio.run(run_check), 7)
+
+    def test_configure_thread_stack_size_uses_environment(self):
+        with (
+            patch.dict(os.environ, {"APP_THREAD_STACK_SIZE_KB": "1024"}),
+            patch("services.runtime_config.threading.stack_size", return_value=0) as stack_size,
+        ):
+            self.assertEqual(configure_thread_stack_size(), 1024 * 1024)
+            stack_size.assert_called_once_with(1024 * 1024)
 
 
 if __name__ == "__main__":
