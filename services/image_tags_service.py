@@ -8,6 +8,16 @@ from services.config import DATA_DIR
 TAGS_FILE = DATA_DIR / "image_tags.json"
 
 
+def _db_backend():
+    try:
+        from services.config import config
+
+        backend = config.get_storage_backend()
+        return backend if backend.supports_database_features() is True else None
+    except Exception:
+        return None
+
+
 def _ensure_file() -> None:
     TAGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     if not TAGS_FILE.exists():
@@ -15,6 +25,9 @@ def _ensure_file() -> None:
 
 
 def load_tags() -> dict[str, list[str]]:
+    db = _db_backend()
+    if db is not None:
+        return db.load_image_tags()
     _ensure_file()
     try:
         data = json.loads(TAGS_FILE.read_text(encoding="utf-8"))
@@ -24,6 +37,11 @@ def load_tags() -> dict[str, list[str]]:
 
 
 def save_tags(data: dict[str, list[str]]) -> None:
+    db = _db_backend()
+    if db is not None:
+        for rel, tags in data.items():
+            db.set_image_tags(str(rel), [str(tag) for tag in tags])
+        return
     _ensure_file()
     TAGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -33,6 +51,9 @@ def get_tags(image_rel: str) -> list[str]:
 
 
 def set_tags(image_rel: str, tags: list[str]) -> list[str]:
+    db = _db_backend()
+    if db is not None:
+        return db.set_image_tags(image_rel, tags)
     data = load_tags()
     cleaned = list(dict.fromkeys(t.strip() for t in tags if t.strip()))
     if cleaned:
@@ -44,12 +65,20 @@ def set_tags(image_rel: str, tags: list[str]) -> list[str]:
 
 
 def remove_tags(image_rel: str) -> None:
+    db = _db_backend()
+    if db is not None:
+        db.remove_image_tags(image_rel)
+        return
     data = load_tags()
     if data.pop(image_rel, None) is not None:
         save_tags(data)
 
 
 def remove_many_tags(image_rels: list[str] | set[str]) -> None:
+    db = _db_backend()
+    if db is not None:
+        db.remove_many_image_tags(image_rels)
+        return
     data = load_tags()
     changed = False
     for image_rel in image_rels:
@@ -61,6 +90,9 @@ def remove_many_tags(image_rels: list[str] | set[str]) -> None:
 
 def delete_tag(tag: str) -> int:
     """从所有图片中删除指定标签，返回受影响的图片数。"""
+    db = _db_backend()
+    if db is not None:
+        return db.delete_image_tag(tag)
     data = load_tags()
     count = 0
     for rel in list(data):
@@ -75,6 +107,9 @@ def delete_tag(tag: str) -> int:
 
 
 def get_all_tags() -> list[str]:
+    db = _db_backend()
+    if db is not None:
+        return db.list_image_tags()
     data = load_tags()
     seen: set[str] = set()
     result: list[str] = []

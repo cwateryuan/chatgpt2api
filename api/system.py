@@ -25,6 +25,7 @@ from services.image_storage_service import ImageStorageError, image_storage_serv
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
+from services.runtime_state import runtime_state
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -95,13 +96,26 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/images")
-    async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
+    async def get_images(
+        request: Request,
+        start_date: str = "",
+        end_date: str = "",
+        tag: str = "",
+        q: str = "",
+        page: int = 1,
+        page_size: int = 60,
+        authorization: str | None = Header(default=None),
+    ):
         require_admin(authorization)
         return await run_in_threadpool(
             list_images,
             resolve_image_base_url(request),
             start_date.strip(),
             end_date.strip(),
+            tag.strip(),
+            q.strip(),
+            page,
+            page_size,
         )
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
@@ -185,6 +199,7 @@ def create_router(app_version: str) -> APIRouter:
         return {
             "backend": storage.get_backend_info(),
             "health": storage.health_check(),
+            "redis": runtime_state.health_check(),
         }
 
     @router.post("/api/backup/test")
@@ -317,6 +332,7 @@ def create_router(app_version: str) -> APIRouter:
             "healthy": healthy,
             "version": app_version,
             "storage": {"backend": storage.get_backend_info(), "health": storage_health},
+            "redis": runtime_state.health_check(),
             "proxy_runtime": proxy_settings.get_runtime_status(),
             "accounts": stats,
         }

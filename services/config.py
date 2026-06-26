@@ -512,14 +512,26 @@ class ConfigStore:
     def cleanup_old_images(self) -> int:
         cutoff = time.time() - self.image_retention_days * 86400
         removed = 0
+        removed_rels: list[str] = []
         for path in self.images_dir.rglob("*"):
             if path.is_file() and path.stat().st_mtime < cutoff:
+                try:
+                    removed_rels.append(path.relative_to(self.images_dir).as_posix())
+                except Exception:
+                    pass
                 path.unlink()
                 removed += 1
         for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
             try:
                 path.rmdir()
             except OSError:
+                pass
+        if removed_rels:
+            try:
+                backend = self.get_storage_backend()
+                if backend.supports_database_features():
+                    backend.delete_image_records(removed_rels)
+            except Exception:
                 pass
         return removed
 

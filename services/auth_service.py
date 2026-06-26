@@ -72,6 +72,24 @@ class AuthService:
     def _save(self) -> None:
         self.storage.save_auth_keys(self._items)
 
+    def _database_features_enabled(self) -> bool:
+        try:
+            return bool(self.storage.supports_database_features())
+        except Exception:
+            return False
+
+    def _save_item(self, item: dict[str, object]) -> None:
+        if self._database_features_enabled():
+            self.storage.upsert_auth_key(dict(item))
+            return
+        self._save()
+
+    def _delete_item(self, key_id: str) -> None:
+        if self._database_features_enabled():
+            self.storage.delete_auth_key_ids([key_id])
+            return
+        self._save()
+
     def _reload_locked(self) -> None:
         self._items = self._load()
 
@@ -168,7 +186,7 @@ class AuthService:
                 "last_used_at": None,
             }
             self._items.append(item)
-            self._save()
+            self._save_item(item)
             return self._public_item(item), raw_key
 
     def update_key(
@@ -201,7 +219,7 @@ class AuthService:
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
                 self._items[index] = next_item
-                self._save()
+                self._save_item(next_item)
                 return self._public_item(next_item)
         return None
 
@@ -219,7 +237,7 @@ class AuthService:
             ]
             if len(self._items) == before:
                 return False
-            self._save()
+            self._delete_item(normalized_id)
             return True
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:
@@ -228,6 +246,7 @@ class AuthService:
             return None
         candidate_hash = _hash_key(candidate)
         with self._lock:
+            self._reload_locked()
             for index, item in enumerate(self._items):
                 if not bool(item.get("enabled", True)):
                     continue
@@ -242,7 +261,7 @@ class AuthService:
                 last_flush_at = self._last_used_flush_at.get(item_id)
                 if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
                     try:
-                        self._save()
+                        self._save_item(next_item)
                         self._last_used_flush_at[item_id] = now
                     except Exception:
                         pass

@@ -60,6 +60,16 @@ class LogService:
             return False
         return True
 
+    @staticmethod
+    def _db_backend():
+        try:
+            from services.config import config
+
+            backend = config.get_storage_backend()
+            return backend if backend.supports_database_features() is True else None
+        except Exception:
+            return None
+
     def add(self, type: str, summary: str = "", detail: dict[str, Any] | None = None, **data: Any) -> None:
         item = {
             "id": uuid4().hex,
@@ -68,10 +78,17 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
+        db = self._db_backend()
+        if db is not None:
+            db.add_log(item)
+            return
         with self.path.open("a", encoding="utf-8") as file:
             file.write(self._serialize_item(item) + "\n")
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
+        db = self._db_backend()
+        if db is not None:
+            return db.list_logs(type=type, start_date=start_date, end_date=end_date, limit=limit)
         if not self.path.exists():
             return []
         items: list[dict[str, Any]] = []
@@ -89,6 +106,9 @@ class LogService:
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
+        db = self._db_backend()
+        if db is not None:
+            return {"removed": db.delete_logs(list(target_ids))}
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
         lines = self.path.read_text(encoding="utf-8").splitlines()

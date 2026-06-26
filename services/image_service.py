@@ -167,21 +167,84 @@ def cleanup_image_thumbnails() -> int:
     _cleanup_empty_dirs(thumbnails_root)
     return removed
 
-def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
-    all_tags = load_tags()
-    items = [
-        {
-            **item,
-            "url": str(item.get("url") or f"{base_url.rstrip('/')}/images/{item['path']}"),
-            "thumbnail_url": thumbnail_url(base_url, str(item["path"])),
-            "tags": all_tags.get(str(item["path"]), []),
-        }
-        for item in image_storage_service.list_items(base_url, start_date, end_date)
-    ]
+def _db_backend():
+    try:
+        backend = config.get_storage_backend()
+        return backend if backend.supports_database_features() is True else None
+    except Exception:
+        return None
+
+
+def list_images(
+    base_url: str,
+    start_date: str = "",
+    end_date: str = "",
+    tag: str = "",
+    q: str = "",
+    page: int = 1,
+    page_size: int = 0,
+) -> dict[str, object]:
+    db = _db_backend()
+    total = 0
+    if db is not None:
+        raw_items, total = db.list_images(
+            start_date=start_date,
+            end_date=end_date,
+            tag=tag,
+            q=q,
+            page=page,
+            page_size=page_size or 60,
+        )
+        tag_map = load_tags()
+        items = [
+            {
+                **item,
+                "url": str(item.get("url") or image_storage_service._public_url(str(item["path"]), base_url)),
+                "thumbnail_url": thumbnail_url(base_url, str(item["path"])),
+                "tags": tag_map.get(str(item["path"]), []),
+            }
+            for item in raw_items
+        ]
+    else:
+        all_tags = load_tags()
+        raw_items = image_storage_service.list_items(base_url, start_date, end_date)
+        items = [
+            {
+                **item,
+                "url": str(item.get("url") or f"{base_url.rstrip('/')}/images/{item['path']}"),
+                "thumbnail_url": thumbnail_url(base_url, str(item["path"])),
+                "tags": all_tags.get(str(item["path"]), []),
+            }
+            for item in raw_items
+        ]
+        if tag:
+            items = [item for item in items if tag in item.get("tags", [])]
+        if q:
+            query = q.lower()
+            items = [
+                item for item in items
+                if query in str(item.get("name") or "").lower() or query in str(item.get("path") or "").lower()
+            ]
+        total = len(items)
+        if page_size:
+            safe_page = max(1, int(page or 1))
+            safe_page_size = min(500, max(1, int(page_size or 60)))
+            start = (safe_page - 1) * safe_page_size
+            items = items[start:start + safe_page_size]
     groups: dict[str, list[dict[str, object]]] = {}
     for item in items:
         groups.setdefault(str(item["date"]), []).append(item)
-    return {"items": items, "groups": [{"date": key, "items": value} for key, value in groups.items()]}
+    result: dict[str, object] = {
+        "items": items,
+        "groups": [{"date": key, "items": value} for key, value in groups.items()],
+    }
+    if page_size:
+        result["pagination"] = {
+            "page": max(1, int(page or 1)),
+            "page_size": min(500, max(1, int(page_size or 60))),
+            "total": total,
+        }
+    return result
 
 
 def delete_images(paths: list[str] | None = None, start_date: str = "", end_date: str = "", all_matching: bool = False) -> dict[str, int]:
@@ -273,12 +336,18 @@ def storage_stats() -> dict:
     used_mb = usage.used // (1024 * 1024)
     free_mb = usage.free // (1024 * 1024)
 
-    image_count = 0
-    image_size = 0
-    for p in config.images_dir.rglob("*"):
-        if p.is_file():
-            image_count += 1
-            image_size += p.stat().st_size
+    db = _db_backend()
+    if db is not None:
+        db_stats = db.image_storage_stats()
+        image_count = int(db_stats.get("image_count") or 0)
+        image_size = int(db_stats.get("image_size_bytes") or 0)
+    else:
+        image_count = 0
+        image_size = 0
+        for p in config.images_dir.rglob("*"):
+            if p.is_file():
+                image_count += 1
+                image_size += p.stat().st_size
 
     return {
         "disk_total_mb": total_mb,
@@ -339,6 +408,9 @@ def delete_to_target(target_free_mb: int, dry_run: bool = False) -> dict:
                     tp.unlink()
             remove_tags(rel)
             p.unlink()
+            db = _db_backend()
+            if db is not None:
+                db.delete_image_records([rel])
         freed += size
         removed += 1
 

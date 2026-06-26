@@ -20,6 +20,16 @@ from services.proxy_service import proxy_settings
 CPA_CONFIG_FILE = DATA_DIR / "cpa_config.json"
 
 
+def _db_backend():
+    try:
+        from services.config import config
+
+        backend = config.get_storage_backend()
+        return backend if backend.supports_database_features() is True else None
+    except Exception:
+        return None
+
+
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -73,6 +83,12 @@ class CPAConfig:
         self._pools: list[dict] = self._load()
 
     def _load(self) -> list[dict]:
+        db = _db_backend()
+        if db is not None:
+            try:
+                return [_normalize_pool(item) for item in db.load_named_items("cpa_pools") if isinstance(item, dict)]
+            except Exception:
+                return []
         if not self._store_file.exists():
             return []
         try:
@@ -87,15 +103,21 @@ class CPAConfig:
         return []
 
     def _save(self) -> None:
+        db = _db_backend()
+        if db is not None:
+            db.save_named_items("cpa_pools", self._pools)
+            return
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(json.dumps(self._pools, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def list_pools(self) -> list[dict]:
         with self._lock:
+            self._pools = self._load()
             return [dict(pool) for pool in self._pools]
 
     def get_pool(self, pool_id: str) -> dict | None:
         with self._lock:
+            self._pools = self._load()
             for pool in self._pools:
                 if pool["id"] == pool_id:
                     return dict(pool)
@@ -104,12 +126,14 @@ class CPAConfig:
     def add_pool(self, name: str, base_url: str, secret_key: str) -> dict:
         pool = _normalize_pool({"id": _new_id(), "name": name, "base_url": base_url, "secret_key": secret_key})
         with self._lock:
+            self._pools = self._load()
             self._pools.append(pool)
             self._save()
         return dict(pool)
 
     def update_pool(self, pool_id: str, updates: dict) -> dict | None:
         with self._lock:
+            self._pools = self._load()
             for index, pool in enumerate(self._pools):
                 if pool["id"] != pool_id:
                     continue
@@ -121,6 +145,7 @@ class CPAConfig:
 
     def delete_pool(self, pool_id: str) -> bool:
         with self._lock:
+            self._pools = self._load()
             before = len(self._pools)
             self._pools = [pool for pool in self._pools if pool["id"] != pool_id]
             if len(self._pools) < before:
@@ -130,6 +155,7 @@ class CPAConfig:
 
     def set_import_job(self, pool_id: str, import_job: dict | None) -> dict | None:
         with self._lock:
+            self._pools = self._load()
             for index, pool in enumerate(self._pools):
                 if pool["id"] != pool_id:
                     continue
@@ -142,6 +168,7 @@ class CPAConfig:
 
     def get_import_job(self, pool_id: str) -> dict | None:
         with self._lock:
+            self._pools = self._load()
             for pool in self._pools:
                 if pool["id"] == pool_id:
                     job = pool.get("import_job")

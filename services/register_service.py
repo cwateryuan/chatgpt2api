@@ -16,6 +16,16 @@ from services.register import mail_provider, openai_register
 REGISTER_FILE = DATA_DIR / "register.json"
 
 
+def _db_backend():
+    try:
+        from services.config import config
+
+        backend = config.get_storage_backend()
+        return backend if backend.supports_database_features() is True else None
+    except Exception:
+        return None
+
+
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
     return "\n".join(
         f'{c["email"]}----{c.get("password", "")}----{c["client_id"]}----{c["refresh_token"]}' for c in credentials
@@ -71,17 +81,33 @@ class RegisterService:
             self.start()
 
     def _load(self) -> dict:
+        db = _db_backend()
+        if db is not None:
+            try:
+                data = db.load_named_config("register")
+                if isinstance(data, dict) and data:
+                    return _normalize(data)
+                return _normalize({})
+            except Exception:
+                return _normalize({})
         try:
             return _normalize(json.loads(self._store_file.read_text(encoding="utf-8")))
         except Exception:
             return _normalize({})
 
     def _save(self) -> None:
+        db = _db_backend()
+        if db is not None:
+            db.save_named_config("register", self._config)
+            return
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def get(self) -> dict:
         with self._lock:
+            loaded = self._load()
+            if loaded:
+                self._config = loaded
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         self._redact_outlook_pools(snapshot)
         return snapshot

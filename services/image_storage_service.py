@@ -169,6 +169,14 @@ class ImageStorageService:
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
 
+    @staticmethod
+    def _db_backend():
+        try:
+            backend = config.get_storage_backend()
+            return backend if backend.supports_database_features() is True else None
+        except Exception:
+            return None
+
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
 
@@ -237,10 +245,14 @@ class ImageStorageService:
         }
         if dimensions:
             item["width"], item["height"] = dimensions
-        with self._index_lock:
-            items = self._load_clean_index()
-            items[rel] = item
-            self._save_index(items)
+        db = self._db_backend()
+        if db is not None:
+            db.save_image(item)
+        else:
+            with self._index_lock:
+                items = self._load_clean_index()
+                items[rel] = item
+                self._save_index(items)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
@@ -250,7 +262,8 @@ class ImageStorageService:
         path = _local_image_path(safe_rel)
         if path.is_file():
             return path.read_bytes()
-        item = self._load_clean_index().get(safe_rel, {})
+        db = self._db_backend()
+        item = (db.get_image(safe_rel) if db is not None else None) or self._load_clean_index().get(safe_rel, {})
         if item.get("webdav"):
             return WebDAVClient(self.settings()).get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
@@ -261,14 +274,45 @@ class ImageStorageService:
             return False
         if _local_image_path(safe_rel).is_file():
             return True
-        item = self._load_clean_index().get(safe_rel, {})
+        db = self._db_backend()
+        item = (db.get_image(safe_rel) if db is not None else None) or self._load_clean_index().get(safe_rel, {})
         return bool(item.get("webdav"))
 
     def has_local(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
         return _is_image_rel(safe_rel) and _local_image_path(safe_rel).is_file()
 
-    def list_items(self, base_url: str, start_date: str = "", end_date: str = "") -> list[dict[str, object]]:
+    def list_items(
+        self,
+        base_url: str,
+        start_date: str = "",
+        end_date: str = "",
+        tag: str = "",
+        q: str = "",
+        page: int = 1,
+        page_size: int = 0,
+    ) -> list[dict[str, object]]:
+        db = self._db_backend()
+        if db is not None:
+            items, _total = db.list_images(
+                start_date=start_date,
+                end_date=end_date,
+                tag=tag,
+                q=q,
+                page=page,
+                page_size=page_size,
+            )
+            return [
+                {
+                    **item,
+                    "rel": str(item.get("rel") or item.get("path") or ""),
+                    "path": str(item.get("path") or item.get("rel") or ""),
+                    "url": self._public_url(str(item.get("rel") or item.get("path") or ""), base_url),
+                }
+                for item in items
+                if _is_image_rel(str(item.get("rel") or item.get("path") or ""))
+            ]
+
         with self._index_lock:
             indexed = self._load_clean_index()
             root = config.images_dir
@@ -355,10 +399,10 @@ class ImageStorageService:
             return set()
 
         removed: set[str] = set()
-        with self._index_lock:
-            items = self._load_clean_index()
-            changed = False
+        db = self._db_backend()
+        if db is not None:
             client: WebDAVClient | None = None
+            record_rels: list[str] = []
             for safe_rel in safe_rels:
                 removed_local = False
                 path = _local_image_path(safe_rel)
@@ -367,7 +411,9 @@ class ImageStorageService:
                     removed_local = True
                     removed.add(safe_rel)
 
-                item = items.get(safe_rel, {})
+                item = db.get_image(safe_rel) or {}
+                if item:
+                    record_rels.append(safe_rel)
                 if item.get("webdav"):
                     try:
                         if client is None:
@@ -377,11 +423,37 @@ class ImageStorageService:
                     except ImageStorageError:
                         if not removed_local:
                             raise
-                if safe_rel in items:
-                    items.pop(safe_rel, None)
-                    changed = True
-            if changed:
-                self._save_index(items)
+                if item and not removed_local:
+                    removed.add(safe_rel)
+            db.delete_image_records(record_rels or safe_rels)
+        else:
+            with self._index_lock:
+                items = self._load_clean_index()
+                changed = False
+                client: WebDAVClient | None = None
+                for safe_rel in safe_rels:
+                    removed_local = False
+                    path = _local_image_path(safe_rel)
+                    if path.is_file():
+                        path.unlink()
+                        removed_local = True
+                        removed.add(safe_rel)
+
+                    item = items.get(safe_rel, {})
+                    if item.get("webdav"):
+                        try:
+                            if client is None:
+                                client = WebDAVClient(self.settings())
+                            if client.delete(safe_rel):
+                                removed.add(safe_rel)
+                        except ImageStorageError:
+                            if not removed_local:
+                                raise
+                    if safe_rel in items:
+                        items.pop(safe_rel, None)
+                        changed = True
+                if changed:
+                    self._save_index(items)
         return removed
 
     def sync_all(self) -> dict[str, int]:
@@ -393,6 +465,7 @@ class ImageStorageService:
         failed = 0
         with self._index_lock:
             items = self._load_clean_index()
+            db = self._db_backend()
             client = WebDAVClient(settings)
             for path in sorted(config.images_dir.rglob("*")):
                 if not path.is_file() or not _is_image_rel(path.name):
@@ -420,6 +493,8 @@ class ImageStorageService:
                         "remote_url": remote_url,
                         **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                     }
+                    if db is not None:
+                        db.save_image(items[rel])
                     uploaded += 1
                 except Exception:
                     failed += 1

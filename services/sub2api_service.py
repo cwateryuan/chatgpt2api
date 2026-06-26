@@ -24,6 +24,16 @@ SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
 _TOKEN_REFRESH_SKEW = 5 * 60
 
 
+def _db_backend():
+    try:
+        from services.config import config
+
+        backend = config.get_storage_backend()
+        return backend if backend.supports_database_features() is True else None
+    except Exception:
+        return None
+
+
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -77,6 +87,12 @@ class Sub2APIConfig:
         self._servers: list[dict] = self._load()
 
     def _load(self) -> list[dict]:
+        db = _db_backend()
+        if db is not None:
+            try:
+                return [_normalize_server(item) for item in db.load_named_items("sub2api_servers") if isinstance(item, dict)]
+            except Exception:
+                return []
         if not self._store_file.exists():
             return []
         try:
@@ -88,6 +104,10 @@ class Sub2APIConfig:
         return []
 
     def _save(self) -> None:
+        db = _db_backend()
+        if db is not None:
+            db.save_named_items("sub2api_servers", self._servers)
+            return
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(
             json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n",
@@ -96,10 +116,12 @@ class Sub2APIConfig:
 
     def list_servers(self) -> list[dict]:
         with self._lock:
+            self._servers = self._load()
             return [dict(server) for server in self._servers]
 
     def get_server(self, server_id: str) -> dict | None:
         with self._lock:
+            self._servers = self._load()
             for server in self._servers:
                 if server["id"] == server_id:
                     return dict(server)
@@ -125,6 +147,7 @@ class Sub2APIConfig:
             "group_id": group_id,
         })
         with self._lock:
+            self._servers = self._load()
             self._servers.append(server)
             self._save()
         _token_cache.pop(server["id"], None)
@@ -132,6 +155,7 @@ class Sub2APIConfig:
 
     def update_server(self, server_id: str, updates: dict) -> dict | None:
         with self._lock:
+            self._servers = self._load()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
@@ -147,6 +171,7 @@ class Sub2APIConfig:
 
     def delete_server(self, server_id: str) -> bool:
         with self._lock:
+            self._servers = self._load()
             before = len(self._servers)
             self._servers = [server for server in self._servers if server["id"] != server_id]
             removed = len(self._servers) < before
@@ -158,6 +183,7 @@ class Sub2APIConfig:
 
     def set_import_job(self, server_id: str, import_job: dict | None) -> dict | None:
         with self._lock:
+            self._servers = self._load()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
@@ -170,6 +196,7 @@ class Sub2APIConfig:
 
     def get_import_job(self, server_id: str) -> dict | None:
         with self._lock:
+            self._servers = self._load()
             for server in self._servers:
                 if server["id"] == server_id:
                     job = server.get("import_job")
