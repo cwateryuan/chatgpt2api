@@ -1553,11 +1553,13 @@ class AccountService:
         access_tokens: list[str],
         progress_id: str | None = None,
         defer_invalid_removal: bool = True,
+        include_items: bool = True,
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            items = self.list_accounts()
-            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            result = {"refreshed": 0, "errors": [], "relogined": 0}
+            if include_items:
+                result["items"] = self.list_accounts()
             if progress_id:
                 self.finish_refresh_progress(progress_id, result)
             return result
@@ -1624,12 +1626,13 @@ class AccountService:
                 t.start()
                 relogined += 1
 
-        result = {
+        result: dict[str, Any] = {
             "refreshed": refreshed,
             "errors": errors,
-            "items": self.list_accounts(),
             "relogined": relogined,
         }
+        if include_items:
+            result["items"] = self.list_accounts()
 
         if progress_id:
             self.finish_refresh_progress(progress_id, result)
@@ -1774,6 +1777,22 @@ class AccountService:
             "total_success": total_success,
             "total_fail": total_fail,
             "by_type": by_type,
+        }
+
+    def get_image_pool_metrics(self) -> dict[str, int]:
+        if self._database_features_enabled():
+            try:
+                items = self.storage.list_image_candidate_accounts()
+            except Exception:
+                with self._lock:
+                    items = list(self._accounts.values())
+        else:
+            with self._lock:
+                items = list(self._accounts.values())
+        normal = [item for item in items if item.get("status") == "正常"]
+        return {
+            "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("image_quota_unknown")),
+            "current_available": len(normal),
         }
 
     def account_health(self) -> dict:

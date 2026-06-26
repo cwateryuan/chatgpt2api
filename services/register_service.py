@@ -17,6 +17,10 @@ from services.runtime_state import runtime_state
 REGISTER_FILE = DATA_DIR / "register.json"
 REGISTER_RUN_LOCK = "lock:register:run"
 REGISTER_RUN_LOCK_TTL_SECONDS = 120
+REGISTER_LOG_LIMIT = 120
+REGISTER_SAVE_INTERVAL_SECONDS = 2.0
+REGISTER_RUNTIME_KEYS = {"enabled", "stats", "logs"}
+REGISTER_RUNTIME_CONFIG_KEY = "register_runtime"
 
 
 def _db_backend():
@@ -76,7 +80,7 @@ def _normalize(raw: dict) -> dict:
             "text": str(item.get("text") or ""),
             "level": str(item.get("level") or "info"),
         }
-        for item in logs[-300:]
+        for item in logs[-REGISTER_LOG_LIMIT:]
         if isinstance(item, dict) and str(item.get("text") or "")
     ]
     return cfg
@@ -88,6 +92,8 @@ class RegisterService:
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._lock_owner = ""
+        self._last_save_at = 0.0
+        self._last_metrics_log: dict[str, tuple[int, int, float]] = {}
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -116,14 +122,83 @@ class RegisterService:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
         self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    def _save_runtime(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_save_at < REGISTER_SAVE_INTERVAL_SECONDS:
+            return
+        self._last_save_at = now
+        runtime_payload = self._snapshot(runtime_only=True)
+        db = _db_backend()
+        if db is not None:
+            try:
+                db.save_named_config(REGISTER_RUNTIME_CONFIG_KEY, runtime_payload)
+                return
+            except Exception:
+                pass
+        self._save()
+
+    def _refresh_persisted_runtime_locked(self) -> None:
+        db = _db_backend()
+        if db is not None:
+            try:
+                runtime_payload = db.load_named_config(REGISTER_RUNTIME_CONFIG_KEY)
+            except Exception:
+                runtime_payload = None
+            if isinstance(runtime_payload, dict) and runtime_payload:
+                for key in REGISTER_RUNTIME_KEYS:
+                    if key in runtime_payload:
+                        self._config[key] = runtime_payload[key]
+                return
+        loaded = self._load()
+        if not loaded:
+            return
+        for key in REGISTER_RUNTIME_KEYS:
+            if key in loaded:
+                self._config[key] = loaded[key]
+
+    def _snapshot(self, *, redact: bool = True, runtime_only: bool = False) -> dict:
+        if runtime_only:
+            stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
+            logs = self._config.get("logs") if isinstance(self._config.get("logs"), list) else []
+            return {
+                "enabled": bool(self._config.get("enabled")),
+                "mode": self._config.get("mode"),
+                "total": self._config.get("total"),
+                "threads": self._config.get("threads"),
+                "target_quota": self._config.get("target_quota"),
+                "target_available": self._config.get("target_available"),
+                "check_interval": self._config.get("check_interval"),
+                "stats": json.loads(json.dumps(stats, ensure_ascii=False)),
+                "logs": json.loads(json.dumps(logs[-REGISTER_LOG_LIMIT:], ensure_ascii=False)),
+            }
+        snapshot = json.loads(json.dumps(self._config, ensure_ascii=False))
+        if redact:
+            self._redact_outlook_pools(snapshot)
+        return snapshot
+
+    def _runtime_cfg_locked(self) -> dict:
+        return {
+            "enabled": bool(self._config.get("enabled")),
+            "mode": str(self._config.get("mode") or "total"),
+            "total": int(self._config.get("total") or 1),
+            "threads": int(self._config.get("threads") or 1),
+            "target_quota": int(self._config.get("target_quota") or 1),
+            "target_available": int(self._config.get("target_available") or 1),
+            "check_interval": int(self._config.get("check_interval") or 5),
+        }
+
+    def runtime_snapshot(self) -> dict:
+        with self._lock:
+            if not self._lock_owner:
+                self._refresh_persisted_runtime_locked()
+            return self._snapshot(runtime_only=True)
+
     def get(self) -> dict:
         with self._lock:
             loaded = self._load()
             if loaded:
                 self._config = loaded
-            snapshot = json.loads(json.dumps(self._config, ensure_ascii=False))
-        self._redact_outlook_pools(snapshot)
-        return snapshot
+            return self._snapshot()
 
     @staticmethod
     def _mask_email(email: str) -> str:
@@ -235,6 +310,12 @@ class RegisterService:
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
+            db = _db_backend()
+            if db is not None:
+                try:
+                    db.save_named_config(REGISTER_RUNTIME_CONFIG_KEY, self._snapshot(runtime_only=True))
+                except Exception:
+                    pass
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
@@ -286,33 +367,36 @@ class RegisterService:
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
-            loaded = self._load()
-            if loaded:
-                self._config = loaded
             logs = self._config.get("logs") if isinstance(self._config.get("logs"), list) else []
             logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
-            self._config["logs"] = logs[-300:]
-            self._save()
+            self._config["logs"] = logs[-REGISTER_LOG_LIMIT:]
+            self._save_runtime()
 
     def _pool_metrics(self) -> dict:
-        items = account_service.list_accounts()
-        normal = [item for item in items if item.get("status") == "正常"]
-        return {
-            "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("image_quota_unknown")),
-            "current_available": len(normal),
-        }
+        return account_service.get_image_pool_metrics()
 
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
+        if mode == "total":
+            return submitted >= int(cfg.get("total") or 1)
         metrics = self._pool_metrics()
         self._bump(**metrics)
+        now = time.monotonic()
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            key = "quota"
+            last_available, last_quota, last_at = self._last_metrics_log.get(key, (-1, -1, 0.0))
+            if reached or metrics["current_available"] != last_available or metrics["current_quota"] != last_quota or now - last_at >= 30:
+                self._last_metrics_log[key] = (metrics["current_available"], metrics["current_quota"], now)
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         if mode == "available":
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
+            key = "available"
+            last_available, last_quota, last_at = self._last_metrics_log.get(key, (-1, -1, 0.0))
+            if reached or metrics["current_available"] != last_available or metrics["current_quota"] != last_quota or now - last_at >= 30:
+                self._last_metrics_log[key] = (metrics["current_available"], metrics["current_quota"], now)
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         return submitted >= int(cfg.get("total") or 1)
 
@@ -339,20 +423,25 @@ class RegisterService:
                 stats["avg_seconds"] = round(elapsed / success, 1) if success else 0
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
-            self._save()
+            self._save_runtime()
 
     def _run(self) -> None:
-        threads = int(self.get()["threads"])
+        with self._lock:
+            cfg = self._runtime_cfg_locked()
+        threads = int(cfg["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
-                cfg = self.get()
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                with self._lock:
+                    cfg = self._runtime_cfg_locked()
+                while bool(cfg.get("enabled")) and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
+                with self._lock:
+                    enabled = bool(self._config.get("enabled"))
+                if not futures and (not enabled or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
@@ -370,6 +459,7 @@ class RegisterService:
         with self._lock:
             self._config["enabled"] = False
             self._save()
+            self._save_runtime(force=True)
             lock_owner = self._lock_owner
             self._lock_owner = ""
             if lock_owner:
