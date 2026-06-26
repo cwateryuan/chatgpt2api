@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Sheet, SheetClose, SheetContent, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import webConfig from "@/constants/common-env";
-import { fetchThirdPartyApps, type ThirdPartyAppsSettings } from "@/lib/api";
+import { fetchTaskSummary, fetchThirdPartyApps, type TaskSummary, type ThirdPartyAppsSettings } from "@/lib/api";
 import { getValidatedAuthSession } from "@/lib/auth-session";
 import { cn } from "@/lib/utils";
 import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth";
@@ -44,6 +44,7 @@ export function TopNav() {
   const router = useRouter();
   const [session, setSession] = useState<StoredAuthSession | null | undefined>(undefined);
   const [thirdPartyApps, setThirdPartyApps] = useState<ThirdPartyAppsSettings | null>(null);
+  const [taskSummary, setTaskSummary] = useState<TaskSummary | null>(null);
   const [isCanvasDialogOpen, setIsCanvasDialogOpen] = useState(false);
 
   useEffect(() => {
@@ -99,6 +100,32 @@ export function TopNav() {
     };
   }, [session]);
 
+  useEffect(() => {
+    if (session?.role !== "admin") {
+      setTaskSummary(null);
+      return;
+    }
+    let active = true;
+    const load = async () => {
+      try {
+        const data = await fetchTaskSummary();
+        if (active) {
+          setTaskSummary(data);
+        }
+      } catch {
+        if (active) {
+          setTaskSummary(null);
+        }
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [session]);
+
   const handleLogout = async () => {
     await clearStoredAuthSession();
     router.replace("/login");
@@ -115,6 +142,22 @@ export function TopNav() {
   const canvas = thirdPartyApps?.infinite_canvas;
   const canvasHref = canvas?.enabled && canvas.url.trim() ? buildThirdPartyHref(canvas.url, baseUrl, session.key) : "";
   const canvasDisplayHref = canvasHref ? decodeURIComponent(canvasHref) : "";
+  const currentTaskCount = Math.max(0, Number(taskSummary?.total ?? 0));
+  const renderNavLabel = (item: { href: string; label: string }) => (
+    <>
+      <span>{item.label}</span>
+      {item.href === "/accounts" ? (
+        <span className={cn(
+          "ml-2 inline-flex h-5 shrink-0 items-center rounded-full px-2 text-[10px] font-semibold leading-none",
+          currentTaskCount > 0
+            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-200"
+            : "bg-stone-100 text-stone-500 dark:bg-white/10 dark:text-stone-300",
+        )}>
+          当前任务数 {currentTaskCount}
+        </span>
+      ) : null}
+    </>
+  );
 
   const handleCanvasOpen = () => {
     if (!canvasHref) {
@@ -165,7 +208,7 @@ export function TopNav() {
                     );
                     return (
                       <SheetClose asChild key={item.href}>
-                        <Link href={item.href} className={className}>{item.label}</Link>
+                        <Link href={item.href} className={className}>{renderNavLabel(item)}</Link>
                       </SheetClose>
                     );
                   })}
@@ -212,7 +255,7 @@ export function TopNav() {
                       : "text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-100",
                   )}
                 >
-                  {item.label}
+                  {renderNavLabel(item)}
                   {active ? <span className="absolute inset-x-0 -bottom-[1px] hidden h-0.5 bg-stone-950 dark:bg-white sm:block" /> : null}
                 </Link>
               );

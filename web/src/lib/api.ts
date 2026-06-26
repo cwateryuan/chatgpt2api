@@ -152,6 +152,11 @@ export type ThirdPartyAppsSettings = {
   };
 };
 
+export type TaskSummary = {
+  image_inflight: number;
+  total: number;
+};
+
 export type SettingsConfig = {
   proxy: string;
   base_url?: string;
@@ -573,6 +578,10 @@ export async function updateSettingsConfig(settings: SettingsConfig) {
 
 export async function fetchThirdPartyApps() {
   return httpRequest<{ third_party_apps: ThirdPartyAppsSettings }>("/api/third-party-apps");
+}
+
+export async function fetchTaskSummary() {
+  return httpRequest<TaskSummary>("/api/tasks/summary");
 }
 
 export async function testBackupConnection() {

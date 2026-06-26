@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from api.support import require_admin, require_identity, resolve_image_base_url
+from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
 from services.config import config
 from services.image_service import (
@@ -86,6 +87,16 @@ def create_router(app_version: str) -> APIRouter:
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
         require_identity(authorization)
         return {"third_party_apps": config.get_third_party_apps_settings()}
+
+    @router.get("/api/tasks/summary")
+    async def get_task_summary(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        accounts = await run_in_threadpool(account_service.list_accounts)
+        image_inflight = sum(max(0, int(item.get("image_inflight") or 0)) for item in accounts)
+        return {
+            "image_inflight": image_inflight,
+            "total": image_inflight,
+        }
 
     @router.post("/api/settings")
     async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
