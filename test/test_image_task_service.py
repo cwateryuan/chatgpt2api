@@ -68,6 +68,45 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
 
+    def test_duplicate_submit_across_service_instances_uses_existing_task(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            calls = 0
+
+            def handler(_payload):
+                nonlocal calls
+                calls += 1
+                time.sleep(0.05)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            path = Path(tmp_dir) / "image_tasks.json"
+            first_worker = self.make_service(path, handler)
+            second_worker = self.make_service(path, handler)
+
+            first_worker.submit_generation(
+                OWNER,
+                client_task_id="shared-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            second_result = second_worker.list_tasks(OWNER, ["shared-task"])
+            duplicate = second_worker.submit_generation(
+                OWNER,
+                client_task_id="shared-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            self.assertEqual(second_result["missing_ids"], [])
+            self.assertEqual(second_result["items"][0]["id"], "shared-task")
+            self.assertEqual(duplicate["id"], "shared-task")
+            task = wait_for_task(second_worker, OWNER, "shared-task", "success")
+            self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
+            self.assertEqual(calls, 1)
+
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = self.make_service(Path(tmp_dir) / "image_tasks.json")
@@ -110,6 +149,7 @@ class ImageTaskServiceTests(unittest.TestCase):
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
+            old_ts = time.time() - 3600
             path.write_text(
                 json.dumps(
                     {
@@ -122,6 +162,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                                 "model": "gpt-image-2",
                                 "created_at": "2099-01-01 00:00:00",
                                 "updated_at": "2099-01-01 00:00:00",
+                                "created_ts": old_ts,
+                                "updated_ts": old_ts,
                             },
                             {
                                 "id": "running-task",
@@ -131,6 +173,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                                 "model": "gpt-image-2",
                                 "created_at": "2099-01-01 00:00:00",
                                 "updated_at": "2099-01-01 00:00:00",
+                                "created_ts": old_ts,
+                                "updated_ts": old_ts,
                             },
                         ]
                     }
@@ -143,6 +187,37 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+
+    def test_startup_keeps_fresh_unfinished_tasks_for_other_workers(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            now = time.time()
+            path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "id": "running-task",
+                                "owner_id": "owner-1",
+                                "status": "running",
+                                "mode": "generate",
+                                "model": "gpt-image-2",
+                                "created_at": "2099-01-01 00:00:00",
+                                "updated_at": "2099-01-01 00:00:00",
+                                "created_ts": now,
+                                "updated_ts": now,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            service = self.make_service(path)
+            result = service.list_tasks(OWNER, ["running-task"])
+
+            self.assertEqual(result["missing_ids"], [])
+            self.assertEqual(result["items"][0]["status"], "running")
 
 
 if __name__ == "__main__":

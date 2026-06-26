@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,19 @@ def _timestamp(value: object) -> float:
         return 0.0
 
 
+def _task_activity_ts(task: dict[str, Any]) -> float:
+    values: list[float] = []
+    for key in ("updated_ts", "started_ts", "created_ts"):
+        value = task.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            values.append(float(value))
+    if values:
+        return max(values)
+    values.extend(_timestamp(task.get(key)) for key in ("updated_at", "created_at"))
+    values = [value for value in values if value > 0]
+    return max(values) if values else 0.0
+
+
 def _clean(value: object, default: str = "") -> str:
     return str(value or default).strip()
 
@@ -59,6 +74,44 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
             if isinstance(url, str) and url:
                 urls.append(url)
     return urls
+
+
+@contextmanager
+def _file_lock(path: Path):
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    locked = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -113,11 +166,12 @@ class ImageTaskService:
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            self._tasks = self._load_locked()
-            changed = self._recover_unfinished_locked()
-            changed = self._cleanup_locked() or changed
-            if changed:
-                self._save_locked()
+            with _file_lock(self.path):
+                self._tasks = self._load_locked()
+                changed = self._recover_unfinished_locked()
+                changed = self._cleanup_locked() or changed
+                if changed:
+                    self._save_locked()
 
     def submit_generation(
         self,
@@ -171,25 +225,29 @@ class ImageTaskService:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
         with self._lock:
-            if self._cleanup_locked():
-                self._save_locked()
-            items = []
-            missing_ids = []
-            for task_id in requested_ids:
-                task = self._tasks.get(_task_key(owner, task_id))
-                if task is None:
-                    missing_ids.append(task_id)
-                else:
-                    items.append(_public_task(task))
-            if not requested_ids:
-                items = [
-                    _public_task(task)
-                    for task in self._tasks.values()
-                    if task.get("owner_id") == owner
-                ]
-                items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            with _file_lock(self.path):
+                self._tasks = self._load_locked()
+                changed = self._recover_unfinished_locked()
+                changed = self._cleanup_locked() or changed
+                if changed:
+                    self._save_locked()
+                items = []
                 missing_ids = []
-            return {"items": items, "missing_ids": missing_ids}
+                for task_id in requested_ids:
+                    task = self._tasks.get(_task_key(owner, task_id))
+                    if task is None:
+                        missing_ids.append(task_id)
+                    else:
+                        items.append(_public_task(task))
+                if not requested_ids:
+                    items = [
+                        _public_task(task)
+                        for task in self._tasks.values()
+                        if task.get("owner_id") == owner
+                    ]
+                    items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+                    missing_ids = []
+                return {"items": items, "missing_ids": missing_ids}
 
     def _submit(
         self,
@@ -207,27 +265,30 @@ class ImageTaskService:
         now = _now_iso()
         should_start = False
         with self._lock:
-            cleaned = self._cleanup_locked()
-            task = self._tasks.get(key)
-            if task is not None:
-                if cleaned:
-                    self._save_locked()
-                return _public_task(task)
-            task = {
-                "id": task_id,
-                "owner_id": owner,
-                "status": TASK_STATUS_QUEUED,
-                "mode": mode,
-                "model": _clean(payload.get("model"), "gpt-image-2"),
-                "size": _clean(payload.get("size")),
-                "quality": _clean(payload.get("quality"), "auto"),
-                "created_at": now,
-                "updated_at": now,
-                "created_ts": time.time(),
-            }
-            self._tasks[key] = task
-            self._save_locked()
-            should_start = True
+            with _file_lock(self.path):
+                self._tasks = self._load_locked()
+                cleaned = self._recover_unfinished_locked()
+                cleaned = self._cleanup_locked() or cleaned
+                task = self._tasks.get(key)
+                if task is not None:
+                    if cleaned:
+                        self._save_locked()
+                    return _public_task(task)
+                task = {
+                    "id": task_id,
+                    "owner_id": owner,
+                    "status": TASK_STATUS_QUEUED,
+                    "mode": mode,
+                    "model": _clean(payload.get("model"), "gpt-image-2"),
+                    "size": _clean(payload.get("size")),
+                    "quality": _clean(payload.get("quality"), "auto"),
+                    "created_at": now,
+                    "updated_at": now,
+                    "created_ts": time.time(),
+                }
+                self._tasks[key] = task
+                self._save_locked()
+                should_start = True
 
         if should_start:
             thread = threading.Thread(
@@ -348,13 +409,15 @@ class ImageTaskService:
 
     def _update_task(self, key: str, **updates: Any) -> None:
         with self._lock:
-            task = self._tasks.get(key)
-            if task is None:
-                return
-            task.update(updates)
-            task["updated_at"] = _now_iso()
-            task["updated_ts"] = time.time()
-            self._save_locked()
+            with _file_lock(self.path):
+                self._tasks = self._load_locked()
+                task = self._tasks.get(key)
+                if task is None:
+                    return
+                task.update(updates)
+                task["updated_at"] = _now_iso()
+                task["updated_ts"] = time.time()
+                self._save_locked()
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -401,6 +464,12 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
+            progress = _clean(item.get("progress"))
+            if progress:
+                task["progress"] = progress
+            conversation_id = _clean(item.get("conversation_id"))
+            if conversation_id:
+                task["conversation_id"] = conversation_id
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
@@ -412,11 +481,20 @@ class ImageTaskService:
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False
+        try:
+            poll_timeout_secs = int(config.image_poll_timeout_secs)
+        except Exception:
+            poll_timeout_secs = 120
+        stale_cutoff = time.time() - max(300, poll_timeout_secs * 2)
         for task in self._tasks.values():
             if task.get("status") in UNFINISHED_STATUSES:
+                activity_ts = _task_activity_ts(task)
+                if activity_ts and activity_ts > stale_cutoff:
+                    continue
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = "服务已重启，未完成的图片任务已中断"
                 task["updated_at"] = _now_iso()
+                task["updated_ts"] = time.time()
                 changed = True
         return changed
 
@@ -445,21 +523,23 @@ class ImageTaskService:
         owner = _owner_id(identity)
         key = _task_key(owner, _clean(task_id))
         with self._lock:
-            task = self._tasks.get(key)
-            if task is None:
-                raise ValueError("task not found")
-            if task.get("status") != TASK_STATUS_ERROR:
-                raise ValueError("task is not in error state")
-            error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
-                raise ValueError("task error is not a timeout error")
-            conversation_id = _clean(task.get("conversation_id"))
-            if not conversation_id:
-                raise ValueError("task has no conversation_id")
-            mode = task.get("mode", "generate")
-            model = task.get("model", "gpt-image-2")
-            # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            with _file_lock(self.path):
+                self._tasks = self._load_locked()
+                task = self._tasks.get(key)
+                if task is None:
+                    raise ValueError("task not found")
+                if task.get("status") != TASK_STATUS_ERROR:
+                    raise ValueError("task is not in error state")
+                error_msg = _clean(task.get("error"))
+                if "超时" not in error_msg:
+                    raise ValueError("task error is not a timeout error")
+                conversation_id = _clean(task.get("conversation_id"))
+                if not conversation_id:
+                    raise ValueError("task has no conversation_id")
+                mode = task.get("mode", "generate")
+                model = task.get("model", "gpt-image-2")
+                task.update(status=TASK_STATUS_RUNNING, error="", updated_at=_now_iso(), updated_ts=time.time())
+                self._save_locked()
 
         # 启动新线程继续轮询
         thread = threading.Thread(
