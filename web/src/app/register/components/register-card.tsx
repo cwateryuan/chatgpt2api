@@ -41,8 +41,9 @@ export function RegisterCard() {
 
   if (!config) return null;
 
+  const mail = config.mail || { request_timeout: 30, wait_timeout: 120, wait_interval: 3, providers: [] };
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
-  const providers = config.mail.providers || [];
+  const providers = mail.providers || [];
   const logs = config.logs || [];
   const updateProviderType = (index: number, type: string) => {
     updateProvider(index, {
@@ -139,15 +140,15 @@ export function RegisterCard() {
             <div className="grid gap-4 md:grid-cols-3">
               <div className="space-y-2">
                 <label className="text-sm text-stone-700">请求超时</label>
-                <Input value={String(config.mail.request_timeout || "")} onChange={(event) => setMailField("request_timeout", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                <Input value={String(mail.request_timeout || "")} onChange={(event) => setMailField("request_timeout", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
               </div>
               <div className="space-y-2">
                 <label className="text-sm text-stone-700">等待验证码超时</label>
-                <Input value={String(config.mail.wait_timeout || "")} onChange={(event) => setMailField("wait_timeout", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                <Input value={String(mail.wait_timeout || "")} onChange={(event) => setMailField("wait_timeout", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
               </div>
               <div className="space-y-2">
                 <label className="text-sm text-stone-700">轮询间隔</label>
-                <Input value={String(config.mail.wait_interval || "")} onChange={(event) => setMailField("wait_interval", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
+                <Input value={String(mail.wait_interval || "")} onChange={(event) => setMailField("wait_interval", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
               </div>
             </div>
 

@@ -5,7 +5,6 @@ import { LoaderCircle } from "lucide-react";
 
 import webConfig from "@/constants/common-env";
 import { useAuthGuard } from "@/lib/use-auth-guard";
-import type { RegisterConfig } from "@/lib/api";
 import { getStoredAuthKey } from "@/store/auth";
 
 import { useSettingsStore } from "../settings/store";
@@ -14,7 +13,7 @@ import { RegisterCard } from "./components/register-card";
 function RegisterDataController() {
   const didLoadRef = useRef(false);
   const loadRegister = useSettingsStore((state) => state.loadRegister);
-  const setRegisterConfig = useSettingsStore((state) => state.setRegisterConfig);
+  const mergeRegisterRuntime = useSettingsStore((state) => state.mergeRegisterRuntime);
 
   useEffect(() => {
     if (didLoadRef.current) return;
@@ -44,7 +43,11 @@ function RegisterDataController() {
       source = new EventSource(`${baseUrl}/api/register/events?token=${encodeURIComponent(token)}`);
       source.onmessage = (event) => {
         stopFallback();
-        setRegisterConfig(JSON.parse(event.data) as RegisterConfig);
+        try {
+          mergeRegisterRuntime(JSON.parse(event.data));
+        } catch {
+          startFallback();
+        }
       };
       source.onerror = () => {
         startFallback();
@@ -55,7 +58,7 @@ function RegisterDataController() {
       stopFallback();
       source?.close();
     };
-  }, [loadRegister, setRegisterConfig]);
+  }, [loadRegister, mergeRegisterRuntime]);
 
   return null;
 }

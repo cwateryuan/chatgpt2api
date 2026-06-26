@@ -251,6 +251,64 @@ function normalizeFiles(items: CPARemoteFile[]) {
   return files;
 }
 
+const DEFAULT_REGISTER_MAIL: RegisterConfig["mail"] = {
+  request_timeout: 30,
+  wait_timeout: 120,
+  wait_interval: 3,
+  providers: [],
+};
+
+const DEFAULT_REGISTER_STATS: RegisterConfig["stats"] = {
+  success: 0,
+  fail: 0,
+  done: 0,
+  running: 0,
+  threads: 1,
+};
+
+type RegisterUpdate = Partial<Omit<RegisterConfig, "mail" | "stats">> & {
+  mail?: Partial<RegisterConfig["mail"]>;
+  stats?: Partial<RegisterConfig["stats"]>;
+};
+
+function normalizeRegisterConfig(config: RegisterUpdate, previous?: RegisterConfig | null): RegisterConfig {
+  const mailSource = config.mail || previous?.mail || {};
+  const statsSource = config.stats || {};
+  const threads = Math.max(1, Number(config.threads ?? previous?.threads ?? previous?.stats?.threads ?? 1) || 1);
+  const statsThreads = Math.max(1, Number(statsSource.threads ?? previous?.stats?.threads ?? threads) || threads);
+  const mode = config.mode === "quota" || config.mode === "available" || config.mode === "total"
+    ? config.mode
+    : previous?.mode || "total";
+
+  return {
+    enabled: Boolean(config.enabled ?? previous?.enabled ?? false),
+    mail: {
+      ...DEFAULT_REGISTER_MAIL,
+      ...(previous?.mail || {}),
+      ...mailSource,
+      providers: Array.isArray(mailSource.providers)
+        ? mailSource.providers
+        : Array.isArray(previous?.mail?.providers)
+          ? previous.mail.providers
+          : [],
+    },
+    proxy: String(config.proxy ?? previous?.proxy ?? ""),
+    total: Math.max(1, Number(config.total ?? previous?.total ?? 1) || 1),
+    threads,
+    mode,
+    target_quota: Math.max(1, Number(config.target_quota ?? previous?.target_quota ?? 1) || 1),
+    target_available: Math.max(1, Number(config.target_available ?? previous?.target_available ?? 1) || 1),
+    check_interval: Math.max(1, Number(config.check_interval ?? previous?.check_interval ?? 5) || 5),
+    stats: {
+      ...DEFAULT_REGISTER_STATS,
+      ...(previous?.stats || {}),
+      ...statsSource,
+      threads: statsThreads,
+    },
+    logs: Array.isArray(config.logs) ? config.logs : previous?.logs || [],
+  };
+}
+
 type SettingsStore = {
   config: SettingsConfig | null;
   isLoadingConfig: boolean;
@@ -326,6 +384,7 @@ type SettingsStore = {
 
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
+  mergeRegisterRuntime: (runtime: RegisterUpdate) => void;
   setRegisterProxy: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
@@ -882,7 +941,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!silent) set({ isLoadingRegister: true });
     try {
       const data = await fetchRegisterConfig();
-      set({ registerConfig: data.register });
+      set((state) => ({ registerConfig: normalizeRegisterConfig(data.register, state.registerConfig) }));
     } catch (error) {
       if (!silent) toast.error(error instanceof Error ? error.message : "加载注册配置失败");
     } finally {
@@ -891,7 +950,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setRegisterConfig: (config) => {
-    set({ registerConfig: config, isLoadingRegister: false });
+    set((state) => ({ registerConfig: normalizeRegisterConfig(config, state.registerConfig), isLoadingRegister: false }));
+  },
+
+  mergeRegisterRuntime: (runtime) => {
+    set((state) => ({ registerConfig: normalizeRegisterConfig(runtime, state.registerConfig), isLoadingRegister: false }));
   },
 
   setRegisterProxy: (value) => {
