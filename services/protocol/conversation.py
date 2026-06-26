@@ -214,12 +214,15 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
 
 
 def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
+    base_prompt = prompt.strip()
     hints = []
+    if "本次只生成一张图片" not in base_prompt:
+        hints.append("本次只生成一张图片。")
     if size:
         hints.append(f"输出图片尺寸为 {size}。")
     if quality:
         hints.append(f"输出图片质量为 {quality}。")
-    return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
+    return f"{base_prompt}\n\n{''.join(hints)}" if hints else prompt
 
 
 def encoding_for_model(model: str):

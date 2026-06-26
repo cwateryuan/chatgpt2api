@@ -11,9 +11,12 @@ from pathlib import Path
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.register import mail_provider, openai_register
+from services.runtime_state import runtime_state
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+REGISTER_RUN_LOCK = "lock:register:run"
+REGISTER_RUN_LOCK_TTL_SECONDS = 120
 
 
 def _db_backend():
@@ -66,6 +69,16 @@ def _normalize(raw: dict) -> dict:
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
     cfg["stats"] = stats
+    logs = raw.get("logs") if isinstance(raw.get("logs"), list) else []
+    cfg["logs"] = [
+        {
+            "time": str(item.get("time") or _now()),
+            "text": str(item.get("text") or ""),
+            "level": str(item.get("level") or "info"),
+        }
+        for item in logs[-300:]
+        if isinstance(item, dict) and str(item.get("text") or "")
+    ]
     return cfg
 
 
@@ -74,7 +87,7 @@ class RegisterService:
         self._store_file = store_file
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
-        self._logs: list[dict] = []
+        self._lock_owner = ""
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -108,7 +121,7 @@ class RegisterService:
             loaded = self._load()
             if loaded:
                 self._config = loaded
-            snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
+            snapshot = json.loads(json.dumps(self._config, ensure_ascii=False))
         self._redact_outlook_pools(snapshot)
         return snapshot
 
@@ -187,6 +200,9 @@ class RegisterService:
 
     def update(self, updates: dict) -> dict:
         with self._lock:
+            loaded = self._load()
+            if loaded:
+                self._config = loaded
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
@@ -196,13 +212,23 @@ class RegisterService:
 
     def start(self) -> dict:
         with self._lock:
+            loaded = self._load()
+            if loaded:
+                self._config = loaded
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
                 return self.get()
+            lock_owner = runtime_state.acquire_lock(REGISTER_RUN_LOCK, ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS)
+            if not lock_owner:
+                self._config = self._load()
+                self._config["enabled"] = True
+                self._save()
+                return self.get()
+            self._lock_owner = lock_owner
             self._config["enabled"] = True
             self._drop_mail_proxy()
-            self._logs = []
+            self._config["logs"] = []
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
@@ -216,6 +242,9 @@ class RegisterService:
 
     def stop(self) -> dict:
         with self._lock:
+            loaded = self._load()
+            if loaded:
+                self._config = loaded
             self._config["enabled"] = False
             self._config["stats"]["updated_at"] = _now()
             self._save()
@@ -224,7 +253,10 @@ class RegisterService:
 
     def reset(self) -> dict:
         with self._lock:
-            self._logs = []
+            loaded = self._load()
+            if loaded:
+                self._config = loaded
+            self._config["logs"] = []
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
@@ -235,6 +267,9 @@ class RegisterService:
         scope = str(scope or "all").strip().lower()
         if scope == "unused":
             with self._lock:
+                loaded = self._load()
+                if loaded:
+                    self._config = loaded
                 removed = self._prune_unused_outlook_pools()
                 openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
                 self._save()
@@ -251,8 +286,13 @@ class RegisterService:
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
-            self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
-            self._logs = self._logs[-300:]
+            loaded = self._load()
+            if loaded:
+                self._config = loaded
+            logs = self._config.get("logs") if isinstance(self._config.get("logs"), list) else []
+            logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
+            self._config["logs"] = logs[-300:]
+            self._save()
 
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
@@ -278,6 +318,12 @@ class RegisterService:
 
     def _bump(self, **updates) -> None:
         with self._lock:
+            if self._lock_owner:
+                runtime_state.extend_lock(
+                    REGISTER_RUN_LOCK,
+                    self._lock_owner,
+                    ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS,
+                )
             self._config["stats"].update(updates)
             stats = self._config["stats"]
             started_at = str(stats.get("started_at") or "")
@@ -324,6 +370,10 @@ class RegisterService:
         with self._lock:
             self._config["enabled"] = False
             self._save()
+            lock_owner = self._lock_owner
+            self._lock_owner = ""
+            if lock_owner:
+                runtime_state.release_lock(REGISTER_RUN_LOCK, lock_owner)
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
 

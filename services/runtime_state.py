@@ -376,6 +376,31 @@ return current
             self._memory_locks[lock_key] = (owner, time.time() + ttl)
             return owner
 
+    def extend_lock(self, key: str, owner: str, ttl_seconds: int = 300) -> bool:
+        lock_key = _clean(key)
+        lock_owner = _clean(owner)
+        if not lock_key or not lock_owner:
+            return False
+        ttl = max(5, int(ttl_seconds or 300))
+        if self._redis is not None:
+            try:
+                script = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+"""
+                return bool(self._redis.eval(script, 1, lock_key, lock_owner, ttl))
+            except Exception:
+                pass
+        with self._lock:
+            self._cleanup_memory_locked()
+            item = self._memory_locks.get(lock_key)
+            if item and item[0] == lock_owner:
+                self._memory_locks[lock_key] = (lock_owner, time.time() + ttl)
+                return True
+            return False
+
     def release_lock(self, key: str, owner: str) -> None:
         lock_key = _clean(key)
         lock_owner = _clean(owner)

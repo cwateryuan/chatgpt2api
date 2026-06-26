@@ -196,6 +196,7 @@ function LogsContent() {
                   <TableHead>时间</TableHead>
                   <TableHead>类型</TableHead>
                   {isCallLog ? <TableHead>令牌名称</TableHead> : null}
+                  {isCallLog ? <TableHead>IP</TableHead> : null}
                   {isCallLog ? <TableHead>调用耗时</TableHead> : null}
                   {isCallLog ? <TableHead>状态</TableHead> : null}
                   {isCallLog ? <TableHead className="w-36">图片</TableHead> : null}
@@ -214,6 +215,7 @@ function LogsContent() {
                       <TableCell className="whitespace-nowrap">{item.time}</TableCell>
                       <TableCell><Badge variant="secondary" className="rounded-md">{typeLabels[item.type] || item.type}</Badge></TableCell>
                       {isCallLog ? <TableCell>{getDetailText(item, "key_name")}</TableCell> : null}
+                      {isCallLog ? <TableCell className="whitespace-nowrap">{getDetailText(item, "ip")}</TableCell> : null}
                       {isCallLog ? <TableCell>{formatDuration(item)}</TableCell> : null}
                       {isCallLog ? (
                         <TableCell>

@@ -24,20 +24,38 @@ function RegisterDataController() {
 
   useEffect(() => {
     let source: EventSource | null = null;
+    let fallbackTimer: ReturnType<typeof setInterval> | null = null;
     let closed = false;
+    const stopFallback = () => {
+      if (fallbackTimer) {
+        clearInterval(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+    const startFallback = () => {
+      if (fallbackTimer) return;
+      fallbackTimer = setInterval(() => {
+        void loadRegister(true);
+      }, 2000);
+    };
     void getStoredAuthKey().then((token) => {
       if (closed || !token) return;
       const baseUrl = webConfig.apiUrl.replace(/\/$/, "");
       source = new EventSource(`${baseUrl}/api/register/events?token=${encodeURIComponent(token)}`);
       source.onmessage = (event) => {
+        stopFallback();
         setRegisterConfig(JSON.parse(event.data) as RegisterConfig);
+      };
+      source.onerror = () => {
+        startFallback();
       };
     });
     return () => {
       closed = true;
+      stopFallback();
       source?.close();
     };
-  }, [setRegisterConfig]);
+  }, [loadRegister, setRegisterConfig]);
 
   return null;
 }

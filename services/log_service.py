@@ -243,6 +243,7 @@ class LoggedCall:
     started: float = field(default_factory=time.time)
     request_text: str = ""
     request_shape: dict[str, int] | None = None
+    client_ip: str = ""
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.protocol.conversation import ImageGenerationError
@@ -337,6 +338,9 @@ class LoggedCall:
             detail["request_text"] = request_excerpt
         if self.request_shape:
             detail["request_shape"] = self.request_shape
+        client_ip = str(self.client_ip or "").strip()
+        if client_ip:
+            detail["ip"] = client_ip
         if error:
             detail["error"] = error
         email = str(account_email or "").strip()

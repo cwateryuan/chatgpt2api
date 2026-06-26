@@ -50,6 +50,18 @@ def resolve_image_base_url(request: Request) -> str:
     return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
+def resolve_client_ip(request: Request) -> str:
+    for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
+        value = str(request.headers.get(header) or "").strip()
+        if not value:
+            continue
+        if header == "x-forwarded-for":
+            value = value.split(",", 1)[0].strip()
+        if value:
+            return value
+    return str(request.client.host if request.client else "").strip()
+
+
 def raise_image_quota_error(exc: Exception) -> None:
     message = str(exc)
     if "no available image quota" in message.lower():
