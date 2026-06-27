@@ -276,6 +276,15 @@ def _runtime_snapshot() -> dict[str, Any]:
         }
 
 
+def _request_activity_snapshot() -> dict[str, Any]:
+    try:
+        from services.request_activity import request_activity
+
+        return request_activity.snapshot()
+    except Exception as exc:
+        return {"error": repr(exc)[:300]}
+
+
 def build_memory_snapshot(*, reason: str = "scheduled", collect: bool = False) -> dict[str, Any]:
     now = time.time()
     return {
@@ -290,6 +299,7 @@ def build_memory_snapshot(*, reason: str = "scheduled", collect: bool = False) -
         "gc": _gc_snapshot(collect=collect),
         "image_tasks": _image_tasks_snapshot(),
         "runtime": _runtime_snapshot(),
+        "request_activity": _request_activity_snapshot(),
     }
 
 

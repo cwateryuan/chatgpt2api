@@ -1283,6 +1283,7 @@ def _generate_single_image(
         emitted_for_token = False
         returned_message = False
         returned_result = False
+        slot_released = False
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
         logger.debug({
@@ -1317,9 +1318,11 @@ def _generate_single_image(
                 outputs.append(output)
             if returned_message:
                 account_service.mark_image_result(token, False)
+                slot_released = True
                 return outputs
             if not returned_result:
                 account_service.mark_image_result(token, False)
+                slot_released = True
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1332,9 +1335,11 @@ def _generate_single_image(
                     )
                 return outputs
             account_service.mark_image_result(token, True)
+            slot_released = True
             return outputs
         except ImagePollTimeoutError as exc:
             account_service.mark_image_result(token, False)
+            slot_released = True
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
@@ -1361,6 +1366,7 @@ def _generate_single_image(
             raise
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)
+            slot_released = True
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1378,6 +1384,7 @@ def _generate_single_image(
             ) from exc
         except ImageGenerationError as exc:
             account_service.mark_image_result(token, False)
+            slot_released = True
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
@@ -1420,6 +1427,7 @@ def _generate_single_image(
             raise
         except Exception as exc:
             account_service.mark_image_result(token, False)
+            slot_released = True
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1467,6 +1475,8 @@ def _generate_single_image(
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
+            if not slot_released and token:
+                account_service.release_image_slot(token)
             if backend is not None:
                 backend.close()
             trim_memory("image_generation")

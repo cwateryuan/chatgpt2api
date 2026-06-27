@@ -80,6 +80,7 @@ class DebugMemoryTests(unittest.TestCase):
 
         encoded = json.dumps(snapshot, ensure_ascii=False)
         self.assertEqual(snapshot["runtime"]["image_inflight_total"], 3)
+        self.assertIn("active", snapshot["request_activity"])
         self.assertEqual(snapshot["image_tasks"]["loaded_tasks"], 1)
         self.assertEqual(snapshot["image_tasks"]["b64_json_tasks"], 1)
         self.assertIn("data_chars", snapshot["image_tasks"]["recent"][0])

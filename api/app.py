@@ -15,6 +15,8 @@ from services.config import config
 from services.debug_memory import start_memory_diagnostic_scheduler
 from services.image_service import start_image_cleanup_scheduler
 from services.memory import start_memory_trim_scheduler
+from services.memory_recycle import start_memory_recycle_scheduler
+from services.request_activity import RequestActivityMiddleware
 from services.runtime_config import configure_thread_stack_size, configure_threadpool_tokens
 
 
@@ -30,6 +32,7 @@ def create_app() -> FastAPI:
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         memory_trim_thread = start_memory_trim_scheduler(stop_event)
         memory_diag_thread = start_memory_diagnostic_scheduler(stop_event)
+        memory_recycle_thread = start_memory_recycle_scheduler(stop_event)
         backup_service.start()
         config.cleanup_old_images()
         try:
@@ -40,10 +43,12 @@ def create_app() -> FastAPI:
             cleanup_thread.join(timeout=1)
             memory_trim_thread.join(timeout=1)
             memory_diag_thread.join(timeout=1)
+            memory_recycle_thread.join(timeout=1)
             backup_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
+    app.add_middleware(RequestActivityMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
