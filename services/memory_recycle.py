@@ -90,7 +90,14 @@ def _unfinished_image_tasks() -> int:
         return -1
 
 
-def _should_recycle(*, threshold_kb: int, idle_secs_required: float, min_age_secs: float, started_at: float) -> tuple[bool, dict[str, Any]]:
+def _should_recycle(
+    *,
+    threshold_kb: int,
+    idle_secs_required: float,
+    min_age_secs: float,
+    started_at: float,
+    require_global_idle: bool = False,
+) -> tuple[bool, dict[str, Any]]:
     rss_kb = _rss_kb()
     activity = request_activity.snapshot()
     inflight = _runtime_inflight_total()
@@ -109,6 +116,7 @@ def _should_recycle(*, threshold_kb: int, idle_secs_required: float, min_age_sec
         "unfinished_image_tasks": unfinished_image_tasks,
         "register_running": register_running,
         "age_secs": round(age_secs, 3),
+        "require_global_idle": require_global_idle,
     }
     if rss_kb < threshold_kb:
         return False, detail
@@ -118,14 +126,15 @@ def _should_recycle(*, threshold_kb: int, idle_secs_required: float, min_age_sec
         return False, detail
     if float(activity.get("idle_secs") or 0.0) < idle_secs_required:
         return False, detail
-    if inflight != 0:
-        return False, detail
     if image_task_threads != 0:
-        return False, detail
-    if unfinished_image_tasks != 0:
         return False, detail
     if register_running:
         return False, detail
+    if require_global_idle:
+        if inflight != 0:
+            return False, detail
+        if unfinished_image_tasks != 0:
+            return False, detail
     return True, detail
 
 
@@ -140,6 +149,7 @@ def start_memory_recycle_scheduler(stop_event: threading.Event) -> threading.Thr
     idle_secs_required = _env_float("APP_MEMORY_RECYCLE_IDLE_SECS", 300.0, 5.0)
     interval_secs = _env_float("APP_MEMORY_RECYCLE_INTERVAL_SECS", 30.0, 5.0)
     min_age_secs = _env_float("APP_MEMORY_RECYCLE_MIN_AGE_SECS", 300.0, 0.0)
+    require_global_idle = _env_bool("APP_MEMORY_RECYCLE_REQUIRE_GLOBAL_IDLE", False)
     started_at = time.monotonic()
 
     def _worker() -> None:
@@ -149,6 +159,7 @@ def start_memory_recycle_scheduler(stop_event: threading.Event) -> threading.Thr
                 idle_secs_required=idle_secs_required,
                 min_age_secs=min_age_secs,
                 started_at=started_at,
+                require_global_idle=require_global_idle,
             )
             if not should_recycle:
                 logger.debug({"event": "memory_recycle_skip", **detail})
