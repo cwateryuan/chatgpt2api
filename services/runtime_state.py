@@ -318,6 +318,49 @@ return current
             self._memory_rr["text"] = value
             return value
 
+    def set_flag(self, key: str, value: str = "1", ttl_seconds: int = 3600) -> None:
+        flag_key = _clean(key)
+        if not flag_key:
+            return
+        ttl = max(5, int(ttl_seconds or 3600))
+        if self._redis is not None:
+            try:
+                self._redis.set(flag_key, _clean(value) or "1", ex=ttl)
+                return
+            except Exception:
+                pass
+        with self._lock:
+            self._memory_progress[flag_key] = ({"value": _clean(value) or "1"}, time.time() + ttl)
+
+    def get_flag(self, key: str) -> str:
+        flag_key = _clean(key)
+        if not flag_key:
+            return ""
+        if self._redis is not None:
+            try:
+                return _clean(self._redis.get(flag_key))
+            except Exception:
+                return ""
+        with self._lock:
+            self._cleanup_memory_locked()
+            item = self._memory_progress.get(flag_key)
+            if not item:
+                return ""
+            return _clean(item[0].get("value"))
+
+    def delete_flag(self, key: str) -> None:
+        flag_key = _clean(key)
+        if not flag_key:
+            return
+        if self._redis is not None:
+            try:
+                self._redis.delete(flag_key)
+                return
+            except Exception:
+                pass
+        with self._lock:
+            self._memory_progress.pop(flag_key, None)
+
     def set_progress(self, kind: str, progress_id: str, data: dict[str, Any], ttl_seconds: int = 3600) -> None:
         key = self._progress_key(kind, progress_id)
         if not key:

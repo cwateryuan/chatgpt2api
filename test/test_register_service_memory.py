@@ -9,6 +9,9 @@ from services.register_service import REGISTER_RUNTIME_CONFIG_KEY, RegisterServi
 
 
 class FakeRuntimeState:
+    def __init__(self):
+        self.flags: dict[str, str] = {}
+
     def acquire_lock(self, *_args, **_kwargs):
         return "owner"
 
@@ -17,6 +20,15 @@ class FakeRuntimeState:
 
     def release_lock(self, *_args, **_kwargs):
         return None
+
+    def set_flag(self, key: str, value: str = "1", **_kwargs):
+        self.flags[key] = value
+
+    def get_flag(self, key: str):
+        return self.flags.get(key, "")
+
+    def delete_flag(self, key: str):
+        self.flags.pop(key, None)
 
 
 class FakeDB:
@@ -75,6 +87,44 @@ class RegisterServiceMemoryTests(unittest.TestCase):
             service = RegisterService(Path(tmp) / "register.json")
 
             self.assertEqual(service._pool_metrics(), {"current_quota": 7, "current_available": 2})
+
+    def test_get_merges_persisted_runtime_state(self):
+        db = FakeDB()
+        db.configs["register"] = {"enabled": False, "threads": 1, "logs": [], "stats": {"running": 0}}
+        db.configs[REGISTER_RUNTIME_CONFIG_KEY] = {
+            "enabled": True,
+            "threads": 1,
+            "logs": [{"time": "now", "text": "running", "level": "yellow"}],
+            "stats": {"running": 3, "done": 4},
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("services.register_service._db_backend", return_value=db),
+            mock.patch("services.register_service.runtime_state", FakeRuntimeState()),
+        ):
+            service = RegisterService(Path(tmp) / "register.json")
+            snapshot = service.get()
+
+        self.assertTrue(snapshot["enabled"])
+        self.assertEqual(snapshot["stats"]["running"], 3)
+        self.assertEqual(snapshot["logs"][-1]["text"], "running")
+
+    def test_owner_runtime_snapshot_applies_shared_stop_flag(self):
+        runtime_state = FakeRuntimeState()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("services.register_service._db_backend", return_value=None),
+            mock.patch("services.register_service.runtime_state", runtime_state),
+        ):
+            service = RegisterService(Path(tmp) / "register.json")
+            service._lock_owner = "owner"
+            service._config["enabled"] = True
+            service._config["stats"]["running"] = 2
+            runtime_state.set_flag("register:stop_requested")
+            snapshot = service.runtime_snapshot()
+
+        self.assertFalse(snapshot["enabled"])
+        self.assertEqual(snapshot["stats"]["running"], 2)
 
 
 if __name__ == "__main__":

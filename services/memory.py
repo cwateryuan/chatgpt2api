@@ -60,3 +60,19 @@ def trim_memory(reason: str = "", *, force: bool = False) -> bool:
     except Exception as exc:
         logger.debug({"event": "memory_trim_failed", "reason": reason, "error": repr(exc)})
         return False
+
+
+def start_memory_trim_scheduler(stop_event: threading.Event) -> threading.Thread:
+    if not _env_bool("APP_MEMORY_TRIM_ENABLED", True):
+        thread = threading.Thread(target=lambda: None, daemon=True, name="memory-trim-disabled")
+        thread.start()
+        return thread
+    interval = _env_float("APP_MEMORY_TRIM_INTERVAL_SECS", 30.0, 1.0)
+
+    def _worker() -> None:
+        while not stop_event.wait(interval):
+            trim_memory("idle_scheduler")
+
+    thread = threading.Thread(target=_worker, daemon=True, name="memory-trim")
+    thread.start()
+    return thread

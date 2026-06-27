@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from curl_cffi import requests
 
 from services.account_service import account_service
+from services.memory import trim_memory
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
 
@@ -633,3 +634,4 @@ def worker(index: int) -> dict:
         return {"ok": False, "index": index, "error": str(e)}
     finally:
         registrar.close()
+        trim_memory("register_worker")
