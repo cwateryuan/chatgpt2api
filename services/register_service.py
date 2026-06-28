@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -13,6 +14,7 @@ from services.config import DATA_DIR
 from services.memory import trim_memory
 from services.register import mail_provider, openai_register
 from services.runtime_state import runtime_state
+from utils.log import logger
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
@@ -22,6 +24,8 @@ REGISTER_STOP_KEY = "register:stop_requested"
 REGISTER_STOP_TTL_SECONDS = 86400
 REGISTER_LOG_LIMIT = 120
 REGISTER_SAVE_INTERVAL_SECONDS = 2.0
+REGISTER_SUPERVISOR_INTERVAL_SECONDS = 10.0
+REGISTER_SUPERVISOR_WAIT_LOG_INTERVAL_SECONDS = 30.0
 REGISTER_RUNTIME_KEYS = {"enabled", "stats", "logs"}
 REGISTER_RUNTIME_CONFIG_KEY = "register_runtime"
 
@@ -90,17 +94,38 @@ def _normalize(raw: dict) -> dict:
 
 
 class RegisterService:
-    def __init__(self, store_file: Path):
+    def __init__(self, store_file: Path, *, start_supervisor: bool = False):
         self._store_file = store_file
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._lock_owner = ""
+        self._lock_lost = False
         self._last_save_at = 0.0
         self._last_metrics_log: dict[str, tuple[int, int, float]] = {}
+        self._last_supervisor_wait_log_at = 0.0
+        self._supervisor_stop = threading.Event()
+        self._supervisor: threading.Thread | None = None
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
-        if self._config["enabled"]:
-            self.start()
+        if start_supervisor:
+            self.start_supervisor()
+
+    def start_supervisor(self) -> None:
+        with self._lock:
+            if self._supervisor and self._supervisor.is_alive():
+                return
+            self._supervisor_stop.clear()
+            self._supervisor = threading.Thread(
+                target=self._supervise_loop,
+                daemon=True,
+                name="register-supervisor",
+            )
+            self._supervisor.start()
+
+    def stop_supervisor(self, *, timeout: float | None = None) -> None:
+        self._supervisor_stop.set()
+        if timeout is not None and self._supervisor is not None:
+            self._supervisor.join(timeout=timeout)
 
     def _load(self) -> dict:
         db = _db_backend()
@@ -189,6 +214,130 @@ class RegisterService:
             "target_available": int(self._config.get("target_available") or 1),
             "check_interval": int(self._config.get("check_interval") or 5),
         }
+
+    def _runner_alive_locked(self) -> bool:
+        return self._runner is not None and self._runner.is_alive()
+
+    def _sync_register_stats_locked(self) -> None:
+        stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
+        started_at = str(stats.get("started_at") or "")
+        start_time = time.time()
+        if started_at:
+            try:
+                start_time = datetime.fromisoformat(started_at).timestamp()
+            except Exception:
+                start_time = time.time()
+        with openai_register.stats_lock:
+            openai_register.stats.update({
+                "done": int(stats.get("done") or 0),
+                "success": int(stats.get("success") or 0),
+                "fail": int(stats.get("fail") or 0),
+                "start_time": start_time,
+            })
+
+    def _start_runner_locked(self, *, reset_runtime: bool, recovered: bool) -> None:
+        self._lock_lost = False
+        self._config["enabled"] = True
+        self._drop_mail_proxy()
+        if reset_runtime:
+            self._config["logs"] = []
+            metrics = self._pool_metrics()
+            self._config["stats"] = {
+                "job_id": uuid.uuid4().hex,
+                "success": 0,
+                "fail": 0,
+                "done": 0,
+                "running": 0,
+                "threads": self._config["threads"],
+                **metrics,
+                "started_at": _now(),
+                "updated_at": _now(),
+            }
+        else:
+            existing_stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
+            self._config["stats"] = {
+                **_default_config()["stats"],
+                **existing_stats,
+                "threads": self._config["threads"],
+                "updated_at": _now(),
+            }
+            self._config["stats"].setdefault("job_id", uuid.uuid4().hex)
+            self._config["stats"].setdefault("started_at", _now())
+        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+        self._sync_register_stats_locked()
+        if reset_runtime:
+            self._save()
+        self._save_runtime(force=True)
+        self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
+        self._runner.start()
+        event = "register_runner_recovered" if recovered else "register_runner_started"
+        logger.warning({
+            "event": event,
+            "pid": os.getpid(),
+            "mode": self._config.get("mode"),
+            "threads": self._config.get("threads"),
+        })
+
+    def _log_recovery_wait_locked(self) -> None:
+        now = time.monotonic()
+        if now - self._last_supervisor_wait_log_at < REGISTER_SUPERVISOR_WAIT_LOG_INTERVAL_SECONDS:
+            return
+        self._last_supervisor_wait_log_at = now
+        self._append_log(
+            f"注册任务恢复等待锁释放：当前 worker 暂未拿到注册锁，最多等待旧锁 TTL {REGISTER_RUN_LOCK_TTL_SECONDS}s",
+            "yellow",
+            force=True,
+        )
+        logger.warning({
+            "event": "register_recovery_wait_lock",
+            "pid": os.getpid(),
+            "lock_ttl_secs": REGISTER_RUN_LOCK_TTL_SECONDS,
+        })
+
+    def _supervise_once(self) -> dict[str, object]:
+        with self._lock:
+            if self._runner_alive_locked():
+                return {"state": "running", "pid": os.getpid()}
+            if self._lock_owner:
+                lock_owner = self._lock_owner
+                self._lock_owner = ""
+                self._lock_lost = False
+                runtime_state.release_lock(REGISTER_RUN_LOCK, lock_owner)
+                self._append_log("注册 runner 异常停止，已释放本进程注册锁并等待恢复", "yellow", force=True)
+                logger.warning({"event": "register_runner_stale_lock_released", "pid": os.getpid()})
+            loaded = self._load()
+            if loaded:
+                self._config = loaded
+            self._refresh_persisted_runtime_locked()
+            if self._apply_stop_request_locked() or self._stop_requested():
+                return {"state": "stopped", "pid": os.getpid()}
+            if not bool(self._config.get("enabled")):
+                return {"state": "disabled", "pid": os.getpid()}
+            lock_owner = runtime_state.acquire_lock(REGISTER_RUN_LOCK, ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS)
+            if not lock_owner:
+                self._log_recovery_wait_locked()
+                return {"state": "waiting_lock", "pid": os.getpid()}
+            self._lock_owner = lock_owner
+            self._start_runner_locked(reset_runtime=False, recovered=True)
+            self._append_log(
+                f"注册任务恢复启动，模式={self._config['mode']}，线程数={self._config['threads']}",
+                "yellow",
+                force=True,
+            )
+            return {"state": "recovered", "pid": os.getpid()}
+
+    def _supervise_loop(self) -> None:
+        while not self._supervisor_stop.is_set():
+            try:
+                self._supervise_once()
+            except Exception as exc:
+                logger.warning({
+                    "event": "register_supervisor_error",
+                    "pid": os.getpid(),
+                    "error": str(exc)[:300],
+                })
+            if self._supervisor_stop.wait(REGISTER_SUPERVISOR_INTERVAL_SECONDS):
+                return
 
     def runtime_snapshot(self) -> dict:
         with self._lock:
@@ -305,7 +454,7 @@ class RegisterService:
 
     def start(self) -> dict:
         with self._lock:
-            if self._runner and self._runner.is_alive():
+            if self._runner_alive_locked():
                 if not self._stop_requested():
                     self._config["enabled"] = True
                     self._save_runtime(force=True)
@@ -316,26 +465,15 @@ class RegisterService:
             lock_owner = runtime_state.acquire_lock(REGISTER_RUN_LOCK, ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS)
             if not lock_owner:
                 self._refresh_persisted_runtime_locked()
+                self._clear_stop_requested()
+                self._config["enabled"] = True
+                self._config["stats"]["updated_at"] = _now()
+                self._save_runtime(force=True)
+                self._log_recovery_wait_locked()
                 return self.get()
             self._lock_owner = lock_owner
             self._clear_stop_requested()
-            self._config["enabled"] = True
-            self._drop_mail_proxy()
-            self._config["logs"] = []
-            metrics = self._pool_metrics()
-            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
-            with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
-            self._save()
-            db = _db_backend()
-            if db is not None:
-                try:
-                    db.save_named_config(REGISTER_RUNTIME_CONFIG_KEY, self._snapshot(runtime_only=True))
-                except Exception:
-                    pass
-            self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
-            self._runner.start()
+            self._start_runner_locked(reset_runtime=True, recovered=False)
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
             return self.get()
 
@@ -424,12 +562,17 @@ class RegisterService:
 
     def _bump(self, **updates) -> None:
         with self._lock:
-            if self._lock_owner:
-                runtime_state.extend_lock(
+            lock_lost_now = False
+            if self._lock_owner and not self._lock_lost:
+                extended = runtime_state.extend_lock(
                     REGISTER_RUN_LOCK,
                     self._lock_owner,
                     ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS,
                 )
+                if not extended:
+                    self._lock_lost = True
+                    self._config["enabled"] = False
+                    lock_lost_now = True
             self._config["stats"].update(updates)
             stats = self._config["stats"]
             started_at = str(stats.get("started_at") or "")
@@ -446,6 +589,9 @@ class RegisterService:
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
             self._save_runtime()
+        if lock_lost_now:
+            self._append_log("注册锁续租失败，本 worker 停止提交新注册任务并退出", "red", force=True)
+            logger.warning({"event": "register_lock_lost_exit", "pid": os.getpid()})
 
     def _apply_stop_request_locked(self) -> bool:
         if not self._stop_requested():
@@ -458,6 +604,8 @@ class RegisterService:
     def _refresh_runtime_cfg_for_runner(self) -> dict:
         with self._lock:
             cfg = self._runtime_cfg_locked()
+            if self._lock_lost:
+                cfg["enabled"] = False
             if self._apply_stop_request_locked():
                 cfg["enabled"] = False
             return cfg
@@ -472,16 +620,26 @@ class RegisterService:
     def _run(self) -> None:
         cfg = self._refresh_runtime_cfg_for_runner()
         threads = int(cfg["threads"])
-        submitted, done, success, fail = 0, 0, 0, 0
+        with self._lock:
+            stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
+            done = max(0, int(stats.get("done") or 0))
+            success = max(0, int(stats.get("success") or 0))
+            fail = max(0, int(stats.get("fail") or 0))
+        submitted = max(done, success + fail)
+        lock_lost_exit = False
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
                 cfg = self._refresh_runtime_cfg_for_runner()
+                if self._lock_lost:
+                    lock_lost_exit = True
                 while bool(cfg.get("enabled")) and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
                 cfg = self._refresh_runtime_cfg_for_runner()
+                if self._lock_lost:
+                    lock_lost_exit = True
                 enabled = bool(cfg.get("enabled"))
                 if not futures and (not enabled or str(cfg.get("mode") or "total") == "total"):
                     break
@@ -501,15 +659,21 @@ class RegisterService:
                         fail += 1
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
         with self._lock:
-            self._config["enabled"] = False
-            self._save()
+            stopped_by_user = self._stop_requested()
+            keep_enabled_for_recovery = bool(self._lock_lost or lock_lost_exit) and not stopped_by_user
+            self._config["enabled"] = bool(keep_enabled_for_recovery)
+            if not keep_enabled_for_recovery:
+                self._save()
             self._save_runtime(force=True)
             lock_owner = self._lock_owner
             self._lock_owner = ""
             if lock_owner:
                 runtime_state.release_lock(REGISTER_RUN_LOCK, lock_owner)
-            self._clear_stop_requested()
-        self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow", force=True)
+            if not keep_enabled_for_recovery:
+                self._clear_stop_requested()
+            self._lock_lost = False
+        suffix = "，等待其他 worker 恢复" if keep_enabled_for_recovery else ""
+        self._append_log(f"注册任务结束，成功{success}，失败{fail}{suffix}", "yellow", force=True)
         trim_memory("register_run_finished", force=True)
 
 

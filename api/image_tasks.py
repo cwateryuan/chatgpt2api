@@ -4,11 +4,12 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import ImageInputError, parse_image_edit_request, read_image_sources_with_diagnostics
 from api.support import require_identity, resolve_client_ip, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
+from services.protocol.error_response import openai_error_response
 
 
 class ImageGenerationTaskRequest(BaseModel):
@@ -33,6 +34,18 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
     except HTTPException as exc:
         call.log("调用失败", status="failed", error=str(exc.detail))
         raise
+
+
+def _image_input_log_detail(
+        image_inputs: list[dict[str, object]] | None = None,
+        mask_inputs: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    detail: dict[str, object] = {}
+    if image_inputs is not None:
+        detail["image_inputs"] = image_inputs
+    if mask_inputs is not None:
+        detail["mask_inputs"] = mask_inputs
+    return detail
 
 
 def create_router() -> APIRouter:
@@ -90,19 +103,35 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
         prompt = str(payload["prompt"])
         model = str(payload["model"])
-        await filter_or_log(
-            LoggedCall(
-                identity,
-                "/api/image-tasks/edits",
-                model,
-                "图生图任务",
-                request_text=prompt,
-                client_ip=resolve_client_ip(request),
-            ),
-            prompt,
+        call = LoggedCall(
+            identity,
+            "/api/image-tasks/edits",
+            model,
+            "图生图任务",
+            request_text=prompt,
+            client_ip=resolve_client_ip(request),
         )
-        images = await read_image_sources(image_sources)
-        masks = await read_image_sources(mask_sources) if mask_sources else None
+        await filter_or_log(call, prompt)
+        image_inputs: list[dict[str, object]] = []
+        mask_inputs: list[dict[str, object]] = []
+        try:
+            images, image_inputs = await read_image_sources_with_diagnostics(image_sources, role="image")
+            masks = None
+            if mask_sources:
+                masks, mask_inputs = await read_image_sources_with_diagnostics(mask_sources, role="mask")
+            call.extra_detail.update(_image_input_log_detail(image_inputs, mask_inputs if mask_sources else None))
+        except ImageInputError as exc:
+            if exc.role == "mask":
+                mask_inputs = exc.diagnostics
+            else:
+                image_inputs = exc.diagnostics
+            call.log(
+                "调用失败",
+                status="failed",
+                error=str(exc.detail),
+                extra_detail=_image_input_log_detail(image_inputs, mask_inputs if mask_sources else None),
+            )
+            return openai_error_response(exc.detail, exc.status_code)
         try:
             return await run_in_threadpool(
                 image_task_service.submit_edit,
@@ -115,6 +144,7 @@ def create_router() -> APIRouter:
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,
+                image_input_diagnostics=call.extra_detail,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc

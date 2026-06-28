@@ -51,6 +51,10 @@ def _has_register_thread() -> bool:
     return any(thread.is_alive() and thread.name == "openai-register" for thread in threading.enumerate())
 
 
+def _register_thread_names() -> list[str]:
+    return sorted(thread.name for thread in threading.enumerate() if thread.is_alive() and "register" in thread.name)
+
+
 def _runtime_inflight_total() -> int:
     try:
         from services.runtime_state import runtime_state
@@ -115,6 +119,7 @@ def _should_recycle(
         "image_task_threads": image_task_threads,
         "unfinished_image_tasks": unfinished_image_tasks,
         "register_running": register_running,
+        "register_thread_names": _register_thread_names(),
         "age_secs": round(age_secs, 3),
         "require_global_idle": require_global_idle,
     }

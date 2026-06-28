@@ -207,6 +207,7 @@ class ImageTaskService:
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        image_input_diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -218,6 +219,7 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "_log_detail": image_input_diagnostics or {},
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -310,13 +312,15 @@ class ImageTaskService:
     ) -> None:
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        log_detail = payload.get("_log_detail") if isinstance(payload.get("_log_detail"), dict) else {}
+        handler_payload = {k: v for k, v in payload.items() if not str(k).startswith("_")}
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**payload, "progress_callback": progress_callback}
+        payload_with_progress = {**handler_payload, "progress_callback": progress_callback}
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -346,6 +350,7 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
                 account_email=account_email,
+                extra_detail=log_detail,
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
@@ -365,6 +370,7 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
+                extra_detail=log_detail,
             )
 
     def _log_call(
@@ -380,6 +386,7 @@ class ImageTaskService:
         error: str = "",
         urls: list[str] | None = None,
         account_email: str = "",
+        extra_detail: dict[str, Any] | None = None,
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -402,6 +409,8 @@ class ImageTaskService:
             detail["account_email"] = account_email
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
+        if extra_detail:
+            detail.update(extra_detail)
         try:
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:

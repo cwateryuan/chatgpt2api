@@ -5,6 +5,8 @@ import binascii
 import json
 import mimetypes
 import re
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import unquote, unquote_to_bytes, urlparse
@@ -12,31 +14,57 @@ from urllib.parse import unquote, unquote_to_bytes, urlparse
 from curl_cffi import requests
 from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from PIL import Image, UnidentifiedImageError
 from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
+from services.protocol.error_response import error_message_from_detail
 
 ImageInput = tuple[bytes, str, str]
-ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
 
+@dataclass(frozen=True)
+class ImageSourceRef:
+    source_type: str
+    value: str
+    filename: str = ""
+    mime_type: str = ""
+
+
+ImageSource = ImageSourceRef | UploadFile | ImageInput
+
+
+class ImageInputError(HTTPException):
+    def __init__(self, message: str, diagnostics: list[dict[str, Any]], *, role: str = "image") -> None:
+        super().__init__(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": str(message or "invalid image input"),
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "invalid_image_input",
+                }
+            },
+        )
+        self.diagnostics = diagnostics
+        self.role = role
+
+
 def _clean(value: object, default: str = "") -> str:
-    """清理字符串：转换为字符串并去掉首尾空白。"""
     text = str(value if value is not None else default).strip()
     return text or default
 
 
 def _is_upload(value: object) -> TypeGuard[UploadFile]:
-    """识别上传文件：兼容 Starlette 表单返回的 UploadFile。"""
     return isinstance(value, UploadFile)
 
 
 def _parse_bool(value: object) -> bool | None:
-    """解析布尔字段：兼容 JSON 布尔值和表单字符串。"""
     if value is None or value == "":
         return None
     if isinstance(value, bool):
@@ -50,7 +78,6 @@ def _parse_bool(value: object) -> bool | None:
 
 
 def _parse_count(value: object) -> int:
-    """解析生成数量：保持图片接口的 1 到 4 限制。"""
     try:
         count = int(value or 1)
     except (TypeError, ValueError) as exc:
@@ -61,7 +88,6 @@ def _parse_count(value: object) -> int:
 
 
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
-    """构造图片编辑载荷：从表单或 JSON 字段提取通用参数。"""
     prompt = _clean(fields.get("prompt"))
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
@@ -80,7 +106,6 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
 
 
 def _json_reference_value(value: object) -> object:
-    """解析表单图片引用：支持把 images 字段写成 JSON 字符串。"""
     if not isinstance(value, str):
         return value
     text = value.strip()
@@ -92,20 +117,11 @@ def _json_reference_value(value: object) -> object:
         return value
 
 
-def _decode_base64_image(value: object, filename: str, mime_type: str) -> ImageInput:
-    try:
-        data = base64.b64decode(str(value).strip(), validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
-    return data, filename, mime_type
+def _base64_source(value: object, filename: str, mime_type: str, source_type: str) -> ImageSourceRef:
+    return ImageSourceRef(source_type=source_type, value=str(value or ""), filename=filename, mime_type=mime_type)
 
 
 def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
-    """提取图片引用对象：支持 image_url 或 url，明确拒绝 file_id。"""
     has_url = "image_url" in value or "url" in value
     if value.get("file_id"):
         raise HTTPException(
@@ -116,7 +132,7 @@ def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
     if inline:
         filename = _clean(value.get("filename") or value.get("file_name"), "image.png")
         mime_type = _clean(value.get("mime_type") or value.get("mimeType"), "image/png")
-        return [_decode_base64_image(inline, filename, mime_type)]
+        return [_base64_source(inline, filename, mime_type, "json_b64")]
     if not has_url:
         raise HTTPException(status_code=400, detail={"error": "image reference must include image_url"})
     image_url = value.get("image_url", value.get("url"))
@@ -126,7 +142,6 @@ def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
 
 
 def _sources_from_value(value: object) -> list[ImageSource]:
-    """展开图片引用：把字符串、数组和对象统一成图片来源列表。"""
     value = _json_reference_value(value)
     if _is_upload(value):
         return [value]
@@ -134,9 +149,12 @@ def _sources_from_value(value: object) -> list[ImageSource]:
         text = value.strip()
         if not text:
             return []
-        if text.lower().startswith(("data:", "http://", "https://")):
-            return [text]
-        return [_decode_base64_image(text, "image.png", "image/png")]
+        lower = text.lower()
+        if lower.startswith("data:"):
+            return [ImageSourceRef(source_type="data_url", value=text)]
+        if lower.startswith(("http://", "https://")):
+            return [ImageSourceRef(source_type="url", value=text)]
+        return [_base64_source(text, "image.png", "image/png", "base64")]
     if isinstance(value, list):
         sources: list[ImageSource] = []
         for item in value:
@@ -150,7 +168,6 @@ def _sources_from_value(value: object) -> list[ImageSource]:
 
 
 def _json_image_sources(body: dict[str, Any]) -> list[ImageSource]:
-    """读取 JSON 图片引用：优先支持官方 images 数组字段。"""
     sources: list[ImageSource] = []
     for key in ("images", "image", "image_url"):
         if key in body:
@@ -159,7 +176,6 @@ def _json_image_sources(body: dict[str, Any]) -> list[ImageSource]:
 
 
 def _json_mask_sources(body: dict[str, Any]) -> list[ImageSource]:
-    """读取 JSON mask 引用。"""
     mask = body.get("mask")
     if mask is not None:
         return _sources_from_value(mask)
@@ -167,10 +183,6 @@ def _json_mask_sources(body: dict[str, Any]) -> list[ImageSource]:
 
 
 async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], list[ImageSource], list[ImageSource]]:
-    """解析图片编辑请求：同时支持 multipart 上传和官方 JSON 图片 URL。
-    
-    返回 (payload, image_sources, mask_sources)
-    """
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type == "application/json":
         try:
@@ -198,7 +210,6 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
 
 def _extension_from_mime(mime_type: str) -> str:
-    """推导图片扩展名：把 MIME 类型转换为常见文件后缀。"""
     subtype = mime_type.split("/", 1)[1].split("+", 1)[0] if "/" in mime_type else "png"
     if subtype == "jpeg":
         return "jpg"
@@ -206,7 +217,6 @@ def _extension_from_mime(mime_type: str) -> str:
 
 
 def _safe_filename(name: str, mime_type: str, fallback: str) -> str:
-    """生成安全文件名：清理 URL 文件名并补齐扩展名。"""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
     if not cleaned:
         cleaned = fallback
@@ -215,54 +225,77 @@ def _safe_filename(name: str, mime_type: str, fallback: str) -> str:
     return cleaned
 
 
+def _first_bytes_preview(data: bytes | bytearray | None) -> str:
+    if not data:
+        return ""
+    return bytes(data[:32]).hex()
+
+
+def _diag_url_fields(diag: dict[str, Any], url: str) -> None:
+    parsed = urlparse(url)
+    diag["url_scheme"] = parsed.scheme
+    host = parsed.hostname or ""
+    diag["url_host"] = f"{host}:{parsed.port}" if host and parsed.port else host
+    diag["url_path"] = parsed.path or "/"
+
+
+def _diag_data_url_fields(diag: dict[str, Any], url: str) -> None:
+    header = str(url or "").split(",", 1)[0]
+    mime_type = header.split(";", 1)[0].removeprefix("data:") or "image/png"
+    diag["url_scheme"] = "data"
+    diag["declared_mime"] = mime_type
+
+
+def _invalid(message: str) -> ValueError:
+    return ValueError(message)
+
+
+def _decode_base64_data(value: str) -> bytes:
+    try:
+        return base64.b64decode(str(value).strip(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise _invalid("invalid base64 image data") from exc
+
+
 def _decode_data_url(url: str) -> ImageInput:
-    """解码 data URL：把内联图片转成标准图片输入元组。"""
     header, separator, payload = url.partition(",")
     if not separator:
-        raise HTTPException(status_code=400, detail={"error": "invalid data image URL"})
+        raise _invalid("invalid data image URL")
     mime_type = header.split(";", 1)[0].removeprefix("data:") or "image/png"
     if not mime_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+        raise _invalid("image_url must point to an image")
     try:
         data = base64.b64decode(payload, validate=True) if ";base64" in header else unquote_to_bytes(payload)
     except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid data image URL"}) from exc
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image URL is empty"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
+        raise _invalid("invalid data image URL") from exc
     return data, f"image_url.{_extension_from_mime(mime_type)}", mime_type
 
 
 def _response_mime_type(response: requests.Response, parsed_path: str) -> str:
-    """识别下载图片类型：优先响应头，必要时按 URL 后缀推断。"""
     header_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
     guessed_type = mimetypes.guess_type(parsed_path)[0] or ""
     if header_type.startswith("image/"):
         return header_type
     if header_type and header_type not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+        raise _invalid("image_url must point to an image")
     if guessed_type.startswith("image/"):
         return guessed_type
     if not header_type or header_type in {"application/octet-stream", "binary/octet-stream"}:
         return "image/png"
-    raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+    raise _invalid("image_url must point to an image")
 
 
 def _filename_from_url(parsed_path: str, mime_type: str) -> str:
-    """生成 URL 图片文件名：从链接路径提取名称并做安全化。"""
     raw_name = PurePosixPath(unquote(parsed_path)).name
     return _safe_filename(raw_name, mime_type, "image_url")
 
 
-def _download_image_url(url: str) -> ImageInput:
-    """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
+def _download_image_url_with_diagnostics(url: str, diag: dict[str, Any]) -> ImageInput:
     source = _clean(url)
-    if source.startswith("data:"):
-        return _decode_data_url(source)
+    _diag_url_fields(diag, source)
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
+        raise _invalid("image_url must be an http or https URL")
     try:
         response = requests.get(
             source,
@@ -272,38 +305,141 @@ def _download_image_url(url: str) -> ImageInput:
             **proxy_settings.build_session_kwargs(),
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+        error_name = exc.__class__.__name__
+        raise _invalid(f"image_url fetch failed: {error_name}") from exc
+    diag["http_status"] = int(response.status_code)
+    content_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip()
+    if content_type:
+        diag["response_content_type"] = content_type
     content_length = _clean(response.headers.get("content-length"))
+    if content_length:
+        diag["response_content_length"] = int(content_length) if content_length.isdigit() else content_length
+    if not 200 <= response.status_code < 300:
+        diag["first_bytes_preview"] = _first_bytes_preview(response.content)
+        raise _invalid(f"image_url fetch failed: HTTP {response.status_code}")
     if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+        raise _invalid("image_url exceeds 50MB limit")
     data = response.content
     if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+        raise _invalid("image_url returned empty content")
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
+        raise _invalid("image_url exceeds 50MB limit")
+    diag["bytes"] = len(data)
+    try:
+        mime_type = _response_mime_type(response, parsed.path)
+    except Exception:
+        diag["first_bytes_preview"] = _first_bytes_preview(data)
+        raise
     return data, _filename_from_url(parsed.path, mime_type), mime_type
 
 
-async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
-    """读取图片来源：上传文件直接读取，URL 下载后统一返回图片元组。"""
+def _image_mime(format_name: str) -> str:
+    if not format_name:
+        return ""
+    return Image.MIME.get(format_name.upper(), f"image/{format_name.lower()}")
+
+
+def _inspect_image(data: bytes, diag: dict[str, Any]) -> tuple[str, str]:
+    try:
+        with Image.open(BytesIO(data)) as image:
+            format_name = str(image.format or "").upper()
+            width, height = image.size
+            image.verify()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise _invalid(f"image parse failed: {exc}") from exc
+    diag["detected_format"] = format_name
+    detected_mime = _image_mime(format_name)
+    if detected_mime:
+        diag["detected_mime"] = detected_mime
+    diag["width"] = int(width)
+    diag["height"] = int(height)
+    return format_name, detected_mime
+
+
+def _ensure_image_limits(data: bytes, source_name: str) -> None:
+    if not data:
+        raise _invalid(f"{source_name} is empty")
+    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
+        raise _invalid(f"{source_name} exceeds 50MB limit")
+
+
+def _read_source_sync(source: ImageSourceRef, diag: dict[str, Any]) -> ImageInput:
+    if source.source_type == "url":
+        return _download_image_url_with_diagnostics(source.value, diag)
+    if source.source_type == "data_url":
+        _diag_data_url_fields(diag, source.value)
+        return _decode_data_url(source.value)
+    data = _decode_base64_data(source.value)
+    return data, source.filename or "image.png", source.mime_type or "image/png"
+
+
+def _error_message(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        return error_message_from_detail(exc.detail)
+    return str(exc) or "invalid image input"
+
+
+async def read_image_sources_with_diagnostics(
+    sources: list[ImageSource],
+    *,
+    role: str = "image",
+) -> tuple[list[ImageInput], list[dict[str, Any]]]:
     images: list[ImageInput] = []
-    for source in sources:
-        if isinstance(source, tuple):
-            images.append(source)
-            continue
-        if _is_upload(source):
-            try:
-                image_data = await source.read()
-            finally:
-                await source.close()
-            if not image_data:
-                raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-            images.append((image_data, source.filename or "image.png", source.content_type or "image/png"))
-            continue
-        images.append(await run_in_threadpool(_download_image_url, source))
+    diagnostics: list[dict[str, Any]] = []
+    for index, source in enumerate(sources, start=1):
+        data: bytes | None = None
+        diag: dict[str, Any] = {"role": role, "index": index}
+        try:
+            if _is_upload(source):
+                diag["source_type"] = "upload"
+                if source.filename:
+                    diag["filename"] = source.filename
+                if source.content_type:
+                    diag["declared_mime"] = source.content_type
+                try:
+                    data = await source.read()
+                finally:
+                    await source.close()
+                filename = source.filename or "image.png"
+                mime_type = source.content_type or "image/png"
+            elif isinstance(source, tuple):
+                diag["source_type"] = "inline"
+                data, filename, mime_type = source
+                if filename:
+                    diag["filename"] = filename
+                if mime_type:
+                    diag["declared_mime"] = mime_type
+            else:
+                diag["source_type"] = source.source_type
+                if source.filename:
+                    diag["filename"] = source.filename
+                if source.mime_type:
+                    diag["declared_mime"] = source.mime_type
+                data, filename, mime_type = await run_in_threadpool(_read_source_sync, source, diag)
+                if filename:
+                    diag.setdefault("filename", filename)
+                if mime_type:
+                    diag.setdefault("declared_mime", mime_type)
+            _ensure_image_limits(data, "image file" if role == "image" else "mask file")
+            diag["bytes"] = len(data)
+            _format, detected_mime = _inspect_image(data, diag)
+            if not str(mime_type or "").lower().startswith("image/") and detected_mime:
+                mime_type = detected_mime
+            images.append((data, filename, mime_type or detected_mime or "image/png"))
+            diagnostics.append(diag)
+        except Exception as exc:
+            message = _error_message(exc)
+            diag["parse_error"] = message
+            preview = _first_bytes_preview(data)
+            if preview:
+                diag["first_bytes_preview"] = preview
+            diagnostics.append(diag)
+            raise ImageInputError(message, diagnostics, role=role) from exc
     if not images:
-        raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
+        raise ImageInputError("image file is required", diagnostics, role=role)
+    return images, diagnostics
+
+
+async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
+    images, _diagnostics = await read_image_sources_with_diagnostics(sources)
     return images

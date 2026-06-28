@@ -5,11 +5,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import ImageInputError, parse_image_edit_request, read_image_sources_with_diagnostics
 from api.support import require_identity, resolve_client_ip, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import editable_file_task_service
 from services.log_service import LoggedCall
+from services.protocol.error_response import openai_error_response
 from services.protocol import (
     anthropic_v1_messages,
     openai_v1_chat_complete,
@@ -77,6 +78,18 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
         raise
 
 
+def _image_input_log_detail(
+        image_inputs: list[dict[str, object]] | None = None,
+        mask_inputs: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    detail: dict[str, object] = {}
+    if image_inputs is not None:
+        detail["image_inputs"] = image_inputs
+    if mask_inputs is not None:
+        detail["mask_inputs"] = mask_inputs
+    return detail
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -126,9 +139,25 @@ def create_router() -> APIRouter:
             client_ip=resolve_client_ip(request),
         )
         await filter_or_log(call, prompt)
-        payload["images"] = await read_image_sources(image_sources)
-        if mask_sources:
-            payload["mask"] = await read_image_sources(mask_sources)
+        image_inputs: list[dict[str, object]] = []
+        mask_inputs: list[dict[str, object]] = []
+        try:
+            payload["images"], image_inputs = await read_image_sources_with_diagnostics(image_sources, role="image")
+            if mask_sources:
+                payload["mask"], mask_inputs = await read_image_sources_with_diagnostics(mask_sources, role="mask")
+            call.extra_detail.update(_image_input_log_detail(image_inputs, mask_inputs if mask_sources else None))
+        except ImageInputError as exc:
+            if exc.role == "mask":
+                mask_inputs = exc.diagnostics
+            else:
+                image_inputs = exc.diagnostics
+            call.log(
+                "调用失败",
+                status="failed",
+                error=str(exc.detail),
+                extra_detail=_image_input_log_detail(image_inputs, mask_inputs if mask_sources else None),
+            )
+            return openai_error_response(exc.detail, exc.status_code)
         payload["base_url"] = resolve_image_base_url(request)
         return await call.run(openai_v1_image_edit.handle, payload)
 

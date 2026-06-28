@@ -244,6 +244,7 @@ class LoggedCall:
     request_text: str = ""
     request_shape: dict[str, int] | None = None
     client_ip: str = ""
+    extra_detail: dict[str, Any] = field(default_factory=dict)
 
     async def run(self, handler, *args, sse: str = "openai"):
         from services.protocol.conversation import ImageGenerationError
@@ -321,7 +322,8 @@ class LoggedCall:
                          conversation_id=conversation_ids[0] if conversation_ids else "")
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
-            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
+            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
+            extra_detail: dict[str, Any] | None = None) -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -358,4 +360,7 @@ class LoggedCall:
         collected_urls = [*(urls or []), *_collect_urls(result)]
         if collected_urls and not self.endpoint.startswith("/v1/search"):
             detail["urls"] = list(dict.fromkeys(collected_urls))
+        merged_extra = {**self.extra_detail, **(extra_detail or {})}
+        if merged_extra:
+            detail.update(merged_extra)
         log_service.add(LOG_TYPE_CALL, f"{self.summary}{suffix}", detail)

@@ -11,12 +11,16 @@ from services.register_service import REGISTER_RUNTIME_CONFIG_KEY, RegisterServi
 class FakeRuntimeState:
     def __init__(self):
         self.flags: dict[str, str] = {}
+        self.lock_available = True
+        self.extend_ok = True
+        self.acquire_calls = 0
 
     def acquire_lock(self, *_args, **_kwargs):
-        return "owner"
+        self.acquire_calls += 1
+        return "owner" if self.lock_available else ""
 
     def extend_lock(self, *_args, **_kwargs):
-        return True
+        return self.extend_ok
 
     def release_lock(self, *_args, **_kwargs):
         return None
@@ -125,6 +129,87 @@ class RegisterServiceMemoryTests(unittest.TestCase):
 
         self.assertFalse(snapshot["enabled"])
         self.assertEqual(snapshot["stats"]["running"], 2)
+
+    def test_supervisor_waits_for_old_lock_then_recovers_without_resetting_logs(self):
+        runtime_state = FakeRuntimeState()
+        runtime_state.lock_available = False
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("services.register_service._db_backend", return_value=None),
+            mock.patch("services.register_service.runtime_state", runtime_state),
+            mock.patch.object(RegisterService, "_run", lambda self: None),
+        ):
+            path = Path(tmp) / "register.json"
+            service = RegisterService(path)
+            service._config["enabled"] = True
+            service._config["threads"] = 1
+            service._config["logs"] = [{"time": "now", "text": "keep me", "level": "yellow"}]
+            service._config["stats"] = {"success": 3, "fail": 1, "done": 4, "running": 0, "threads": 1}
+            service._save()
+
+            waiting = service._supervise_once()
+            self.assertEqual(waiting["state"], "waiting_lock")
+            self.assertIsNone(service._runner)
+
+            runtime_state.lock_available = True
+            recovered = service._supervise_once()
+            self.assertEqual(recovered["state"], "recovered")
+            self.assertEqual(service._lock_owner, "owner")
+            snapshot = service.get()
+            texts = [item["text"] for item in snapshot["logs"]]
+            self.assertIn("keep me", texts)
+            self.assertEqual(snapshot["stats"]["success"], 3)
+            from services.register_service import openai_register
+
+            self.assertEqual(openai_register.stats["success"], 3)
+
+    def test_start_keeps_enabled_when_old_lock_blocks_runner(self):
+        runtime_state = FakeRuntimeState()
+        runtime_state.lock_available = False
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("services.register_service._db_backend", return_value=None),
+            mock.patch("services.register_service.runtime_state", runtime_state),
+        ):
+            service = RegisterService(Path(tmp) / "register.json")
+            snapshot = service.start()
+
+        self.assertTrue(snapshot["enabled"])
+        self.assertIsNone(service._runner)
+
+    def test_supervisor_does_not_restart_after_user_stop(self):
+        runtime_state = FakeRuntimeState()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("services.register_service._db_backend", return_value=None),
+            mock.patch("services.register_service.runtime_state", runtime_state),
+            mock.patch.object(RegisterService, "_run", lambda self: None),
+        ):
+            service = RegisterService(Path(tmp) / "register.json")
+            service._config["enabled"] = True
+            service._save()
+            runtime_state.set_flag("register:stop_requested")
+
+            state = service._supervise_once()
+
+        self.assertEqual(state["state"], "stopped")
+        self.assertEqual(runtime_state.acquire_calls, 0)
+
+    def test_bump_marks_lock_lost_when_extend_fails(self):
+        runtime_state = FakeRuntimeState()
+        runtime_state.extend_ok = False
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("services.register_service._db_backend", return_value=None),
+            mock.patch("services.register_service.runtime_state", runtime_state),
+        ):
+            service = RegisterService(Path(tmp) / "register.json")
+            service._lock_owner = "owner"
+            service._config["enabled"] = True
+            service._bump(running=0)
+
+        self.assertTrue(service._lock_lost)
+        self.assertFalse(service._config["enabled"])
 
 
 if __name__ == "__main__":

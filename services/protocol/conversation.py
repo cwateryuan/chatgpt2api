@@ -314,13 +314,29 @@ def format_downloaded_image_result(
     base_url: str | None = None,
     created: int | None = None,
 ) -> dict[str, Any]:
-    return format_image_result(
-        ({"image_bytes": image_data} for image_data in backend.iter_image_bytes(image_urls)),
-        prompt,
-        response_format,
-        base_url,
-        created,
-    )
+    try:
+        return format_image_result(
+            ({"image_bytes": image_data} for image_data in backend.iter_image_bytes(image_urls)),
+            prompt,
+            response_format,
+            base_url,
+            created,
+        )
+    except ImageGenerationError:
+        raise
+    except Exception as exc:
+        logger.warning({
+            "event": "upstream_image_download",
+            "status": "failed",
+            "url_count": len(image_urls),
+            "error": str(exc)[:300],
+        })
+        raise ImageGenerationError(
+            "upstream image download failed",
+            status_code=502,
+            error_type="server_error",
+            code="upstream_image_download",
+        ) from exc
 
 
 @dataclass
