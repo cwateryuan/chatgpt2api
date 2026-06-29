@@ -20,6 +20,7 @@ from services.account_service import account_service
 from services.memory import trim_memory
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
+from utils.log import logger
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -116,6 +117,8 @@ def log(text: str, color: str = "") -> None:
             register_log_sink(text, color)
         except Exception:
             pass
+    if not logger._enabled("info"):
+        return
     with print_lock:
         prefix = colors.get(color, "")
         suffix = "\033[0m" if prefix else ""
@@ -373,7 +376,11 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
         timeout=60,
     )
     if resp.status_code != 200:
-        print(resp.text)
+        logger.warning({
+            "event": "platform_oauth_token_failed",
+            "status_code": resp.status_code,
+            "body_preview": str(resp.text or "")[:500],
+        })
         return None
     return _response_json(resp)
 

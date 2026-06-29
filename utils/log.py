@@ -22,10 +22,14 @@ class Logger:
     def _enabled(self, level: str) -> bool:
         try:
             from services.config import config
-            levels = set(config.log_levels)
+            raw_levels = config.data.get("log_levels") if isinstance(getattr(config, "data", None), dict) else None
+            if raw_levels is None:
+                levels = {"info", "warning", "error"}
+            else:
+                levels = set(config.log_levels)
         except Exception:
-            levels = set()
-        return level in (levels or {"info", "warning", "error"})
+            levels = {"info", "warning", "error"}
+        return level in levels
 
     def _mask_string(self, value: str, keep: int = 10) -> str:
         if len(value) <= keep:

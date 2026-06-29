@@ -7,6 +7,7 @@ from services.storage.base import StorageBackend
 from services.storage.database_storage import DatabaseStorageBackend
 from services.storage.git_storage import GitStorageBackend
 from services.storage.json_storage import JSONStorageBackend
+from utils.log import logger
 
 
 def create_storage_backend(data_dir: Path) -> StorageBackend:
@@ -23,13 +24,13 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
     """
     backend_type = os.getenv("STORAGE_BACKEND", "json").lower().strip()
     
-    print(f"[storage] Initializing storage backend: {backend_type}")
+    logger.info({"event": "storage_backend_init", "backend": backend_type})
     
     if backend_type == "json":
         # 本地 JSON 文件存储
         file_path = data_dir / "accounts.json"
         auth_keys_path = data_dir / "auth_keys.json"
-        print(f"[storage] Using JSON storage: {file_path}")
+        logger.info({"event": "storage_backend_json", "file_path": str(file_path)})
         return JSONStorageBackend(file_path, auth_keys_path)
     
     elif backend_type in ("sqlite", "postgres", "postgresql", "mysql", "database"):
@@ -39,9 +40,9 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         if not database_url:
             # 如果没有指定 DATABASE_URL，使用本地 SQLite
             database_url = f"sqlite:///{data_dir / 'accounts.db'}"
-            print(f"[storage] No DATABASE_URL provided, using local SQLite: {database_url}")
+            logger.info({"event": "storage_backend_sqlite_default", "database_url": database_url})
         else:
-            print(f"[storage] Using database storage: {_mask_password(database_url)}")
+            logger.info({"event": "storage_backend_database", "database_url": _mask_password(database_url)})
         
         return DatabaseStorageBackend(database_url)
     
@@ -59,7 +60,12 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
                 "Please set GIT_REPO_URL environment variable."
             )
         
-        print(f"[storage] Using Git storage: {_mask_token(repo_url)}, branch: {branch}, file: {file_path}")
+        logger.info({
+            "event": "storage_backend_git",
+            "repo_url": _mask_token(repo_url),
+            "branch": branch,
+            "file_path": file_path,
+        })
         
         cache_dir = data_dir / "git_cache"
         return GitStorageBackend(

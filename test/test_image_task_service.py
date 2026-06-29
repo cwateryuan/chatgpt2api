@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from services.image_task_service import ImageTaskService
+from services.image_timeout import ImageRequestDeadline
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -67,6 +68,28 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = wait_for_task(service, OWNER, "task-1", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
+
+    def test_task_handler_receives_image_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            seen: dict[str, object] = {}
+
+            def handler(payload):
+                seen.update(payload)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="deadline-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            wait_for_task(service, OWNER, "deadline-task", "success")
+            self.assertIsInstance(seen.get("deadline"), ImageRequestDeadline)
+            self.assertGreater(float(seen.get("timeout_secs") or 0), 0)
 
     def test_duplicate_submit_across_service_instances_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

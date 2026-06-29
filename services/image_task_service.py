@@ -12,6 +12,7 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
+from services.image_timeout import ImageRequestDeadline
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
@@ -320,7 +321,13 @@ class ImageTaskService:
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        payload_with_progress = {**handler_payload, "progress_callback": progress_callback}
+        timeout_secs = float(config.image_poll_timeout_secs)
+        payload_with_progress = {
+            **handler_payload,
+            "progress_callback": progress_callback,
+            "timeout_secs": timeout_secs,
+            "deadline": ImageRequestDeadline(timeout_secs, started_at=started),
+        }
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -576,10 +583,12 @@ class ImageTaskService:
             from services.protocol.conversation import format_downloaded_image_result
 
             backend = OpenAIBackendAPI()
+            deadline = ImageRequestDeadline(extra_timeout_secs, started_at=started)
             try:
                 file_ids, sediment_ids = backend._poll_image_results(
                     conversation_id,
                     extra_timeout_secs,
+                    deadline=deadline,
                 )
                 if not file_ids and not sediment_ids:
                     raise RuntimeError(
@@ -587,7 +596,7 @@ class ImageTaskService:
                     )
 
                 image_urls = backend.resolve_conversation_image_urls(
-                    conversation_id, file_ids, sediment_ids, poll=False,
+                    conversation_id, file_ids, sediment_ids, poll=False, deadline=deadline,
                 )
                 if not image_urls:
                     raise RuntimeError("图片 URL 解析失败")
@@ -599,6 +608,7 @@ class ImageTaskService:
                     "b64_json",
                     "",
                     int(time.time()),
+                    deadline,
                 )["data"]
             finally:
                 backend.close()

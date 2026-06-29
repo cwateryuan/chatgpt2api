@@ -5,11 +5,13 @@ from unittest import mock
 
 from services.protocol.conversation import (
     ConversationRequest,
+    ImageGenerationTimeoutError,
     ImageOutput,
     _generate_single_image,
     format_downloaded_image_result,
     format_image_result,
 )
+from services.image_timeout import ImageRequestDeadline
 
 
 class FakeBackend:
@@ -101,6 +103,19 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
         self.assertEqual(outputs[0].data[0]["url"], "http://app.test/image.png")
         self.assertIn("token-1", service.released)
         self.assertIn(("token-2", True), service.marked)
+
+    def test_expired_deadline_raises_image_generation_timeout(self):
+        deadline = ImageRequestDeadline(1, started_at=0)
+
+        with self.assertRaises(ImageGenerationTimeoutError) as raised:
+            _generate_single_image(
+                ConversationRequest(prompt="draw", model="gpt-image-2", deadline=deadline),
+                1,
+                1,
+            )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(raised.exception.code, "image_generation_timeout")
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from services.sub2api_service import (
     sub2api_config,
     sub2api_import_service,
 )
+from utils.log import logger
 
 
 
@@ -366,14 +367,15 @@ def create_router() -> APIRouter:
         # 入参日志：截断敏感字段，仅保留前几位，方便排错而不泄密
         cb_preview = (body.callback or "")[:80]
         sid_preview = (body.session_id or "")[:8]
-        print(
-            f"[oauth-login] finish called: session_id={sid_preview}..., callback_preview={cb_preview!r}",
-            flush=True,
-        )
+        logger.info({
+            "event": "oauth_login_finish_called",
+            "session_id_preview": f"{sid_preview}...",
+            "callback_preview": cb_preview,
+        })
         try:
             tokens = await run_in_threadpool(oauth_login_service.finish, body.session_id, body.callback)
         except OAuthLoginError as exc:
-            print(f"[oauth-login] finish rejected: {exc}", flush=True)
+            logger.warning({"event": "oauth_login_finish_rejected", "error": str(exc)})
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
         payload = {

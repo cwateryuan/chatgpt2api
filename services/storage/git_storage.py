@@ -10,6 +10,7 @@ from git import Repo
 from git.exc import GitCommandError
 
 from services.storage.base import StorageBackend
+from utils.log import logger
 
 
 class GitStorageBackend(StorageBackend):
@@ -87,7 +88,7 @@ class GitStorageBackend(StorageBackend):
         try:
             return self._load_json_file(self.file_path)
         except Exception as e:
-            print(f"[git-storage] load failed: {e}")
+            logger.warning({"event": "git_storage_load_failed", "target": "accounts", "error": str(e)})
             raise
 
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
@@ -95,7 +96,7 @@ class GitStorageBackend(StorageBackend):
         try:
             self._save_json_file(self.file_path, accounts, "Update accounts data")
         except Exception as e:
-            print(f"[git-storage] save failed: {e}")
+            logger.warning({"event": "git_storage_save_failed", "target": "accounts", "error": str(e)})
             raise e
 
     def load_auth_keys(self) -> list[dict[str, Any]]:
@@ -106,7 +107,7 @@ class GitStorageBackend(StorageBackend):
                 data = data.get("items")
             return data if isinstance(data, list) else []
         except Exception as e:
-            print(f"[git-storage] load failed: {e}")
+            logger.warning({"event": "git_storage_load_failed", "target": "auth_keys", "error": str(e)})
             raise
 
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
@@ -114,7 +115,7 @@ class GitStorageBackend(StorageBackend):
         try:
             self._save_json_file(self.auth_keys_file_path, {"items": auth_keys}, "Update auth keys data")
         except Exception as e:
-            print(f"[git-storage] save failed: {e}")
+            logger.warning({"event": "git_storage_save_failed", "target": "auth_keys", "error": str(e)})
             raise e
 
     def _load_json_file(self, file_path: str) -> list[dict[str, Any]]:

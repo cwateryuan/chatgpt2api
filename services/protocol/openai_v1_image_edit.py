@@ -14,6 +14,8 @@ from services.protocol.conversation import (
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
+from services.config import config
+from services.image_timeout import ImageRequestDeadline
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
@@ -64,6 +66,10 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
+    timeout_secs = float(body.get("timeout_secs") or config.image_poll_timeout_secs)
+    deadline = body.get("deadline")
+    if not isinstance(deadline, ImageRequestDeadline):
+        deadline = ImageRequestDeadline(timeout_secs)
     encoded_images = encode_images(images)
     if not encoded_images:
         raise ImageGenerationError("image is required")
@@ -78,6 +84,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        timeout_secs=timeout_secs,
+        deadline=deadline,
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

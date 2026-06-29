@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import threading
 
+from utils.log import logger
+
 
 def configure_thread_stack_size(default_kb: int = 0) -> int | None:
     """Configure stack size for subsequently created Python threads.
@@ -23,10 +25,10 @@ def configure_thread_stack_size(default_kb: int = 0) -> int | None:
     size_bytes = max(64 * 1024, size_kb * 1024)
     try:
         threading.stack_size(size_bytes)
-        print(f"[runtime] Python thread stack size={size_bytes} bytes", flush=True)
+        logger.info({"event": "runtime_thread_stack_size", "size_bytes": size_bytes})
         return size_bytes
     except (RuntimeError, ValueError) as exc:
-        print(f"[runtime] failed to configure Python thread stack size: {exc}", flush=True)
+        logger.warning({"event": "runtime_thread_stack_size_failed", "error": str(exc)})
         return None
 
 
@@ -46,8 +48,8 @@ def configure_threadpool_tokens(default: int = 100) -> int | None:
 
         limiter = anyio.to_thread.current_default_thread_limiter()
         limiter.total_tokens = tokens
-        print(f"[runtime] AnyIO threadpool tokens={tokens}", flush=True)
+        logger.info({"event": "runtime_threadpool_tokens", "tokens": tokens})
         return tokens
     except Exception as exc:
-        print(f"[runtime] failed to configure AnyIO threadpool tokens: {exc}", flush=True)
+        logger.warning({"event": "runtime_threadpool_tokens_failed", "error": str(exc)})
         return None

@@ -10,6 +10,8 @@ from starlette.datastructures import Headers
 from api.support import resolve_client_ip
 from services.protocol.conversation import build_image_prompt
 from services.runtime_config import configure_thread_stack_size, configure_threadpool_tokens
+from services.config import config
+from utils.log import logger
 
 
 class _Client:
@@ -58,6 +60,20 @@ class RuntimeAndLoggingTests(unittest.TestCase):
         ):
             self.assertEqual(configure_thread_stack_size(), 1024 * 1024)
             stack_size.assert_called_once_with(1024 * 1024)
+
+    def test_empty_log_levels_disables_default_console_levels(self):
+        with patch.dict(config.data, {"log_levels": []}, clear=False):
+            self.assertFalse(logger._enabled("info"))
+            self.assertFalse(logger._enabled("debug"))
+            self.assertFalse(logger._enabled("warning"))
+            self.assertFalse(logger._enabled("error"))
+
+    def test_missing_log_levels_uses_default_console_levels(self):
+        with patch.dict(config.data, {}, clear=True):
+            self.assertTrue(logger._enabled("info"))
+            self.assertFalse(logger._enabled("debug"))
+            self.assertTrue(logger._enabled("warning"))
+            self.assertTrue(logger._enabled("error"))
 
 
 if __name__ == "__main__":
