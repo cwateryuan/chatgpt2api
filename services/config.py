@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from pathlib import Path
+import threading
 import time
 
 from services.storage.base import StorageBackend
@@ -103,6 +104,13 @@ def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> in
     except (OverflowError, TypeError, ValueError):
         normalized = default
     return max(minimum, normalized)
+
+
+def _normalize_log_levels(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    allowed = {"debug", "info", "warning", "error"}
+    return [level for item in value if (level := str(item or "").strip().lower()) in allowed]
 
 
 def _normalize_backup_include(value: object) -> dict[str, bool]:
@@ -351,8 +359,10 @@ def _load_settings() -> LoadedSettings:
 class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
+        self._lock = threading.RLock()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.data = self._load()
+        self._data = self._load()
+        self._file_signature = self._stat_signature()
         self._storage_backend: StorageBackend | None = None
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
@@ -367,8 +377,89 @@ class ConfigStore:
     def _load(self) -> dict[str, object]:
         return _read_json_object(self.path, name="config.json")
 
-    def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _stat_signature(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    @property
+    def data(self) -> dict[str, object]:
+        self.reload_if_changed()
+        return self._data
+
+    @data.setter
+    def data(self, value: dict[str, object]) -> None:
+        with self._lock:
+            self._data = value
+            self._file_signature = self._stat_signature()
+
+    def reload_if_changed(self, *, force: bool = False) -> None:
+        with self._lock:
+            signature = self._stat_signature()
+            if not force and signature == self._file_signature:
+                return
+            self._data = self._load()
+            self._file_signature = self._stat_signature()
+
+    def _save(self, data: dict[str, object] | None = None) -> None:
+        payload = self._data if data is None else data
+        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._data = payload
+        self._file_signature = self._stat_signature()
+
+    def _normalize_proxy_runtime_for_update(
+        self,
+        value: object,
+        base_data: dict[str, object],
+    ) -> dict[str, object]:
+        if isinstance(value, dict):
+            incoming = dict(value)
+            previous_clearance = _normalize_proxy_runtime_settings(base_data.get("proxy_runtime")).get("clearance")
+            if isinstance(previous_clearance, dict):
+                incoming["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
+                incoming["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
+            return _normalize_proxy_runtime_settings(incoming)
+        return _normalize_proxy_runtime_settings(value)
+
+    def _is_stale_update_value(
+        self,
+        key: str,
+        value: object,
+        previous_data: dict[str, object],
+        latest_data: dict[str, object],
+    ) -> bool:
+        if key == "proxy_runtime":
+            previous_value = self._normalize_proxy_runtime_for_update(value, previous_data)
+            latest_value = self._normalize_proxy_runtime_for_update(value, latest_data)
+            previous_current = _normalize_proxy_runtime_settings(previous_data.get("proxy_runtime"))
+            latest_current = _normalize_proxy_runtime_settings(latest_data.get("proxy_runtime"))
+            return previous_value == previous_current and latest_value != latest_current
+        if key == "log_levels":
+            incoming_value = _normalize_log_levels(value)
+            previous_value = _normalize_log_levels(previous_data.get("log_levels"))
+            latest_value = _normalize_log_levels(latest_data.get("log_levels"))
+            return incoming_value == previous_value and incoming_value != latest_value
+        if key == "image_poll_timeout_secs":
+            incoming_value = _normalize_positive_int(value, 120, 1)
+            previous_value = _normalize_positive_int(previous_data.get("image_poll_timeout_secs"), 120, 1)
+            latest_value = _normalize_positive_int(latest_data.get("image_poll_timeout_secs"), 120, 1)
+            return incoming_value == previous_value and incoming_value != latest_value
+        return previous_data.get(key) == value and latest_data.get(key) != previous_data.get(key)
+
+    def _drop_stale_update_values(
+        self,
+        incoming: dict[str, object],
+        previous_data: dict[str, object],
+        latest_data: dict[str, object],
+    ) -> dict[str, object]:
+        protected_keys = {"proxy_runtime", "log_levels", "image_poll_timeout_secs"}
+        result = dict(incoming)
+        for key in protected_keys.intersection(result):
+            if self._is_stale_update_value(key, result[key], previous_data, latest_data):
+                result.pop(key, None)
+        return result
 
     @property
     def auth_key(self) -> str:
@@ -477,11 +568,7 @@ class ConfigStore:
 
     @property
     def log_levels(self) -> list[str]:
-        levels = self.data.get("log_levels")
-        if not isinstance(levels, list):
-            return []
-        allowed = {"debug", "info", "warning", "error"}
-        return [level for item in levels if (level := str(item or "").strip().lower()) in allowed]
+        return _normalize_log_levels(self.data.get("log_levels"))
 
     @property
     def sensitive_words(self) -> list[str]:
@@ -597,32 +684,34 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
-        next_data = dict(self.data)
-        next_data.update(dict(data or {}))
-        if "backup" in next_data:
-            next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
-        if "image_storage" in next_data:
-            next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
-            _validate_image_storage_settings(next_data["image_storage"])
-        if "chat_completion_cache" in next_data:
-            next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
-                next_data.get("chat_completion_cache")
-            )
-        if "third_party_apps" in next_data:
-            next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
-        if "proxy_runtime" in next_data:
-            incoming_runtime = next_data.get("proxy_runtime")
-            if isinstance(incoming_runtime, dict):
-                previous_clearance = self.get_proxy_runtime_settings().get("clearance")
-                if isinstance(previous_clearance, dict):
-                    incoming_runtime = dict(incoming_runtime)
-                    incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
-                    incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
-            next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
-        next_data.pop("backup_state", None)
-        self.data = next_data
-        self._save()
-        return self.get()
+        with self._lock:
+            previous_data = copy.deepcopy(self._data)
+            latest_data = self._load()
+            self._data = latest_data
+            self._file_signature = self._stat_signature()
+
+            incoming = self._drop_stale_update_values(dict(data or {}), previous_data, latest_data)
+            next_data = dict(latest_data)
+            next_data.update(incoming)
+            if "backup" in next_data:
+                next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
+            if "image_storage" in next_data:
+                next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
+                _validate_image_storage_settings(next_data["image_storage"])
+            if "chat_completion_cache" in next_data:
+                next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
+                    next_data.get("chat_completion_cache")
+                )
+            if "third_party_apps" in next_data:
+                next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+            if "proxy_runtime" in next_data:
+                next_data["proxy_runtime"] = self._normalize_proxy_runtime_for_update(
+                    next_data.get("proxy_runtime"),
+                    latest_data,
+                )
+            next_data.pop("backup_state", None)
+            self._save(next_data)
+            return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
         return _normalize_backup_settings(self.data.get("backup"))
