@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 import os
@@ -16,6 +17,8 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+APP_SETTINGS_CONFIG_KEY = "settings"
+APP_CONFIG_REFRESH_SECS = 2.0
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -364,6 +367,9 @@ class ConfigStore:
         self._data = self._load()
         self._file_signature = self._stat_signature()
         self._storage_backend: StorageBackend | None = None
+        self._db_refreshing = False
+        self._db_last_checked_at = 0.0
+        self.reload_if_changed(force=True)
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
                 "❌ auth-key 未设置！\n"
@@ -384,8 +390,71 @@ class ConfigStore:
             return None
         return (stat.st_mtime_ns, stat.st_size)
 
+    def _app_config_backend(self) -> StorageBackend | None:
+        try:
+            backend = self.get_storage_backend()
+            if not backend.supports_database_features():
+                return None
+            if not hasattr(backend, "load_app_config") or not hasattr(backend, "save_app_config"):
+                return None
+            return backend
+        except Exception:
+            return None
+
+    def _load_db_settings(self, *, seed: dict[str, object] | None = None) -> dict[str, object] | None:
+        backend = self._app_config_backend()
+        if backend is None:
+            return None
+        try:
+            loaded = backend.load_app_config(APP_SETTINGS_CONFIG_KEY)
+            if isinstance(loaded, dict):
+                return dict(loaded)
+            if seed is not None:
+                payload = dict(seed)
+                backend.save_app_config(APP_SETTINGS_CONFIG_KEY, payload)
+                return payload
+        except Exception:
+            return None
+        return None
+
+    def _effective_data(self, file_data: dict[str, object], db_data: dict[str, object] | None) -> dict[str, object]:
+        if not isinstance(db_data, dict):
+            return dict(file_data)
+        merged = dict(file_data)
+        merged.update(db_data)
+        return merged
+
+    def _sync_db_settings_locked(self, *, seed: dict[str, object] | None = None) -> bool:
+        if self._db_refreshing:
+            return False
+        self._db_refreshing = True
+        try:
+            db_data = self._load_db_settings(seed=seed)
+            self._db_last_checked_at = time.monotonic()
+            if db_data is None:
+                return False
+            file_data = self._load()
+            self._data = self._effective_data(file_data, db_data)
+            self._file_signature = self._stat_signature()
+            return True
+        finally:
+            self._db_refreshing = False
+
+    def _save_db_settings(self, data: dict[str, object]) -> bool:
+        backend = self._app_config_backend()
+        if backend is None:
+            return False
+        try:
+            backend.save_app_config(APP_SETTINGS_CONFIG_KEY, dict(data))
+            self._db_last_checked_at = time.monotonic()
+            return True
+        except Exception:
+            return False
+
     @property
     def data(self) -> dict[str, object]:
+        if self._db_refreshing:
+            return self._data
         self.reload_if_changed()
         return self._data
 
@@ -398,16 +467,31 @@ class ConfigStore:
     def reload_if_changed(self, *, force: bool = False) -> None:
         with self._lock:
             signature = self._stat_signature()
-            if not force and signature == self._file_signature:
+            file_changed = signature != self._file_signature
+            if force or file_changed:
+                file_data = self._load()
+                self._data = file_data
+                self._file_signature = self._stat_signature()
+                self._sync_db_settings_locked(seed=file_data)
                 return
-            self._data = self._load()
-            self._file_signature = self._stat_signature()
+            if time.monotonic() - self._db_last_checked_at >= APP_CONFIG_REFRESH_SECS:
+                self._sync_db_settings_locked()
 
     def _save(self, data: dict[str, object] | None = None) -> None:
         payload = self._data if data is None else data
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         self._data = payload
         self._file_signature = self._stat_signature()
+
+    def _save_effective(self, data: dict[str, object]) -> None:
+        db_saved = self._save_db_settings(data)
+        try:
+            self._save(data)
+        except Exception:
+            if not db_saved:
+                raise
+            self._data = dict(data)
+            self._file_signature = self._stat_signature()
 
     def _normalize_proxy_runtime_for_update(
         self,
@@ -454,9 +538,8 @@ class ConfigStore:
         previous_data: dict[str, object],
         latest_data: dict[str, object],
     ) -> dict[str, object]:
-        protected_keys = {"proxy_runtime", "log_levels", "image_poll_timeout_secs"}
         result = dict(incoming)
-        for key in protected_keys.intersection(result):
+        for key in list(result):
             if self._is_stale_update_value(key, result[key], previous_data, latest_data):
                 result.pop(key, None)
         return result
@@ -513,6 +596,13 @@ class ConfigStore:
             return max(1, int(self.data.get("image_account_concurrency", 3)))
         except (TypeError, ValueError):
             return 3
+
+    @property
+    def image_timeout_account_cooldown_secs(self) -> int:
+        try:
+            return max(0, int(self.data.get("image_timeout_account_cooldown_secs", 180)))
+        except (TypeError, ValueError):
+            return 180
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -646,6 +736,7 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_timeout_account_cooldown_secs"] = self.image_timeout_account_cooldown_secs
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
@@ -686,32 +777,38 @@ class ConfigStore:
     def update(self, data: dict[str, object]) -> dict[str, object]:
         with self._lock:
             previous_data = copy.deepcopy(self._data)
-            latest_data = self._load()
-            self._data = latest_data
-            self._file_signature = self._stat_signature()
+            backend = self._app_config_backend()
+            lock_factory = getattr(backend, "app_config_write_lock", None) if backend is not None else None
+            write_lock = lock_factory(APP_SETTINGS_CONFIG_KEY) if callable(lock_factory) else nullcontext()
+            with write_lock:
+                file_latest = self._load()
+                db_latest = self._load_db_settings(seed=file_latest)
+                latest_data = self._effective_data(file_latest, db_latest)
+                self._data = latest_data
+                self._file_signature = self._stat_signature()
 
-            incoming = self._drop_stale_update_values(dict(data or {}), previous_data, latest_data)
-            next_data = dict(latest_data)
-            next_data.update(incoming)
-            if "backup" in next_data:
-                next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
-            if "image_storage" in next_data:
-                next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
-                _validate_image_storage_settings(next_data["image_storage"])
-            if "chat_completion_cache" in next_data:
-                next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
-                    next_data.get("chat_completion_cache")
-                )
-            if "third_party_apps" in next_data:
-                next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
-            if "proxy_runtime" in next_data:
-                next_data["proxy_runtime"] = self._normalize_proxy_runtime_for_update(
-                    next_data.get("proxy_runtime"),
-                    latest_data,
-                )
-            next_data.pop("backup_state", None)
-            self._save(next_data)
-            return self.get()
+                incoming = self._drop_stale_update_values(dict(data or {}), previous_data, latest_data)
+                next_data = dict(latest_data)
+                next_data.update(incoming)
+                if "backup" in next_data:
+                    next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
+                if "image_storage" in next_data:
+                    next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
+                    _validate_image_storage_settings(next_data["image_storage"])
+                if "chat_completion_cache" in next_data:
+                    next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
+                        next_data.get("chat_completion_cache")
+                    )
+                if "third_party_apps" in next_data:
+                    next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+                if "proxy_runtime" in next_data:
+                    next_data["proxy_runtime"] = self._normalize_proxy_runtime_for_update(
+                        next_data.get("proxy_runtime"),
+                        latest_data,
+                    )
+                next_data.pop("backup_state", None)
+                self._save_effective(next_data)
+                return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
         return _normalize_backup_settings(self.data.get("backup"))

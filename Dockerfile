@@ -53,4 +53,4 @@ COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80
 
-CMD ["sh", "-c", "uv run uvicorn main:app --host 0.0.0.0 --port 80 --workers ${UVICORN_WORKERS:-1} --no-access-log --log-level warning"]
+CMD ["sh", "-c", "uv run uvicorn main:app --host 0.0.0.0 --port 80 --workers ${UVICORN_WORKERS:-1} --no-access-log --log-level warning --timeout-keep-alive 5 --timeout-graceful-shutdown 30 --backlog 4096"]

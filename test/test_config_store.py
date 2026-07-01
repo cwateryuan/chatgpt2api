@@ -1,10 +1,32 @@
 import copy
+from contextlib import contextmanager
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from services.config import DEFAULT_PROXY_RUNTIME, ConfigStore
+
+
+class FakeAppConfigStorage:
+    def __init__(self) -> None:
+        self.items: dict[str, dict[str, object]] = {}
+        self.lock_entries = 0
+
+    def supports_database_features(self) -> bool:
+        return True
+
+    def load_app_config(self, key: str) -> dict[str, object] | None:
+        item = self.items.get(key)
+        return dict(item) if isinstance(item, dict) else None
+
+    def save_app_config(self, key: str, data: dict[str, object]) -> None:
+        self.items[key] = dict(data)
+
+    @contextmanager
+    def app_config_write_lock(self, key: str):
+        self.lock_entries += 1
+        yield
 
 
 class ConfigStoreTests(unittest.TestCase):
@@ -79,6 +101,51 @@ class ConfigStoreTests(unittest.TestCase):
 
             self.assertEqual(store.image_poll_timeout_secs, 333)
             self.assertEqual(store.log_levels, [])
+
+    def test_db_settings_are_seeded_from_config_file(self) -> None:
+        tmp_dir, store = self._make_store({"image_poll_timeout_secs": 120})
+        with tmp_dir:
+            fake_db = FakeAppConfigStorage()
+            store._storage_backend = fake_db
+            store.reload_if_changed(force=True)
+
+            self.assertEqual(fake_db.items["settings"]["image_poll_timeout_secs"], 120)
+
+    def test_db_settings_override_recreated_config_file(self) -> None:
+        tmp_dir, store = self._make_store({"image_poll_timeout_secs": 120, "log_levels": ["info"]})
+        with tmp_dir:
+            fake_db = FakeAppConfigStorage()
+            fake_db.save_app_config("settings", {"image_poll_timeout_secs": 240, "log_levels": ["error"]})
+            store._storage_backend = fake_db
+            store.reload_if_changed(force=True)
+
+            self.assertEqual(store.image_poll_timeout_secs, 240)
+            self.assertEqual(store.log_levels, ["error"])
+
+            store.path.write_text(json.dumps({"auth-key": "test-auth", "image_poll_timeout_secs": 60}), encoding="utf-8")
+            store.reload_if_changed(force=True)
+
+            self.assertEqual(store.image_poll_timeout_secs, 240)
+            self.assertEqual(store.log_levels, ["error"])
+
+    def test_multi_worker_db_update_merges_latest_settings(self) -> None:
+        tmp_dir, worker_a = self._make_store({"image_poll_timeout_secs": 120, "log_levels": ["info"]})
+        with tmp_dir:
+            fake_db = FakeAppConfigStorage()
+            worker_a._storage_backend = fake_db
+            worker_a.reload_if_changed(force=True)
+            worker_b = ConfigStore(worker_a.path)
+            worker_b._storage_backend = fake_db
+            worker_b.reload_if_changed(force=True)
+
+            worker_a.update({"proxy_runtime": {"enabled": True, "egress_mode": "single_proxy", "proxy_url": "http://proxy"}})
+            worker_b.update({"image_poll_timeout_secs": 300})
+
+            saved = fake_db.load_app_config("settings") or {}
+            self.assertEqual(saved["image_poll_timeout_secs"], 300)
+            self.assertTrue(saved["proxy_runtime"]["enabled"])
+            self.assertEqual(saved["proxy_runtime"]["proxy_url"], "http://proxy")
+            self.assertGreaterEqual(fake_db.lock_entries, 2)
 
 
 if __name__ == "__main__":

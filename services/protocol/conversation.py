@@ -167,6 +167,19 @@ def _sleep_with_deadline(request: "ConversationRequest", seconds: float) -> None
     _deadline_from_request(request).sleep(seconds)
 
 
+def _cooldown_image_account(token: str, reason: str, *, account_email: str = "") -> None:
+    ttl = int(config.image_timeout_account_cooldown_secs or 0)
+    if not token or ttl <= 0:
+        return
+    account_service.set_image_cooldown(token, ttl, reason=reason)
+    logger.warning({
+        "event": "image_account_cooldown",
+        "reason": reason,
+        "ttl_secs": ttl,
+        "account_email": account_email,
+    })
+
+
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
 # 检测模型返回的部分工具调用 JSON（如 {"size":"1920x1088","n":1}）
 # 这些 JSON 包含图片生成工具的参数，但没有实际生成图片
@@ -1452,6 +1465,7 @@ def _generate_single_image(
             slot_released = True
             return outputs
         except ImagePollTimeoutError as exc:
+            _cooldown_image_account(token, "poll_timeout", account_email=account_email)
             account_service.mark_image_result(token, False)
             slot_released = True
             if account_email:
@@ -1481,6 +1495,7 @@ def _generate_single_image(
                 raise
             raise
         except ImageDeadlineExpired as exc:
+            _cooldown_image_account(token, "deadline_expired", account_email=account_email)
             account_service.mark_image_result(token, False)
             slot_released = True
             raise image_timeout_error(deadline, account_email=account_email) from exc
@@ -1556,6 +1571,7 @@ def _generate_single_image(
             slot_released = True
             last_error = str(exc)
             if deadline.remaining() <= 0:
+                _cooldown_image_account(token, "deadline_after_exception", account_email=account_email)
                 raise image_timeout_error(deadline, account_email=account_email) from exc
             logger.warning({
                 "event": "image_stream_fail",
@@ -1565,6 +1581,7 @@ def _generate_single_image(
                 "index": index,
             })
             if is_http2_stream_error(last_error):
+                _cooldown_image_account(token, "http2_stream_error", account_email=account_email)
                 logger.warning({
                     "event": "image_stream_http2_error",
                     "request_token": token,
@@ -1588,6 +1605,7 @@ def _generate_single_image(
             if not emitted_for_token and is_tls_connection_error(last_error):
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
+                    _cooldown_image_account(token, "tls_connection_error_retry", account_email=account_email)
                     logger.warning({
                         "event": "image_stream_tls_retry",
                         "request_token": token,
@@ -1602,6 +1620,7 @@ def _generate_single_image(
             if not emitted_for_token and is_connection_timeout_error(last_error):
                 conn_timeout_retry_count += 1
                 if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
+                    _cooldown_image_account(token, "connection_timeout_retry", account_email=account_email)
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
                     logger.warning({
                         "event": "image_stream_conn_timeout_retry",

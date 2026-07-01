@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Any
 
 
@@ -136,3 +137,12 @@ class StorageBackend(ABC):
 
     def load_named_config(self, key: str) -> dict[str, Any] | None:
         raise NotImplementedError
+
+    def save_app_config(self, key: str, data: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def load_app_config(self, key: str) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    def app_config_write_lock(self, key: str):
+        return nullcontext()

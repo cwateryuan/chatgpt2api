@@ -147,6 +147,26 @@ class AccountCapabilityTests(unittest.TestCase):
             else:
                 config.data["image_account_concurrency"] = original_concurrency
 
+    def test_image_account_cooldown_excludes_token_without_changing_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            runtime_state.clear_image_slots({"cooldown-token", "ready-token"})
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "cooldown-token", "status": "正常", "quota": 3},
+                    {"access_token": "ready-token", "status": "正常", "quota": 3},
+                ]
+            )
+            service.fetch_remote_info = lambda access_token, event="fetch_remote_info", **_kwargs: service.get_account(access_token)
+            service.set_image_cooldown("cooldown-token", 60, reason="test")
+
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+
+            self.assertEqual(token, "ready-token")
+            self.assertEqual(service.get_account("cooldown-token")["status"], "正常")
+            runtime_state.clear_image_slots({"cooldown-token", "ready-token"})
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True

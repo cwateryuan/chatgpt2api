@@ -128,7 +128,31 @@ def _proc_snapshot() -> dict[str, Any]:
         "hwm_kb": _parse_kb(status.get("VmHWM", "")),
         "data_kb": _parse_kb(status.get("VmData", "")),
         "threads": _safe_int(status.get("Threads")),
+        "fd_count": _fd_count(),
+        "socket_fd_count": _socket_fd_count(),
     }
+
+
+def _fd_count() -> int | None:
+    try:
+        return len(list(Path("/proc/self/fd").iterdir()))
+    except Exception:
+        return None
+
+
+def _socket_fd_count() -> int | None:
+    try:
+        total = 0
+        for fd in Path("/proc/self/fd").iterdir():
+            try:
+                target = os.readlink(fd)
+            except Exception:
+                continue
+            if str(target).startswith("socket:"):
+                total += 1
+        return total
+    except Exception:
+        return None
 
 
 def _safe_int(value: object) -> int | None:
@@ -268,10 +292,12 @@ def _runtime_snapshot() -> dict[str, Any]:
 
         return {
             "image_inflight_total": runtime_state.image_inflight_total(),
+            "image_cooldown_total": runtime_state.image_cooldown_total(),
         }
     except Exception as exc:
         return {
             "image_inflight_total": None,
+            "image_cooldown_total": None,
             "error": repr(exc)[:300],
         }
 

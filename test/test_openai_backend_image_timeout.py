@@ -6,7 +6,7 @@ from unittest import mock
 from curl_cffi import CurlOpt
 
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, _curl_deadline_options
+from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, _curl_deadline_options, _post_stream_with_curl_options
 
 
 class FakeResponse:
@@ -73,6 +73,20 @@ class OpenAIBackendImageTimeoutTests(unittest.TestCase):
         self.assertIsInstance(response, FakeResponse)
         self.assertIn(CurlOpt.TIMEOUT_MS, backend.session.curl_options_seen)
         self.assertEqual(backend.session.curl_options, {CurlOpt.LOW_SPEED_TIME: 10})
+
+    def test_post_stream_with_curl_options_restores_session_options(self):
+        session = FakeSession()
+
+        response = _post_stream_with_curl_options(
+            session,
+            "https://example.test/stream",
+            curl_options={CurlOpt.TIMEOUT_MS: 1234},
+            stream=True,
+        )
+
+        self.assertIsInstance(response, FakeResponse)
+        self.assertEqual(session.curl_options_seen[CurlOpt.TIMEOUT_MS], 1234)
+        self.assertEqual(session.curl_options, {CurlOpt.LOW_SPEED_TIME: 10})
 
 
 if __name__ == "__main__":
