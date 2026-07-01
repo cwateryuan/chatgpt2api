@@ -9,7 +9,7 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -22,7 +22,7 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
-from services.image_timeout import ImageRequestDeadline
+from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -271,14 +271,14 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
-    def _get_me(self) -> Dict[str, Any]:
+    def _get_me(self, deadline: ImageRequestDeadline | None = None) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=_timeout(20, deadline))
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_conversation_init(self) -> Dict[str, Any]:
+    def _get_conversation_init(self, deadline: ImageRequestDeadline | None = None) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
         response = self.session.post(
             self.base_url + path,
@@ -289,16 +289,16 @@ class OpenAIBackendAPI:
                 "conversation_id": None,
                 "timezone_offset_min": -480,
             },
-            timeout=20,
+            timeout=_timeout(20, deadline),
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_default_account(self) -> Dict[str, Any]:
+    def _get_default_account(self, deadline: ImageRequestDeadline | None = None) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
         response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+                                    timeout=_timeout(20, deadline))
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -314,16 +314,24 @@ class OpenAIBackendAPI:
         })
         return default_account
 
-    def get_user_info(self) -> Dict[str, Any]:
+    def get_user_info(self, deadline: ImageRequestDeadline | None = None) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
         executor = ThreadPoolExecutor(max_workers=3)
         try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
-            me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+            me_future = executor.submit(self._get_me, deadline)
+            init_future = executor.submit(self._get_conversation_init, deadline)
+            account_future = executor.submit(self._get_default_account, deadline)
+            if deadline is not None:
+                me_payload = me_future.result(timeout=deadline.require())
+                init_payload = init_future.result(timeout=deadline.require())
+                default_account = account_future.result(timeout=deadline.require())
+            else:
+                me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+        except FutureTimeoutError as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise ImageDeadlineExpired(str(exc) or "image account lookup timed out") from exc
         except (KeyboardInterrupt, SystemExit):
             executor.shutdown(wait=False, cancel_futures=True)
             raise

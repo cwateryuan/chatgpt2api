@@ -548,7 +548,7 @@ class RegisterService:
             last_available, last_quota, last_at = self._last_metrics_log.get(key, (-1, -1, 0.0))
             if reached or metrics["current_available"] != last_available or metrics["current_quota"] != last_quota or now - last_at >= 30:
                 self._last_metrics_log[key] = (metrics["current_available"], metrics["current_quota"], now)
-                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
+                self._append_log(f"检查号池：当前可生图账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         if mode == "available":
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
@@ -556,7 +556,7 @@ class RegisterService:
             last_available, last_quota, last_at = self._last_metrics_log.get(key, (-1, -1, 0.0))
             if reached or metrics["current_available"] != last_available or metrics["current_quota"] != last_quota or now - last_at >= 30:
                 self._last_metrics_log[key] = (metrics["current_available"], metrics["current_quota"], now)
-                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
+                self._append_log(f"检查号池：当前可生图账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         return submitted >= int(cfg.get("total") or 1)
 

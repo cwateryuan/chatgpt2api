@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from services.config import config
+from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
@@ -20,6 +21,7 @@ from services.log_service import (
 from services.runtime_state import runtime_state
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
+from utils.log import logger
 
 
 class AccountService:
@@ -199,6 +201,14 @@ class AccountService:
         if not isinstance(account, dict):
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
+            return False
+        if bool(account.get("image_quota_unknown")):
+            return True
+        return int(account.get("quota") or 0) > 0
+
+    @staticmethod
+    def _is_counted_as_image_pool_available(account: dict) -> bool:
+        if not isinstance(account, dict) or account.get("status") != "正常":
             return False
         if bool(account.get("image_quota_unknown")):
             return True
@@ -1022,15 +1032,86 @@ class AccountService:
         timeout = int(config.image_poll_timeout_secs or 120)
         return max(60, timeout + 60)
 
+    def _image_slot_wait_diagnostics(
+            self,
+            excluded_tokens: set[str] | None = None,
+            plan_type: str | None = None,
+            source_type: str | None = None,
+            plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: ImageRequestDeadline | None = None,
+    ) -> dict[str, Any]:
+        excluded = {str(token or "").strip() for token in (excluded_tokens or set()) if str(token or "").strip()}
+        if self._database_features_enabled():
+            try:
+                items = [
+                    item
+                    for item in self.storage.list_image_candidate_accounts(excluded)
+                    if isinstance(item, dict)
+                ]
+            except Exception:
+                items = list(self._accounts.values())
+        else:
+            items = list(self._accounts.values())
+        matching_tokens: list[str] = []
+        zero_quota_count = 0
+        image_available_count = 0
+        for item in items:
+            if (
+                    not self._account_matches_plan_type(item, plan_type)
+                    or not self._account_matches_any_plan_type(item, plan_types)
+                    or not self._account_matches_source_type(item, source_type)
+            ):
+                continue
+            token = str(item.get("access_token") or "").strip()
+            if token and token in excluded:
+                continue
+            if item.get("status") == "正常" and not bool(item.get("image_quota_unknown")) and int(item.get("quota") or 0) <= 0:
+                zero_quota_count += 1
+            if self._is_image_account_available(item):
+                image_available_count += 1
+                if token:
+                    matching_tokens.append(token)
+        max_concurrency = max(1, int(config.image_account_concurrency or 1))
+        inflight = runtime_state.image_inflight_snapshot(matching_tokens)
+        full_tokens = [token for token in matching_tokens if int(inflight.get(token, 0)) >= max_concurrency]
+        return {
+            "candidate_count": len(items),
+            "ready_candidate_count": len(matching_tokens),
+            "image_available_count": image_available_count,
+            "zero_quota_count": zero_quota_count,
+            "slot_full_count": len(full_tokens),
+            "max_concurrency": max_concurrency,
+            "remaining_secs": round(max(0.0, deadline.remaining()), 3) if deadline is not None else None,
+            "plan_type": plan_type or None,
+            "source_type": source_type or None,
+            "plan_types": sorted(str(item) for item in plan_types) if plan_types else None,
+        }
+
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: ImageRequestDeadline | None = None,
     ) -> str:
         with self._image_slot_condition:
             while True:
+                if deadline is not None:
+                    try:
+                        deadline.require()
+                    except ImageDeadlineExpired:
+                        logger.warning({
+                            "event": "account_slot_wait_timeout",
+                            **self._image_slot_wait_diagnostics(
+                                excluded_tokens,
+                                plan_type,
+                                source_type,
+                                plan_types,
+                                deadline,
+                            ),
+                        })
+                        raise
                 ready_tokens = self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if not ready_tokens:
                     raise RuntimeError(
@@ -1044,7 +1125,10 @@ class AccountService:
                 )
                 if access_token:
                     return access_token
-                self._image_slot_condition.wait(timeout=1.0)
+                wait_for = 1.0
+                if deadline is not None:
+                    wait_for = min(wait_for, max(0.001, deadline.require()))
+                self._image_slot_condition.wait(timeout=wait_for)
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
@@ -1059,6 +1143,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: ImageRequestDeadline | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1073,10 +1158,11 @@ class AccountService:
                 plan_type=plan_type,
                 source_type=source_type,
                 plan_types=plan_types,
+                deadline=deadline,
             )
             attempted_tokens.add(access_token)
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token")
+                account = self.fetch_remote_info(access_token, "get_available_access_token", deadline=deadline)
             except Exception:
                 self.release_image_slot(access_token)
                 continue
@@ -1419,6 +1505,7 @@ class AccountService:
         access_token: str,
         event: str = "fetch_remote_info",
         defer_invalid_removal: bool = True,
+        deadline: ImageRequestDeadline | None = None,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
@@ -1427,13 +1514,13 @@ class AccountService:
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             with OpenAIBackendAPI(active_token) as backend:
-                result = backend.get_user_info()
+                result = backend.get_user_info(deadline=deadline)
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
                     with OpenAIBackendAPI(refreshed_token) as backend:
-                        result = backend.get_user_info()
+                        result = backend.get_user_info(deadline=deadline)
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
                         refreshed_token,
@@ -1790,9 +1877,10 @@ class AccountService:
             with self._lock:
                 items = list(self._accounts.values())
         normal = [item for item in items if item.get("status") == "正常"]
+        available = [item for item in normal if self._is_counted_as_image_pool_available(item)]
         return {
             "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("image_quota_unknown")),
-            "current_available": len(normal),
+            "current_available": len(available),
         }
 
     def account_health(self) -> dict:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,7 +12,9 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
+from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.openai_backend_api import InvalidAccessTokenError
+from services.runtime_state import runtime_state
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -87,7 +90,7 @@ class AccountCapabilityTests(unittest.TestCase):
                 ]
             )
 
-            service.fetch_remote_info = lambda access_token, event="fetch_remote_info": service.get_account(access_token)
+            service.fetch_remote_info = lambda access_token, event="fetch_remote_info", **_kwargs: service.get_account(access_token)
 
             plus_token = service.get_available_access_token(plan_type="plus")
             pro_token = service.get_available_access_token(plan_type="pro")
@@ -96,6 +99,53 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
+
+    def test_image_pool_metrics_counts_only_image_usable_normal_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {"access_token": "zero-normal", "status": "正常", "quota": 0, "image_quota_unknown": False},
+                    {"access_token": "quota-normal", "status": "正常", "quota": 2, "image_quota_unknown": False},
+                    {"access_token": "unknown-normal", "status": "正常", "quota": 0, "image_quota_unknown": True},
+                    {"access_token": "limited", "status": "限流", "quota": 5, "image_quota_unknown": False},
+                    {"access_token": "abnormal", "status": "异常", "quota": 5, "image_quota_unknown": False},
+                    {"access_token": "disabled", "status": "禁用", "quota": 5, "image_quota_unknown": False},
+                ]
+            )
+
+            metrics = service.get_image_pool_metrics()
+
+            self.assertEqual(metrics["current_available"], 2)
+            self.assertEqual(metrics["current_quota"], 2)
+
+    def test_image_slot_wait_respects_deadline_when_all_slots_are_full(self) -> None:
+        original_concurrency = config.data.get("image_account_concurrency")
+        config.data["image_account_concurrency"] = 1
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                runtime_state.clear_image_slots({"busy-token"})
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items([{"access_token": "busy-token", "status": "正常", "quota": 3}])
+                service.fetch_remote_info = lambda access_token, event="fetch_remote_info", **_kwargs: service.get_account(access_token)
+                first = service.get_available_access_token()
+                self.assertEqual(first, "busy-token")
+
+                started = time.time()
+                with self.assertRaises(ImageDeadlineExpired):
+                    service.get_available_access_token(deadline=ImageRequestDeadline(1))
+                self.assertLess(time.time() - started, 2.5)
+
+                service.release_image_slot(first)
+                token = service.get_available_access_token()
+                service.release_image_slot(token)
+                self.assertEqual(token, "busy-token")
+        finally:
+            runtime_state.clear_image_slots({"busy-token"})
+            if original_concurrency is None:
+                config.data.pop("image_account_concurrency", None)
+            else:
+                config.data["image_account_concurrency"] = original_concurrency
 
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
