@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any
@@ -75,11 +76,16 @@ def _string(value: object) -> str:
     return str(value or "").strip()
 
 
+def _token_hash(access_token: object) -> str:
+    return hashlib.sha256(_string(access_token).encode("utf-8")).hexdigest()
+
+
 class AccountModel(Base):
     __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    access_token = Column(String(2048), unique=True, nullable=False, index=True)
+    access_token = Column(Text, nullable=False)
+    access_token_hash = Column(String(64), unique=True, nullable=False, index=True)
     status = Column(String(64), nullable=True, index=True)
     source_type = Column(String(64), nullable=True, index=True)
     type = Column(String(64), nullable=True, index=True)
@@ -212,17 +218,17 @@ class DatabaseStorageBackend(StorageBackend):
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
         session = self.Session()
         try:
-            next_tokens: set[str] = set()
+            next_hashes: set[str] = set()
             for account in accounts:
                 if not isinstance(account, dict):
                     continue
                 token = _string(account.get("access_token") or account.get("accessToken"))
                 if not token:
                     continue
-                next_tokens.add(token)
+                next_hashes.add(_token_hash(token))
                 self._upsert_account_session(session, {**account, "access_token": token})
-            if next_tokens:
-                session.query(AccountModel).filter(~AccountModel.access_token.in_(next_tokens)).delete(synchronize_session=False)
+            if next_hashes:
+                session.query(AccountModel).filter(~AccountModel.access_token_hash.in_(next_hashes)).delete(synchronize_session=False)
             else:
                 session.query(AccountModel).delete()
             session.commit()
@@ -247,12 +253,12 @@ class DatabaseStorageBackend(StorageBackend):
             session.close()
 
     def delete_account_tokens(self, tokens: list[str]) -> int:
-        cleaned = [_string(token) for token in tokens if _string(token)]
-        if not cleaned:
+        hashes = [_token_hash(token) for token in tokens if _string(token)]
+        if not hashes:
             return 0
         session = self.Session()
         try:
-            removed = session.query(AccountModel).filter(AccountModel.access_token.in_(cleaned)).delete(synchronize_session=False)
+            removed = session.query(AccountModel).filter(AccountModel.access_token_hash.in_(hashes)).delete(synchronize_session=False)
             session.commit()
             return int(removed or 0)
         except Exception:
@@ -267,13 +273,13 @@ class DatabaseStorageBackend(StorageBackend):
             return None
         session = self.Session()
         try:
-            row = session.query(AccountModel).filter(AccountModel.access_token == token).first()
+            row = session.query(AccountModel).filter(AccountModel.access_token_hash == _token_hash(token)).first()
             return self._account_from_row(row)
         finally:
             session.close()
 
     def list_image_candidate_accounts(self, excluded_tokens: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
-        excluded = {_string(token) for token in (excluded_tokens or []) if _string(token)}
+        excluded_hashes = {_token_hash(token) for token in (excluded_tokens or []) if _string(token)}
         session = self.Session()
         try:
             query = session.query(
@@ -287,8 +293,8 @@ class DatabaseStorageBackend(StorageBackend):
                 AccountModel.image_quota_unknown,
                 AccountModel.last_used_at,
             )
-            if excluded:
-                query = query.filter(~AccountModel.access_token.in_(excluded))
+            if excluded_hashes:
+                query = query.filter(~AccountModel.access_token_hash.in_(excluded_hashes))
             rows = query.order_by(AccountModel.id.asc()).all()
             items: list[dict[str, Any]] = []
             for row in rows:
@@ -725,10 +731,13 @@ class DatabaseStorageBackend(StorageBackend):
 
     def _upsert_account_session(self, session, account: dict[str, Any]) -> None:
         token = _string(account.get("access_token"))
-        row = session.query(AccountModel).filter(AccountModel.access_token == token).first()
+        token_hash = _token_hash(token)
+        row = session.query(AccountModel).filter(AccountModel.access_token_hash == token_hash).first()
         if row is None:
-            row = AccountModel(access_token=token)
+            row = AccountModel(access_token=token, access_token_hash=token_hash)
             session.add(row)
+        row.access_token = token
+        row.access_token_hash = token_hash
         row.status = _string(account.get("status")) or None
         row.source_type = _string(account.get("source_type")) or None
         row.type = _string(account.get("type")) or None
@@ -832,6 +841,7 @@ class DatabaseStorageBackend(StorageBackend):
         timestamp_type = "TIMESTAMP" if dialect in {"postgresql", "mysql"} else "DATETIME"
         additions: dict[str, dict[str, str]] = {
             "accounts": {
+                "access_token_hash": "VARCHAR(64)",
                 "status": "VARCHAR(64)",
                 "source_type": "VARCHAR(64)",
                 "type": "VARCHAR(64)",
@@ -850,6 +860,8 @@ class DatabaseStorageBackend(StorageBackend):
             },
         }
         with self.engine.begin() as conn:
+            if "accounts" in table_columns:
+                self._ensure_account_token_schema(conn, dialect, table_columns["accounts"])
             for table, columns in additions.items():
                 existing = table_columns.get(table)
                 if not existing:
@@ -882,3 +894,23 @@ class DatabaseStorageBackend(StorageBackend):
             for index_name, table, columns in index_specs:
                 if table in table_columns:
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({columns})"))
+
+    def _ensure_account_token_schema(self, conn, dialect: str, columns: set[str]) -> None:
+        if dialect == "postgresql":
+            conn.execute(text("DROP INDEX IF EXISTS ix_accounts_access_token"))
+            conn.execute(text("DROP INDEX IF EXISTS idx_accounts_access_token"))
+            conn.execute(text("ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_access_token_key"))
+            conn.execute(text("ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT"))
+        if "access_token_hash" not in columns:
+            conn.execute(text("ALTER TABLE accounts ADD COLUMN access_token_hash VARCHAR(64)"))
+            columns.add("access_token_hash")
+        rows = conn.execute(text("SELECT id, access_token FROM accounts WHERE access_token_hash IS NULL OR access_token_hash = ''")).fetchall()
+        for row_id, token in rows:
+            conn.execute(
+                text("UPDATE accounts SET access_token_hash = :token_hash WHERE id = :id"),
+                {"token_hash": _token_hash(token), "id": row_id},
+            )
+        try:
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_accounts_access_token_hash ON accounts (access_token_hash)"))
+        except Exception:
+            pass

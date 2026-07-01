@@ -10,6 +10,28 @@ from services.storage.database_storage import DatabaseStorageBackend
 
 
 class DatabaseStorageTests(unittest.TestCase):
+    def test_accounts_support_access_tokens_longer_than_2048_chars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.db"
+            storage = DatabaseStorageBackend(f"sqlite:///{db_path}")
+            long_token = "token-" + ("x" * 4096)
+
+            storage.upsert_account({
+                "access_token": long_token,
+                "status": "正常",
+                "source_type": "web",
+                "type": "free",
+                "quota": 1,
+            })
+
+            account = storage.get_account(long_token)
+            self.assertIsNotNone(account)
+            self.assertEqual(account["access_token"], long_token)
+            self.assertEqual(account["quota"], 1)
+            self.assertEqual(storage.delete_account_tokens([long_token]), 1)
+            self.assertIsNone(storage.get_account(long_token))
+            storage.engine.dispose()
+
     def test_list_image_candidate_accounts_uses_lightweight_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "accounts.db"
