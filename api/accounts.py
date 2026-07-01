@@ -24,6 +24,7 @@ from api.support import (
     sanitize_sub2api_servers,
 )
 from services.account_service import account_service
+from services.bulk_job_service import bulk_job_service
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
 from services.sub2api_service import (
@@ -238,6 +239,25 @@ def create_router() -> APIRouter:
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", result.get("items", [])),
         }
+
+    @router.post("/api/accounts/import/jobs")
+    async def create_account_import_job(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        account_payloads = [item for item in body.accounts if isinstance(item, dict)]
+        payload_tokens = [_account_payload_token(item) for item in account_payloads]
+        tokens = _unique_tokens([*body.tokens, *payload_tokens])
+        if not tokens:
+            raise HTTPException(status_code=400, detail={"error": "tokens is required"})
+        job_id = bulk_job_service.submit_account_import(tokens=tokens, accounts=account_payloads)
+        return {"job_id": job_id}
+
+    @router.get("/api/accounts/import/jobs/{job_id}")
+    async def get_account_import_job(job_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        progress = bulk_job_service.get_job(bulk_job_service.ACCOUNT_IMPORT_KIND, job_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail={"error": "job not found"})
+        return progress
 
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):

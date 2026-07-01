@@ -391,6 +391,32 @@ return current
             return dict(item[0]) if item else None
 
     def update_progress(self, kind: str, progress_id: str, updater, ttl_seconds: int = 3600) -> dict[str, Any] | None:
+        key = self._progress_key(kind, progress_id)
+        ttl = max(60, int(ttl_seconds or 3600))
+        if key and self._redis is not None:
+            try:
+                from redis import WatchError
+
+                for _ in range(5):
+                    with self._redis.pipeline() as pipe:
+                        try:
+                            pipe.watch(key)
+                            current = _json_loads(pipe.get(key))
+                            if not isinstance(current, dict) or not current:
+                                pipe.unwatch()
+                                return None
+                            updated = updater(dict(current))
+                            if not isinstance(updated, dict):
+                                updated = current
+                            pipe.multi()
+                            pipe.set(key, _json_dumps(updated), ex=ttl)
+                            pipe.execute()
+                            return dict(updated)
+                        except WatchError:
+                            continue
+                return self.get_progress(kind, progress_id)
+            except Exception:
+                pass
         with self._lock:
             current = self.get_progress(kind, progress_id) or {}
             if not current:
@@ -485,9 +511,11 @@ return 0
         normalized_id = _clean(progress_id)
         if not normalized_kind or not normalized_id:
             return ""
-        if normalized_kind not in {"refresh", "relogin"}:
-            normalized_kind = "refresh"
-        return f"account:{normalized_kind}_progress:{normalized_id}"
+        if normalized_kind in {"refresh", "relogin"}:
+            return f"account:{normalized_kind}_progress:{normalized_id}"
+        if normalized_kind in {"bulk_image_delete", "bulk_account_import"}:
+            return f"bulk:{normalized_kind}:progress:{normalized_id}"
+        return ""
 
     def _cleanup_memory_locked(self) -> None:
         now = time.time()

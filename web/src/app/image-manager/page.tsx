@@ -13,11 +13,12 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
+import { cancelBulkJob, compressAllImages, createImageDeleteJob, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageDeleteJob, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type BulkImageDeleteProgress, type ImageStorageStats, type ManagedImage } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
 const IMAGE_MANAGER_CHECKBOX_CLASS = "border-stone-300 bg-white/80 dark:border-white/35 dark:bg-white/5 data-[state=checked]:border-stone-950 dark:data-[state=checked]:border-white";
+const BULK_DELETE_THRESHOLD = 20;
 
 function formatSize(size: number) {
   return size > 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(2)} MB` : `${Math.ceil(size / 1024)} KB`;
@@ -25,6 +26,10 @@ function formatSize(size: number) {
 
 function imageKey(item: ManagedImage) {
   return item.rel || item.url;
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
@@ -92,6 +97,7 @@ function ImageManagerContent() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | "byDate" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [deleteProgress, setDeleteProgress] = useState<BulkImageDeleteProgress | null>(null);
 
   const filteredItems = selectedTags.length > 0
     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
@@ -238,8 +244,14 @@ function ImageManagerContent() {
     if (!deleteMode || selectedCount === 0) return;
     setIsDeleting(true);
     try {
-      const data = await deleteManagedImages(deleteMode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths: selectedPaths });
-      toast.success(`已删除 ${data.removed} 张图片`);
+      const body = deleteMode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths: selectedPaths };
+      if (deleteMode === "filtered" || selectedPaths.length >= BULK_DELETE_THRESHOLD) {
+        const data = await runImageDeleteJob(body);
+        toast.success(`已删除 ${data.removed} 张图片`);
+      } else {
+        const data = await deleteManagedImages(body);
+        toast.success(`已删除 ${data.removed} 张图片`);
+      }
       setDeleteMode(null);
       setSelectedPaths([]);
       await loadImages();
@@ -247,6 +259,28 @@ function ImageManagerContent() {
       toast.error(error instanceof Error ? error.message : "删除图片失败");
     } finally {
       setIsDeleting(false);
+      setDeleteProgress(null);
+    }
+  };
+
+  const runImageDeleteJob = async (body: { paths?: string[]; start_date?: string; end_date?: string; all_matching?: boolean }) => {
+    setDeleteProgress(null);
+    const { job_id } = await createImageDeleteJob(body);
+    toast.success("已创建后台删除任务");
+    for (;;) {
+      const progress = await fetchImageDeleteJob(job_id);
+      setDeleteProgress(progress);
+      if (progress.done) {
+        if (progress.status === "cancelled") {
+          toast.error(`后台删除任务已取消，已删除 ${progress.removed} 张图片`);
+          return progress;
+        }
+        if (progress.error) {
+          throw new Error(progress.error);
+        }
+        return progress;
+      }
+      await wait(1500);
     }
   };
 
@@ -403,6 +437,50 @@ function ImageManagerContent() {
         )}
       </div>
 
+      {deleteProgress ? (
+        <div className="mb-4 overflow-hidden rounded-2xl border border-rose-100 bg-white/90 shadow-sm">
+          <div className="px-4 py-3">
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-stone-600">
+                {deleteProgress.done ? "图片删除任务已结束" : "正在低优先级删除图片"}
+              </span>
+              <span className="font-medium text-stone-700">
+                {deleteProgress.processed}/{deleteProgress.total}
+              </span>
+            </div>
+            <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-stone-100">
+              <div
+                className="h-full rounded-full bg-rose-500 transition-all duration-300 ease-out"
+                style={{ width: `${deleteProgress.total > 0 ? (deleteProgress.processed / deleteProgress.total) * 100 : 0}%` }}
+              />
+            </div>
+            <div className="mt-2 text-xs text-stone-500">
+              已删除 {deleteProgress.removed} 张，失败 {deleteProgress.failed} 张
+            </div>
+            {!deleteProgress.done ? (
+              <Button
+                type="button"
+                variant="outline"
+                className="mt-3 h-8 rounded-lg border-stone-200 bg-white px-3 text-xs"
+                onClick={async () => {
+                  try {
+                    const updated = await cancelBulkJob(deleteProgress.job_id);
+                    if (updated.kind === "bulk_image_delete") {
+                      setDeleteProgress(updated);
+                    }
+                    toast.success("已请求取消后台删除任务");
+                  } catch (error) {
+                    toast.error(error instanceof Error ? error.message : "取消失败");
+                  }
+                }}
+              >
+                取消后台任务
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
       {/* Delete by date dialog */}
       <Dialog open={deleteMode === "byDate"} onOpenChange={() => setDeleteMode(null)}>
         <DialogContent className="sm:max-w-md rounded-2xl">
@@ -422,13 +500,13 @@ function ImageManagerContent() {
                 if (!deleteStartDate) return;
                 try {
                   setIsDeleting(true);
-                  const r = await deleteManagedImages({ end_date: deleteStartDate, all_matching: true });
+                  const r = await runImageDeleteJob({ end_date: deleteStartDate, all_matching: true });
                   toast.success(`已删除 ${r.removed} 张图片`);
                   setDeleteMode(null);
                   void loadStorage();
                   void loadImages();
                 } catch { toast.error("删除失败"); }
-                finally { setIsDeleting(false); }
+                finally { setIsDeleting(false); setDeleteProgress(null); }
               }}>
               {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : null}
               确认删除

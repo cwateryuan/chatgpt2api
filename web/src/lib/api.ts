@@ -96,6 +96,41 @@ export type RefreshProgressResponse = {
   results?: Array<{ token: string; status: string; error?: string | null }>;
 };
 
+export type BulkImageDeleteProgress = {
+  job_id: string;
+  kind: "bulk_image_delete";
+  status: "queued" | "running" | "cancelling" | "cancelled" | "success" | "error";
+  total: number;
+  processed: number;
+  removed: number;
+  failed: number;
+  done: boolean;
+  error: string | null;
+  cancel_requested?: boolean;
+  errors?: Array<{ error?: string; count?: number }>;
+};
+
+export type BulkAccountImportProgress = {
+  job_id: string;
+  kind: "bulk_account_import";
+  status: "queued" | "running" | "cancelling" | "cancelled" | "success" | "error";
+  phase: "queued" | "importing" | "refreshing";
+  total: number;
+  processed: number;
+  imported: number;
+  skipped: number;
+  refreshed: number;
+  failed: number;
+  refresh_total?: number;
+  refresh_processed?: number;
+  status_counts?: Record<string, number>;
+  total_quota?: number;
+  done: boolean;
+  error: string | null;
+  cancel_requested?: boolean;
+  errors?: Array<{ token?: string; error?: string }>;
+};
+
 type AccountUpdateResponse = {
   item: Account;
   items: Account[];
@@ -395,6 +430,23 @@ export async function createAccounts(tokens: string[], accounts: AccountImportPa
   });
 }
 
+export async function createAccountImportJob(tokens: string[], accounts: AccountImportPayload[] = []) {
+  return httpRequest<{ job_id: string }>("/api/accounts/import/jobs", {
+    method: "POST",
+    body: { tokens, accounts },
+  });
+}
+
+export async function fetchAccountImportJob(jobId: string) {
+  return httpRequest<BulkAccountImportProgress>(`/api/accounts/import/jobs/${jobId}`);
+}
+
+export async function cancelBulkJob(jobId: string) {
+  return httpRequest<BulkImageDeleteProgress | BulkAccountImportProgress>(`/api/bulk-jobs/${jobId}/cancel`, {
+    method: "POST",
+  });
+}
+
 export type OAuthLoginStartResponse = {
   session_id: string;
   authorize_url: string;
@@ -646,6 +698,14 @@ export async function fetchManagedImages(filters: { start_date?: string; end_dat
 
 export async function deleteManagedImages(body: { paths?: string[]; start_date?: string; end_date?: string; all_matching?: boolean }) {
   return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
+}
+
+export async function createImageDeleteJob(body: { paths?: string[]; start_date?: string; end_date?: string; all_matching?: boolean }) {
+  return httpRequest<{ job_id: string }>("/api/images/delete/jobs", { method: "POST", body });
+}
+
+export async function fetchImageDeleteJob(jobId: string) {
+  return httpRequest<BulkImageDeleteProgress>(`/api/images/delete/jobs/${jobId}`);
 }
 
 export async function downloadImages(paths: string[]) {

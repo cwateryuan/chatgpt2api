@@ -767,7 +767,11 @@ function AccountsPageContent() {
           <AccountImportDialog
             disabled={isLoading || isRefreshing || isDeleting}
             onImported={(items) => {
-              setAccounts(items);
+              if (items) {
+                setAccounts(items);
+              } else {
+                void loadAccounts();
+              }
               setSelectedIds([]);
               setPage(1);
             }}

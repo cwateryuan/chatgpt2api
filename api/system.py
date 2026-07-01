@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from api.support import require_admin, require_identity, resolve_image_base_url
 from services.account_service import account_service
 from services.backup_service import BackupError, backup_service
+from services.bulk_job_service import bulk_job_service
 from services.config import config
 from services.image_service import (
     compress_images,
@@ -146,6 +147,30 @@ def create_router(app_version: str) -> APIRouter:
             body.end_date.strip(),
             body.all_matching,
         )
+
+    @router.post("/api/images/delete/jobs")
+    async def submit_image_delete_job(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        job_id = bulk_job_service.submit_image_delete(
+            paths=body.paths,
+            start_date=body.start_date.strip(),
+            end_date=body.end_date.strip(),
+            all_matching=body.all_matching,
+        )
+        return {"job_id": job_id}
+
+    @router.get("/api/images/delete/jobs/{job_id}")
+    async def get_image_delete_job(job_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        progress = bulk_job_service.get_job(bulk_job_service.IMAGE_DELETE_KIND, job_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail={"error": "job not found"})
+        return progress
+
+    @router.post("/api/bulk-jobs/{job_id}/cancel")
+    async def cancel_bulk_job(job_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return bulk_job_service.cancel_job(job_id)
 
     @router.post("/api/images/download")
     async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):

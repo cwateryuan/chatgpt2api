@@ -124,6 +124,35 @@ class MemoryRecycleTests(unittest.TestCase):
         ):
             self.assertFalse(_should_recycle(**common)[0])
 
+    def test_should_not_recycle_with_maintenance_activity(self) -> None:
+        fake_activity = mock.Mock()
+        fake_activity.snapshot.return_value = {"active": 0, "idle_secs": 600.0}
+        fake_maintenance = mock.Mock()
+        fake_maintenance.snapshot.return_value = {
+            "active": 1,
+            "by_kind": {"bulk_image_delete": 1},
+            "idle_secs": 0.0,
+        }
+        with (
+            mock.patch("services.memory_recycle._rss_kb", return_value=2 * 1024 * 1024),
+            mock.patch("services.memory_recycle.request_activity", fake_activity),
+            mock.patch("services.memory_recycle.maintenance_activity", fake_maintenance),
+            mock.patch("services.memory_recycle._runtime_inflight_total", return_value=0),
+            mock.patch("services.memory_recycle._active_image_task_threads", return_value=0),
+            mock.patch("services.memory_recycle._unfinished_image_tasks", return_value=0),
+            mock.patch("services.memory_recycle._has_register_thread", return_value=False),
+            mock.patch("services.memory_recycle.time.monotonic", return_value=1000.0),
+        ):
+            should_recycle, detail = _should_recycle(
+                threshold_kb=1024 * 1024,
+                idle_secs_required=300,
+                min_age_secs=300,
+                started_at=0,
+            )
+
+        self.assertFalse(should_recycle)
+        self.assertEqual(detail["maintenance_active"], 1)
+
     def test_should_not_recycle_with_unfinished_task_when_strict(self) -> None:
         fake_activity = mock.Mock()
         fake_activity.snapshot.return_value = {"active": 0, "idle_secs": 600.0}

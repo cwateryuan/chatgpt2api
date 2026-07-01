@@ -29,10 +29,14 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  cancelBulkJob,
+  createAccountImportJob,
   createAccounts,
+  fetchAccountImportJob,
   finishOAuthLogin,
   startOAuthLogin,
   type Account,
+  type BulkAccountImportProgress,
   type AccountImportPayload,
   type OAuthLoginStartResponse,
 } from "@/lib/api";
@@ -42,7 +46,7 @@ type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "cpa" | "oauth
 
 type AccountImportDialogProps = {
   disabled?: boolean;
-  onImported: (items: Account[]) => void;
+  onImported: (items?: Account[]) => void;
 };
 
 type PendingCpaImport = {
@@ -53,6 +57,7 @@ type PendingCpaImport = {
 };
 
 const sessionUrl = "https://chatgpt.com/api/auth/session";
+const BULK_IMPORT_THRESHOLD = 20;
 
 function splitTokens(value: string) {
   return value
@@ -123,6 +128,10 @@ function readFileAsText(file: File) {
   });
 }
 
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function MethodCard({
   title,
   description,
@@ -163,6 +172,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [sessionInput, setSessionInput] = useState("");
   const [codexAuthInput, setCodexAuthInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [importProgress, setImportProgress] = useState<BulkAccountImportProgress | null>(null);
   const [pendingCpaImport, setPendingCpaImport] = useState<PendingCpaImport | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [oauthEmailHint, setOauthEmailHint] = useState("");
@@ -184,6 +194,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     setOauthSession(null);
     setOauthCallbackInput("");
     setOauthStarting(false);
+    setImportProgress(null);
   };
 
   const handleOpenChange = (nextOpen: boolean) => {
@@ -203,6 +214,37 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
     setIsSubmitting(true);
     try {
+      if (normalizedTokens.length >= BULK_IMPORT_THRESHOLD || accountPayloads.length >= BULK_IMPORT_THRESHOLD) {
+        const { job_id } = await createAccountImportJob(normalizedTokens, accountPayloads);
+        toast.success(`已创建后台导入任务，任务会低优先级执行`);
+        let latest: BulkAccountImportProgress | null = null;
+        for (;;) {
+          latest = await fetchAccountImportJob(job_id);
+          setImportProgress(latest);
+          if (latest.done) {
+            break;
+          }
+          await wait(1500);
+        }
+        if (latest.status === "cancelled") {
+          onImported();
+          setOpen(false);
+          resetState();
+          toast.error(`后台导入任务已取消，已导入 ${latest.imported ?? 0} 个，已刷新 ${latest.refreshed ?? 0} 个`);
+          return;
+        }
+        if (latest.error) {
+          throw new Error(latest.error);
+        }
+        onImported();
+        setOpen(false);
+        resetState();
+        toast.success(
+          `${successText ?? "导入完成"}，新增 ${latest.imported ?? 0} 个，跳过 ${latest.skipped ?? 0} 个重复项，已刷新 ${latest.refreshed ?? 0} 个`,
+        );
+        return;
+      }
+
       const data = await createAccounts(normalizedTokens, accountPayloads);
       onImported(data.items);
       setOpen(false);
@@ -786,6 +828,48 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           </DialogHeader>
 
           {renderMethodBody()}
+          {importProgress ? (
+            <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 text-sm text-stone-600">
+              <div className="flex items-center justify-between">
+                <span>{importProgress.phase === "refreshing" ? "正在低优先级刷新账号" : "正在低优先级导入账号"}</span>
+                <span className="font-medium text-stone-800">
+                  {importProgress.phase === "refreshing"
+                    ? `${importProgress.refresh_processed ?? 0}/${importProgress.refresh_total ?? 0}`
+                    : `${importProgress.processed}/${importProgress.total}`}
+                </span>
+              </div>
+              <div className="mt-2 h-2 overflow-hidden rounded-full bg-white">
+                <div
+                  className="h-full rounded-full bg-stone-900 transition-all"
+                  style={{
+                    width: `${Math.min(100, Math.max(0, importProgress.phase === "refreshing"
+                      ? (((importProgress.refresh_processed ?? 0) / Math.max(1, importProgress.refresh_total ?? 1)) * 100)
+                      : ((importProgress.processed / Math.max(1, importProgress.total)) * 100)))}%`,
+                  }}
+                />
+              </div>
+              {!importProgress.done ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="mt-3 h-8 rounded-lg border-stone-200 bg-white px-3 text-xs"
+                  onClick={async () => {
+                    try {
+                      const updated = await cancelBulkJob(importProgress.job_id);
+                      if (updated.kind === "bulk_account_import") {
+                        setImportProgress(updated);
+                      }
+                      toast.success("已请求取消后台导入任务");
+                    } catch (error) {
+                      toast.error(error instanceof Error ? error.message : "取消失败");
+                    }
+                  }}
+                >
+                  取消后台任务
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
 
           <DialogFooter className="pt-2">
             <Button

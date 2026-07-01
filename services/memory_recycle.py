@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Any
 
+from services.maintenance_activity import maintenance_activity
 from services.request_activity import request_activity
 from utils.log import logger
 
@@ -104,6 +105,7 @@ def _should_recycle(
 ) -> tuple[bool, dict[str, Any]]:
     rss_kb = _rss_kb()
     activity = request_activity.snapshot()
+    maintenance = maintenance_activity.snapshot()
     inflight = _runtime_inflight_total()
     image_task_threads = _active_image_task_threads()
     unfinished_image_tasks = _unfinished_image_tasks()
@@ -115,6 +117,8 @@ def _should_recycle(
         "threshold_kb": threshold_kb,
         "request_active": activity.get("active"),
         "request_idle_secs": round(float(activity.get("idle_secs") or 0.0), 3),
+        "maintenance_active": maintenance.get("active"),
+        "maintenance_by_kind": maintenance.get("by_kind"),
         "image_inflight_total": inflight,
         "image_task_threads": image_task_threads,
         "unfinished_image_tasks": unfinished_image_tasks,
@@ -128,6 +132,8 @@ def _should_recycle(
     if age_secs < min_age_secs:
         return False, detail
     if int(activity.get("active") or 0) > 0:
+        return False, detail
+    if int(maintenance.get("active") or 0) > 0:
         return False, detail
     if float(activity.get("idle_secs") or 0.0) < idle_secs_required:
         return False, detail
