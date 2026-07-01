@@ -5,11 +5,13 @@ from unittest import mock
 
 from services.protocol.conversation import (
     ConversationRequest,
+    ImageGenerationError,
     ImageGenerationTimeoutError,
     ImageOutput,
     _generate_single_image,
     format_downloaded_image_result,
     format_image_result,
+    is_http2_stream_error,
 )
 from services.image_timeout import ImageRequestDeadline
 
@@ -18,7 +20,7 @@ class FakeBackend:
     def __init__(self, payloads: list[bytes]):
         self.payloads = payloads
 
-    def iter_image_bytes(self, _urls: list[str]):
+    def iter_image_bytes(self, _urls: list[str], deadline=None):
         yield from self.payloads
 
 
@@ -40,6 +42,19 @@ class FakeAccountService:
     def mark_image_result(self, token, success):
         self.marked.append((token, success))
         self.release_image_slot(token)
+
+
+class ExpiringAfterStartDeadline:
+    timeout_secs = 120
+
+    def require(self):
+        return 1.0
+
+    def remaining(self):
+        return 0.0
+
+    def sleep(self, _seconds):
+        return None
 
 
 class ImageMemoryOptimizationTests(unittest.TestCase):
@@ -116,6 +131,56 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(raised.exception.code, "image_generation_timeout")
+
+    def test_http2_stream_error_is_not_retried(self):
+        service = FakeAccountService()
+        calls = {"count": 0}
+
+        def fake_stream(_backend, _request, _index, _total):
+            calls["count"] += 1
+            raise RuntimeError("Failed to perform, curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR")
+            yield
+
+        with (
+            mock.patch("services.protocol.conversation.account_service", service),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend_class,
+            mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            mock.patch("services.protocol.conversation.trim_memory", lambda *_args, **_kwargs: None),
+        ):
+            backend_class.return_value.close.return_value = None
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(ConversationRequest(prompt="draw", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertIn(("token-1", False), service.marked)
+        self.assertIn("token-1", service.released)
+        self.assertIn("upstream image stream failed", str(raised.exception))
+        self.assertTrue(is_http2_stream_error(str(raised.exception.__cause__)))
+
+    def test_expired_deadline_converts_curl_timeout_to_image_generation_timeout(self):
+        service = FakeAccountService()
+        deadline = ExpiringAfterStartDeadline()
+
+        def fake_stream(_backend, _request, _index, _total):
+            raise RuntimeError("curl: (28) Operation timed out after 120000 milliseconds")
+            yield
+
+        with (
+            mock.patch("services.protocol.conversation.account_service", service),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend_class,
+            mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            mock.patch("services.protocol.conversation.trim_memory", lambda *_args, **_kwargs: None),
+        ):
+            backend_class.return_value.close.return_value = None
+            with self.assertRaises(ImageGenerationTimeoutError) as raised:
+                _generate_single_image(
+                    ConversationRequest(prompt="draw", model="gpt-image-2", deadline=deadline),
+                    1,
+                    1,
+                )
+
+        self.assertEqual(raised.exception.code, "image_generation_timeout")
+        self.assertIn(("token-1", False), service.marked)
 
 
 if __name__ == "__main__":

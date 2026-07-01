@@ -17,7 +17,7 @@ from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, requests
 from PIL import Image
 
 from services.account_service import account_service
@@ -47,6 +47,13 @@ def _timeout(default_secs: float, deadline: ImageRequestDeadline | None = None) 
     if deadline is None:
         return float(default_secs)
     return deadline.request_timeout(default_secs)
+
+
+def _curl_deadline_options(deadline: ImageRequestDeadline | None = None) -> dict[CurlOpt, int]:
+    if deadline is None:
+        return {}
+    remaining = deadline.require()
+    return {CurlOpt.TIMEOUT_MS: max(1, int(remaining * 1000))}
 
 
 @dataclass
@@ -178,6 +185,7 @@ class OpenAIBackendAPI:
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
+            upstream=True,
             verify=True,
         ))
         self.session.headers.update({
@@ -1017,13 +1025,21 @@ class OpenAIBackendAPI:
             "force_parallel_switch": "auto",
         }
         path = "/backend-api/f/conversation"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=_timeout(300, deadline),
-            stream=True,
-        )
+        previous_curl_options = dict(getattr(self.session, "curl_options", {}) or {})
+        self.session.curl_options = {
+            **previous_curl_options,
+            **_curl_deadline_options(deadline),
+        }
+        try:
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                json=payload,
+                timeout=_timeout(300, deadline),
+                stream=True,
+            )
+        finally:
+            self.session.curl_options = previous_curl_options
         ensure_ok(response, path)
         return response
 

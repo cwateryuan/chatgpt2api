@@ -106,6 +106,17 @@ def is_tls_connection_error(message: str) -> bool:
     )
 
 
+def is_http2_stream_error(message: str) -> bool:
+    """Detect HTTP/2 stream failures after an upstream image request was sent."""
+    text = str(message or "").lower()
+    return (
+        "curl: (92)" in text
+        or "http/2 stream" in text
+        or "http2 stream" in text
+        or "internal_error" in text
+    )
+
+
 def is_connection_timeout_error(message: str) -> bool:
     """检测连接超时错误（如 curl 28），这类错误可通过同账号短等待重试解决。"""
     text = str(message or "").lower()
@@ -122,6 +133,8 @@ def image_stream_error_message(message: str) -> str:
     text = str(message or "")
     if is_token_invalid_error(text):
         return "image generation failed"
+    if is_http2_stream_error(text):
+        return "upstream image stream failed, please retry later"
     if is_tls_connection_error(text):
         return "upstream image connection failed, please retry later"
     if is_connection_timeout_error(text):
@@ -1542,6 +1555,8 @@ def _generate_single_image(
             account_service.mark_image_result(token, False)
             slot_released = True
             last_error = str(exc)
+            if deadline.remaining() <= 0:
+                raise image_timeout_error(deadline, account_email=account_email) from exc
             logger.warning({
                 "event": "image_stream_fail",
                 "request_token": token,
@@ -1549,9 +1564,20 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if is_http2_stream_error(last_error):
+                logger.warning({
+                    "event": "image_stream_http2_error",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "index": index,
+                    "error": last_error[:300],
+                })
+                raise ImageGenerationError(
+                    image_stream_error_message(last_error),
+                    account_email=account_email,
+                    conversation_id="",
+                ) from exc
             if not emitted_for_token and is_token_invalid_error(last_error):
-                if deadline.remaining() <= 0:
-                    raise image_timeout_error(deadline, account_email=account_email) from exc
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
@@ -1560,8 +1586,6 @@ def _generate_single_image(
                 continue
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):
-                if deadline.remaining() <= 0:
-                    raise image_timeout_error(deadline, account_email=account_email) from exc
                 tls_retry_count += 1
                 if tls_retry_count <= MAX_TLS_RETRIES:
                     logger.warning({
@@ -1576,8 +1600,6 @@ def _generate_single_image(
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
-                if deadline.remaining() <= 0:
-                    raise image_timeout_error(deadline, account_email=account_email) from exc
                 conn_timeout_retry_count += 1
                 if conn_timeout_retry_count <= MAX_CONN_TIMEOUT_RETRIES:
                     wait_secs = min(3.0 * conn_timeout_retry_count, 9.0)
