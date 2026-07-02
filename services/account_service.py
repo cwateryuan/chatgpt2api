@@ -1071,16 +1071,14 @@ class AccountService:
                 image_available_count += 1
                 if token:
                     matching_tokens.append(token)
-        cooldown = runtime_state.image_cooldown_snapshot(matching_tokens)
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         inflight = runtime_state.image_inflight_snapshot(matching_tokens)
-        full_tokens = [token for token in matching_tokens if token not in cooldown and int(inflight.get(token, 0)) >= max_concurrency]
+        full_tokens = [token for token in matching_tokens if int(inflight.get(token, 0)) >= max_concurrency]
         return {
             "candidate_count": len(items),
             "ready_candidate_count": len(matching_tokens),
             "image_available_count": image_available_count,
             "zero_quota_count": zero_quota_count,
-            "cooldown_count": len(cooldown),
             "slot_full_count": len(full_tokens),
             "max_concurrency": max_concurrency,
             "remaining_secs": round(max(0.0, deadline.remaining()), 3) if deadline is not None else None,
@@ -1115,9 +1113,6 @@ class AccountService:
                         })
                         raise
                 ready_tokens = self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-                cooldown = runtime_state.image_cooldown_snapshot(ready_tokens)
-                if cooldown:
-                    ready_tokens = [token for token in ready_tokens if token not in cooldown]
                 if not ready_tokens:
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
@@ -1141,13 +1136,6 @@ class AccountService:
         with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
             runtime_state.release_image_slot(access_token)
-            self._image_slot_condition.notify_all()
-
-    def set_image_cooldown(self, access_token: str, ttl_seconds: int, reason: str = "") -> None:
-        if not access_token:
-            return
-        runtime_state.set_image_cooldown(access_token, ttl_seconds)
-        with self._image_slot_condition:
             self._image_slot_condition.notify_all()
 
     def get_available_access_token(

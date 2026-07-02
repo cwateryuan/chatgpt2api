@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
 
@@ -79,11 +78,6 @@ def _string(value: object) -> str:
 
 def _token_hash(access_token: object) -> str:
     return hashlib.sha256(_string(access_token).encode("utf-8")).hexdigest()
-
-
-def _advisory_lock_id(value: object) -> int:
-    digest = hashlib.sha256(_string(value).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 class AccountModel(Base):
@@ -181,14 +175,6 @@ class Sub2APIServerModel(Base):
 
 class RegisterConfigModel(Base):
     __tablename__ = "register_config"
-
-    key = Column(String(255), primary_key=True)
-    data = Column(Text, nullable=False)
-    updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
-
-
-class AppConfigModel(Base):
-    __tablename__ = "app_config"
 
     key = Column(String(255), primary_key=True)
     data = Column(Text, nullable=False)
@@ -686,48 +672,6 @@ class DatabaseStorageBackend(StorageBackend):
             return _as_dict(row.data) if row else None
         finally:
             session.close()
-
-    def save_app_config(self, key: str, data: dict[str, Any]) -> None:
-        config_key = _string(key) or "default"
-        session = self.Session()
-        try:
-            row = session.query(AppConfigModel).filter(AppConfigModel.key == config_key).first()
-            if row is None:
-                row = AppConfigModel(key=config_key)
-                session.add(row)
-            row.data = _json_dumps(data if isinstance(data, dict) else {})
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
-    def load_app_config(self, key: str) -> dict[str, Any] | None:
-        config_key = _string(key) or "default"
-        session = self.Session()
-        try:
-            row = session.query(AppConfigModel).filter(AppConfigModel.key == config_key).first()
-            return _as_dict(row.data) if row else None
-        finally:
-            session.close()
-
-    @contextmanager
-    def app_config_write_lock(self, key: str):
-        session = self.Session()
-        try:
-            dialect = self.engine.dialect.name
-            if dialect == "postgresql":
-                lock_id = _advisory_lock_id(f"app_config:{_string(key) or 'default'}")
-                session.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
-            yield
-        finally:
-            try:
-                if self.engine.dialect.name == "postgresql":
-                    lock_id = _advisory_lock_id(f"app_config:{_string(key) or 'default'}")
-                    session.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
-            finally:
-                session.close()
 
     def health_check(self) -> dict[str, Any]:
         try:

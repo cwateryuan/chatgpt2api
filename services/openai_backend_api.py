@@ -56,21 +56,6 @@ def _curl_deadline_options(deadline: ImageRequestDeadline | None = None) -> dict
     return {CurlOpt.TIMEOUT_MS: max(1, int(remaining * 1000))}
 
 
-def _post_stream_with_curl_options(session: requests.Session, url: str, *, curl_options: dict[CurlOpt, int] | None = None, **kwargs):
-    """curl-cffi sync Session only accepts curl_options on the Session object."""
-    if not curl_options:
-        return session.post(url, **kwargs)
-    previous_curl_options = dict(getattr(session, "curl_options", {}) or {})
-    session.curl_options = {
-        **previous_curl_options,
-        **curl_options,
-    }
-    try:
-        return session.post(url, **kwargs)
-    finally:
-        session.curl_options = previous_curl_options
-
-
 @dataclass
 class ChatRequirements:
     """保存一次对话请求所需的 sentinel token。"""
@@ -1040,15 +1025,21 @@ class OpenAIBackendAPI:
             "force_parallel_switch": "auto",
         }
         path = "/backend-api/f/conversation"
-        response = _post_stream_with_curl_options(
-            self.session,
-            self.base_url + path,
-            curl_options=_curl_deadline_options(deadline),
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=_timeout(300, deadline),
-            stream=True,
-        )
+        previous_curl_options = dict(getattr(self.session, "curl_options", {}) or {})
+        self.session.curl_options = {
+            **previous_curl_options,
+            **_curl_deadline_options(deadline),
+        }
+        try:
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                json=payload,
+                timeout=_timeout(300, deadline),
+                stream=True,
+            )
+        finally:
+            self.session.curl_options = previous_curl_options
         ensure_ok(response, path)
         return response
 

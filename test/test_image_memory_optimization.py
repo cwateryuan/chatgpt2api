@@ -29,7 +29,6 @@ class FakeAccountService:
         self.tokens = iter(["token-1", "token-2"])
         self.released: list[str] = []
         self.marked: list[tuple[str, bool]] = []
-        self.cooldowns: list[tuple[str, int, str]] = []
 
     def get_available_access_token(self, **_kwargs):
         return next(self.tokens)
@@ -43,9 +42,6 @@ class FakeAccountService:
     def mark_image_result(self, token, success):
         self.marked.append((token, success))
         self.release_image_slot(token)
-
-    def set_image_cooldown(self, token, ttl_seconds, reason=""):
-        self.cooldowns.append((token, ttl_seconds, reason))
 
 
 class ExpiringAfterStartDeadline:
@@ -158,7 +154,6 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
         self.assertEqual(calls["count"], 1)
         self.assertIn(("token-1", False), service.marked)
         self.assertIn("token-1", service.released)
-        self.assertTrue(any(item[0] == "token-1" and item[2] == "http2_stream_error" for item in service.cooldowns))
         self.assertIn("upstream image stream failed", str(raised.exception))
         self.assertTrue(is_http2_stream_error(str(raised.exception.__cause__)))
 
@@ -186,7 +181,6 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "image_generation_timeout")
         self.assertIn(("token-1", False), service.marked)
-        self.assertTrue(any(item[0] == "token-1" for item in service.cooldowns))
 
 
 if __name__ == "__main__":

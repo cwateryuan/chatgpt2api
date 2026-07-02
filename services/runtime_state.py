@@ -78,7 +78,6 @@ return redis.call("DECR", inflight_key)
         self._memory_aliases: dict[str, tuple[str, float]] = {}
         self._memory_progress: dict[str, tuple[dict[str, Any], float]] = {}
         self._memory_locks: dict[str, tuple[str, float]] = {}
-        self._memory_cooldowns: dict[str, float] = {}
         self._memory_rr: dict[str, int] = {}
         if self.redis_url:
             try:
@@ -215,63 +214,6 @@ return redis.call("DECR", inflight_key)
             else:
                 self._memory_inflight[token] = (current - 1, expires_at)
 
-    def set_image_cooldown(self, access_token: str, ttl_seconds: int) -> None:
-        token = _clean(access_token)
-        ttl = max(0, int(ttl_seconds or 0))
-        if not token or ttl <= 0:
-            return
-        if self._redis is not None:
-            try:
-                self._redis.set(f"account:image:cooldown:{token}", "1", ex=ttl)
-                return
-            except Exception:
-                pass
-        with self._lock:
-            self._memory_cooldowns[token] = time.time() + ttl
-
-    def is_image_cooldown(self, access_token: str) -> bool:
-        token = _clean(access_token)
-        if not token:
-            return False
-        if self._redis is not None:
-            try:
-                return bool(self._redis.exists(f"account:image:cooldown:{token}"))
-            except Exception:
-                pass
-        with self._lock:
-            self._cleanup_memory_locked()
-            return token in self._memory_cooldowns
-
-    def image_cooldown_snapshot(self, tokens: list[str] | None = None) -> dict[str, int]:
-        cleaned = [_clean(token) for token in (tokens or []) if _clean(token)]
-        if self._redis is not None:
-            try:
-                if cleaned:
-                    result: dict[str, int] = {}
-                    for token in cleaned:
-                        ttl = int(self._redis.ttl(f"account:image:cooldown:{token}") or -2)
-                        if ttl > 0:
-                            result[token] = ttl
-                    return result
-                result = {}
-                for key in self._redis.scan_iter("account:image:cooldown:*", count=1000):
-                    token = str(key).rsplit(":", 1)[-1]
-                    ttl = int(self._redis.ttl(key) or -2)
-                    if ttl > 0:
-                        result[token] = ttl
-                return result
-            except Exception:
-                pass
-        with self._lock:
-            self._cleanup_memory_locked()
-            now = time.time()
-            source = cleaned or list(self._memory_cooldowns)
-            return {
-                token: max(0, int(self._memory_cooldowns[token] - now))
-                for token in source
-                if token in self._memory_cooldowns and self._memory_cooldowns[token] > now
-            }
-
     def transfer_image_slot(self, old_token: str, new_token: str, ttl_seconds: int) -> None:
         old = _clean(old_token)
         new = _clean(new_token)
@@ -314,16 +256,13 @@ return current
             return
         if self._redis is not None:
             try:
-                keys = [f"account:image:inflight:{token}" for token in cleaned]
-                keys.extend(f"account:image:cooldown:{token}" for token in cleaned)
-                self._redis.delete(*keys)
+                self._redis.delete(*(f"account:image:inflight:{token}" for token in cleaned))
                 return
             except Exception:
                 pass
         with self._lock:
             for token in cleaned:
                 self._memory_inflight.pop(token, None)
-                self._memory_cooldowns.pop(token, None)
 
     def get_image_inflight(self, access_token: str) -> int:
         token = _clean(access_token)
@@ -367,16 +306,6 @@ return current
         with self._lock:
             self._cleanup_memory_locked()
             return sum(max(0, int(item[0])) for item in self._memory_inflight.values())
-
-    def image_cooldown_total(self) -> int:
-        if self._redis is not None:
-            try:
-                return sum(1 for _key in self._redis.scan_iter("account:image:cooldown:*", count=1000))
-            except Exception:
-                return 0
-        with self._lock:
-            self._cleanup_memory_locked()
-            return len(self._memory_cooldowns)
 
     def next_text_index(self) -> int:
         if self._redis is not None:
@@ -594,7 +523,6 @@ return 0
         self._memory_aliases = {key: item for key, item in self._memory_aliases.items() if item[1] > now}
         self._memory_progress = {key: item for key, item in self._memory_progress.items() if item[1] > now}
         self._memory_locks = {key: item for key, item in self._memory_locks.items() if item[1] > now}
-        self._memory_cooldowns = {key: expires_at for key, expires_at in self._memory_cooldowns.items() if expires_at > now}
 
     @staticmethod
     def _mask_redis_url(url: str) -> str:

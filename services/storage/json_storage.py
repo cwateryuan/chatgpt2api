@@ -13,10 +13,8 @@ class JSONStorageBackend(StorageBackend):
     def __init__(self, file_path: Path, auth_keys_path: Path | None = None):
         self.file_path = file_path
         self.auth_keys_path = auth_keys_path or file_path.with_name("auth_keys.json")
-        self.app_config_path = self.file_path.with_name("app_config.json")
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)
-        self.app_config_path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _load_json_list(file_path: Path) -> list[dict[str, Any]]:
@@ -95,23 +93,3 @@ class JSONStorageBackend(StorageBackend):
             "auth_keys_file_path": str(self.auth_keys_path),
             "auth_keys_file_exists": self.auth_keys_path.exists(),
         }
-
-    def _load_app_config_items(self) -> dict[str, dict[str, Any]]:
-        if not self.app_config_path.exists():
-            return {}
-        try:
-            data = json.loads(self.app_config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, Exception):
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def save_app_config(self, key: str, data: dict[str, Any]) -> None:
-        config_key = str(key or "default").strip() or "default"
-        items = self._load_app_config_items()
-        items[config_key] = data if isinstance(data, dict) else {}
-        self.app_config_path.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    def load_app_config(self, key: str) -> dict[str, Any] | None:
-        config_key = str(key or "default").strip() or "default"
-        item = self._load_app_config_items().get(config_key)
-        return item if isinstance(item, dict) else None
