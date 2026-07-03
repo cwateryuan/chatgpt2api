@@ -605,7 +605,7 @@ class ImageTaskService:
                     backend,
                     image_urls,
                     "",  # prompt 已不重要，结果已经拿到了
-                    "url",
+                    "b64_json",
                     "",
                     int(time.time()),
                     deadline,
