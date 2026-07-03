@@ -4,7 +4,7 @@ export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
-export type ImageStorageMode = "local" | "webdav" | "both";
+export type ImageStorageMode = "local" | "webdav" | "both" | "s3";
 
 export type ImageStorageSettings = {
   enabled: boolean;
@@ -13,7 +13,16 @@ export type ImageStorageSettings = {
   webdav_username: string;
   webdav_password: string;
   webdav_root_path: string;
+  s3_endpoint_url: string;
+  s3_region: string;
+  s3_access_key_id: string;
+  s3_secret_access_key: string;
+  s3_bucket: string;
+  s3_prefix: string;
+  s3_path_style: boolean;
+  s3_skip_ssl_verify: boolean;
   public_base_url: string;
+  force_remote_url_output: boolean;
 };
 
 export type Account = {

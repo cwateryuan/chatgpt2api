@@ -88,6 +88,25 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
         self.assertEqual(result["data"][0]["revised_prompt"], "revised")
         save.assert_called_once_with(b"image-bytes", "http://app.test")
 
+    def test_force_remote_url_output_overrides_b64_response_format(self):
+        with (
+            mock.patch("services.protocol.conversation.save_image_bytes", return_value="https://cdn.example.test/one.png"),
+            mock.patch("services.protocol.conversation.config.get_image_storage_settings", return_value={
+                "enabled": True,
+                "force_remote_url_output": True,
+            }),
+        ):
+            result = format_image_result(
+                [{"b64_json": "aW1hZ2UtYnl0ZXM=", "revised_prompt": "revised"}],
+                "draw",
+                "b64_json",
+                "http://app.test",
+                123,
+            )
+
+        self.assertEqual(result["data"], [{"url": "https://cdn.example.test/one.png", "revised_prompt": "revised"}])
+        self.assertNotIn("b64_json", result["data"][0])
+
     def test_retry_continue_releases_previous_image_slot(self):
         service = FakeAccountService()
         calls = {"count": 0}

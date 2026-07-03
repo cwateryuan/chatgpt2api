@@ -36,7 +36,16 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_username": "",
     "webdav_password": "",
     "webdav_root_path": "chatgpt2api/images",
+    "s3_endpoint_url": "",
+    "s3_region": "us-east-1",
+    "s3_access_key_id": "",
+    "s3_secret_access_key": "",
+    "s3_bucket": "",
+    "s3_prefix": "chatgpt2api/images",
+    "s3_path_style": True,
+    "s3_skip_ssl_verify": False,
     "public_base_url": "",
+    "force_remote_url_output": False,
 }
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
@@ -153,12 +162,13 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     mode = str(source.get("mode") or "local").strip().lower()
-    if mode not in {"local", "webdav", "both"}:
+    if mode not in {"local", "webdav", "both", "s3"}:
         mode = "local"
     enabled = _normalize_bool(source.get("enabled"), False)
     if not enabled:
         mode = "local"
     root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
+    s3_prefix = str(source.get("s3_prefix") or DEFAULT_IMAGE_STORAGE["s3_prefix"]).strip().strip("/")
     return {
         "enabled": enabled,
         "mode": mode,
@@ -166,7 +176,16 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_username": str(source.get("webdav_username") or "").strip(),
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
+        "s3_endpoint_url": str(source.get("s3_endpoint_url") or "").strip().rstrip("/"),
+        "s3_region": str(source.get("s3_region") or DEFAULT_IMAGE_STORAGE["s3_region"]).strip() or "us-east-1",
+        "s3_access_key_id": str(source.get("s3_access_key_id") or "").strip(),
+        "s3_secret_access_key": str(source.get("s3_secret_access_key") or "").strip(),
+        "s3_bucket": str(source.get("s3_bucket") or "").strip(),
+        "s3_prefix": s3_prefix or str(DEFAULT_IMAGE_STORAGE["s3_prefix"]),
+        "s3_path_style": _normalize_bool(source.get("s3_path_style"), True),
+        "s3_skip_ssl_verify": _normalize_bool(source.get("s3_skip_ssl_verify"), False),
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+        "force_remote_url_output": _normalize_bool(source.get("force_remote_url_output"), False),
     }
 
 
@@ -299,10 +318,29 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
     if not _normalize_bool(settings.get("enabled"), False):
         return
-    if not str(settings.get("webdav_url") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
-    if not str(settings.get("webdav_password") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+    mode = str(settings.get("mode") or "local").strip().lower()
+    if mode in {"webdav", "both"}:
+        if not str(settings.get("webdav_url") or "").strip():
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
+        if not str(settings.get("webdav_password") or "").strip():
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+    if mode == "s3":
+        missing = []
+        if not str(settings.get("s3_endpoint_url") or "").strip():
+            missing.append("Endpoint")
+        if not str(settings.get("s3_access_key_id") or "").strip():
+            missing.append("Access Key")
+        if not str(settings.get("s3_secret_access_key") or "").strip():
+            missing.append("Secret Key")
+        if not str(settings.get("s3_bucket") or "").strip():
+            missing.append("Bucket")
+        if missing:
+            raise ValueError(f"启用 S3/MinIO 图片存储后必须填写 {'、'.join(missing)}")
+    if _normalize_bool(settings.get("force_remote_url_output"), False):
+        if mode not in {"webdav", "both", "s3"}:
+            raise ValueError("强制远程 URL 输出需要选择 WebDAV 或 S3/MinIO 存储模式")
+        if not str(settings.get("public_base_url") or "").strip():
+            raise ValueError("强制远程 URL 输出需要填写公开访问前缀")
 
 
 @dataclass(frozen=True)

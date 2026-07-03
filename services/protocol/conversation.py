@@ -12,7 +12,7 @@ import tiktoken
 
 from services.account_service import account_service
 from services.config import config
-from services.image_storage_service import image_storage_service
+from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.memory import trim_memory
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
@@ -200,8 +200,32 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
+def image_storage_settings() -> dict[str, object]:
+    try:
+        return config.get_image_storage_settings()
+    except Exception:
+        return {}
+
+
+def force_remote_url_output_enabled() -> bool:
+    settings = image_storage_settings()
+    return bool(settings.get("enabled") and settings.get("force_remote_url_output"))
+
+
 def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
+    try:
+        return image_storage_service.save(image_data, base_url).url
+    except ImageStorageError as exc:
+        raise ImageGenerationError(
+            "remote image storage failed",
+            status_code=502,
+            error_type="server_error",
+            code="remote_image_storage_failed",
+        ) from exc
+
+
+def normalize_image_response_format(response_format: str) -> str:
+    return "url" if force_remote_url_output_enabled() else response_format
 
 
 def message_text(content: Any) -> str:
@@ -339,7 +363,7 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         url = save_image_bytes(image_payload, base_url)
-        if response_format == "b64_json":
+        if normalize_image_response_format(response_format) == "b64_json":
             if not b64_json:
                 b64_json = base64.b64encode(image_payload).decode("ascii")
             data.append({

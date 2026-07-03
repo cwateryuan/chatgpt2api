@@ -280,7 +280,7 @@ export function ConfigCard() {
                   checked={Boolean(config?.image_storage?.enabled)}
                   onCheckedChange={(checked) => setImageStorageField("enabled", Boolean(checked))}
                 />
-                启用 WebDAV 图片存储
+                启用远程图片存储
               </label>
               <div className="flex flex-wrap gap-2">
                 <Button
@@ -291,22 +291,22 @@ export function ConfigCard() {
                   disabled={isTestingImageStorage || !config?.image_storage?.enabled}
                 >
                   {isTestingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <Cloud className="size-4" />}
-                  测试 WebDAV
+                  测试存储
                 </Button>
                 <Button
                   type="button"
                   variant="outline"
                   className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
                   onClick={() => void syncImagesToWebDAV()}
-                  disabled={isSyncingImageStorage || !config?.image_storage?.enabled || config?.image_storage?.mode === "local"}
+                  disabled={isSyncingImageStorage || !config?.image_storage?.enabled || !["webdav", "both"].includes(String(config?.image_storage?.mode || "local"))}
                 >
                   {isSyncingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-                  全量同步
+                  同步 WebDAV
                 </Button>
               </div>
             </div>
             <p className="text-xs leading-6 text-stone-500">
-              生成时只处理本次新图片；全量同步用于把已有本地图片补传到 WebDAV。
+              生成时只处理本次新图片；同步按钮用于把已有本地图片补传到 WebDAV。S3/MinIO 模式下新图会直接上传到对象存储。
             </p>
             <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2 text-xs text-stone-600">
               当前待保存模式：
@@ -316,7 +316,9 @@ export function ConfigCard() {
                     ? "本机 + WebDAV"
                     : config.image_storage.mode === "webdav"
                       ? "仅 WebDAV"
-                      : "仅本机"
+                      : config.image_storage.mode === "s3"
+                        ? "S3/MinIO"
+                        : "仅本机"
                   : "仅本机"}
               </span>
               <span className="ml-2 text-stone-400">修改后需要点保存，或通过测试/同步按钮自动保存。</span>
@@ -336,48 +338,137 @@ export function ConfigCard() {
                     <SelectItem value="local">仅本机</SelectItem>
                     <SelectItem value="webdav">仅 WebDAV</SelectItem>
                     <SelectItem value="both">本机 + WebDAV</SelectItem>
+                    <SelectItem value="s3">S3/MinIO</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-2 md:col-span-2">
-                <label className="text-sm text-stone-700">WebDAV URL</label>
-                <Input
-                  value={String(config?.image_storage?.webdav_url || "")}
-                  onChange={(event) => setImageStorageField("webdav_url", event.target.value)}
-                  placeholder="https://example.com/dav"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
+              {config?.image_storage?.mode !== "s3" ? (
+                <>
+                  <div className="space-y-2 md:col-span-2">
+                    <label className="text-sm text-stone-700">WebDAV URL</label>
+                    <Input
+                      value={String(config?.image_storage?.webdav_url || "")}
+                      onChange={(event) => setImageStorageField("webdav_url", event.target.value)}
+                      placeholder="https://example.com/dav"
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-stone-700">用户名</label>
+                    <Input
+                      value={String(config?.image_storage?.webdav_username || "")}
+                      onChange={(event) => setImageStorageField("webdav_username", event.target.value)}
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-stone-700">密码</label>
+                    <Input
+                      type="password"
+                      value={String(config?.image_storage?.webdav_password || "")}
+                      onChange={(event) => setImageStorageField("webdav_password", event.target.value)}
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-stone-700">远端目录</label>
+                    <Input
+                      value={String(config?.image_storage?.webdav_root_path || "")}
+                      onChange={(event) => setImageStorageField("webdav_root_path", event.target.value)}
+                      placeholder="chatgpt2api/images"
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="space-y-2 md:col-span-2">
+                    <label className="text-sm text-stone-700">S3/MinIO Endpoint</label>
+                    <Input
+                      value={String(config?.image_storage?.s3_endpoint_url || "")}
+                      onChange={(event) => setImageStorageField("s3_endpoint_url", event.target.value)}
+                      placeholder="https://minio.example.com"
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-stone-700">Region</label>
+                    <Input
+                      value={String(config?.image_storage?.s3_region || "us-east-1")}
+                      onChange={(event) => setImageStorageField("s3_region", event.target.value)}
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-stone-700">Access Key</label>
+                    <Input
+                      value={String(config?.image_storage?.s3_access_key_id || "")}
+                      onChange={(event) => setImageStorageField("s3_access_key_id", event.target.value)}
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-stone-700">Secret Key</label>
+                    <Input
+                      type="password"
+                      value={String(config?.image_storage?.s3_secret_access_key || "")}
+                      onChange={(event) => setImageStorageField("s3_secret_access_key", event.target.value)}
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-stone-700">Bucket</label>
+                    <Input
+                      value={String(config?.image_storage?.s3_bucket || "")}
+                      onChange={(event) => setImageStorageField("s3_bucket", event.target.value)}
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <div className="space-y-2 md:col-span-2">
+                    <label className="text-sm text-stone-700">对象前缀</label>
+                    <Input
+                      value={String(config?.image_storage?.s3_prefix || "")}
+                      onChange={(event) => setImageStorageField("s3_prefix", event.target.value)}
+                      placeholder="chatgpt2api/images"
+                      className="h-10 rounded-xl border-stone-200 bg-white"
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                  </div>
+                  <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+                    <Checkbox
+                      checked={Boolean(config?.image_storage?.s3_skip_ssl_verify)}
+                      onCheckedChange={(checked) => setImageStorageField("s3_skip_ssl_verify", Boolean(checked))}
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                    跳过 S3 TLS 校验
+                  </label>
+                  <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
+                    <Checkbox
+                      checked={Boolean(config?.image_storage?.s3_path_style ?? true)}
+                      onCheckedChange={(checked) => setImageStorageField("s3_path_style", Boolean(checked))}
+                      disabled={!config?.image_storage?.enabled}
+                    />
+                    使用 path-style 地址
+                  </label>
+                </>
+              )}
+              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700 md:col-span-3">
+                <Checkbox
+                  checked={Boolean(config?.image_storage?.force_remote_url_output)}
+                  onCheckedChange={(checked) => setImageStorageField("force_remote_url_output", Boolean(checked))}
                   disabled={!config?.image_storage?.enabled}
                 />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">用户名</label>
-                <Input
-                  value={String(config?.image_storage?.webdav_username || "")}
-                  onChange={(event) => setImageStorageField("webdav_username", event.target.value)}
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">密码</label>
-                <Input
-                  type="password"
-                  value={String(config?.image_storage?.webdav_password || "")}
-                  onChange={(event) => setImageStorageField("webdav_password", event.target.value)}
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">远端目录</label>
-                <Input
-                  value={String(config?.image_storage?.webdav_root_path || "")}
-                  onChange={(event) => setImageStorageField("webdav_root_path", event.target.value)}
-                  placeholder="chatgpt2api/images"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
-              </div>
+                强制远程 URL 输出
+              </label>
               <div className="space-y-2 md:col-span-3">
                 <label className="text-sm text-stone-700">公开访问前缀</label>
                 <Input
