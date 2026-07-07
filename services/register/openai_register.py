@@ -550,6 +550,24 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
         step(index, "验证码校验完成")
 
+    def _load_about_you_page(self, index: int) -> None:
+        step(index, "开始加载 about-you 页面")
+        url = f"{auth_base}/about-you"
+        headers = self._navigate_headers(f"{auth_base}/email-verification")
+        headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+        resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
+        if _is_cloudflare_challenge(resp):
+            bundle = self._refresh_cloudflare_clearance(auth_base, index)
+            if bundle is None:
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
+            headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/email-verification"), url, self.proxy, self.clearance_user_agent)
+            resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
+            if _is_cloudflare_challenge(resp):
+                raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
+        if resp is None or resp.status_code not in (200, 302):
+            raise RuntimeError(error or f"load_about_you_http_{getattr(resp, 'status_code', 'unknown')}")
+        step(index, "about-you 页面加载完成")
+
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
         url = f"{auth_base}/api/accounts/create_account"
@@ -616,6 +634,7 @@ class PlatformRegistrar:
                 raise RuntimeError("等待注册验证码超时")
             step(index, f"收到注册验证码: {code}")
             self._validate_otp(code, index)
+            self._load_about_you_page(index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
             tokens = self._exchange_registered_tokens(index)
         except Exception as error:
