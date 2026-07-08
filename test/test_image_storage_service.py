@@ -76,6 +76,13 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertTrue((self.images_dir / stored.rel).is_file())
         self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
 
+    def test_configured_base_url_overrides_request_host(self):
+        self.mock_config.base_url = "https://img3.135335.xyz"
+
+        stored = self.service().save(png_bytes(), "https://api.example.com")
+
+        self.assertEqual(stored.url, f"https://img3.135335.xyz/images/{stored.rel}")
+
     def test_save_cleanup_is_rate_limited(self):
         service = self.service()
 

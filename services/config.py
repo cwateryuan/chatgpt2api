@@ -625,8 +625,8 @@ class ConfigStore:
     @property
     def base_url(self) -> str:
         return str(
-            os.getenv("CHATGPT2API_BASE_URL")
-            or self.data.get("base_url")
+            self.data.get("base_url")
+            or os.getenv("CHATGPT2API_BASE_URL")
             or ""
         ).strip().rstrip("/")
 

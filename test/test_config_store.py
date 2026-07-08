@@ -1,8 +1,10 @@
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from services.config import DEFAULT_PROXY_RUNTIME, ConfigStore
 
@@ -79,6 +81,16 @@ class ConfigStoreTests(unittest.TestCase):
 
             self.assertEqual(store.image_poll_timeout_secs, 333)
             self.assertEqual(store.log_levels, [])
+
+    def test_base_url_prefers_saved_config_over_environment(self) -> None:
+        tmp_dir, store = self._make_store({"base_url": "https://img3.135335.xyz/"})
+        with tmp_dir, mock.patch.dict(os.environ, {"CHATGPT2API_BASE_URL": "https://old-api.example.com"}):
+            self.assertEqual(store.base_url, "https://img3.135335.xyz")
+
+    def test_base_url_uses_environment_as_fallback(self) -> None:
+        tmp_dir, store = self._make_store({"base_url": ""})
+        with tmp_dir, mock.patch.dict(os.environ, {"CHATGPT2API_BASE_URL": "https://fallback.example.com/"}):
+            self.assertEqual(store.base_url, "https://fallback.example.com")
 
 
 if __name__ == "__main__":
