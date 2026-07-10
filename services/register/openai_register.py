@@ -890,7 +890,7 @@ class PlatformRegistrar:
                 source_type = "microsoft"
             else:
                 self._register_user(email, password, index)
-                mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+                mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
                 self._send_otp(index)
                 step(index, "开始等待注册验证码")
                 code = wait_for_code(mailbox)
