@@ -830,7 +830,7 @@ class PlatformRegistrar:
                 self._reset_auth_cookies()
                 self._platform_authorize(email, index, screen_hint="login_or_signup")
             self._authorize_continue_login(email, index)
-            mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+            mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
             self._send_passwordless_otp(index)
             step(index, "开始等待 Microsoft 登录验证码")
             code = wait_for_code(mailbox)
