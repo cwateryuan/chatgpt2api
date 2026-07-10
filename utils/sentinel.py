@@ -11,6 +11,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
+from utils.turnstile import solve_turnstile_token
+
 if TYPE_CHECKING:
     from curl_cffi.requests import Session
 
@@ -119,9 +121,10 @@ def build_sentinel_token(
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     generator = SentinelTokenGenerator(device_id, ua)
+    requirements_token = generator.generate_requirements_token()
     resp = session.post(
         "https://sentinel.openai.com/backend-api/sentinel/req",
-        data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
+        data=json.dumps({"p": requirements_token, "id": device_id, "flow": flow}),
         headers={
             "Content-Type": "text/plain;charset=UTF-8",
             "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
@@ -153,7 +156,91 @@ def build_sentinel_token(
         if pow_data.get("required") and pow_data.get("seed")
         else generator.generate_requirements_token()
     )
-    sentinel_value = json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+    turnstile_data = data.get("turnstile") or {}
+    so_token = ""
+    if turnstile_data.get("required") and turnstile_data.get("dx"):
+        so_token = solve_turnstile_token(str(turnstile_data.get("dx") or ""), requirements_token) or ""
+        if not so_token:
+            raise RuntimeError("sentinel_so_token_failed")
+    sentinel_value = json.dumps({"p": p_value, "t": so_token, "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
     # oai-sc cookie = "0" + sentinel token "c" value (the challenge token from the server)
     oai_sc_value = "0" + token
     return sentinel_value, oai_sc_value
+
+
+def build_sentinel_with_so_token(
+    session: "Session",
+    device_id: str,
+    flow: str,
+    *,
+    user_agent: str = "",
+    sec_ch_ua: str = "",
+) -> tuple[str, str, str]:
+    """请求 sentinel token 并返回 (sentinel_header_value, so_token_header_value, oai_sc_cookie_value)。
+
+    Args:
+        session: curl_cffi Session 实例
+        device_id: 设备 ID
+        flow: 流程标识（如 "oauth_create_account" 等）
+        user_agent: 可选的 User-Agent 覆盖
+        sec_ch_ua: 可选的 sec-ch-ua 覆盖
+
+    Returns:
+        (openai-sentinel-token, openai-sentinel-so-token, oai-sc cookie) 元组
+
+    Raises:
+        RuntimeError: sentinel 请求失败
+    """
+    ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
+    ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
+    generator = SentinelTokenGenerator(device_id, ua)
+    requirements_token = generator.generate_requirements_token()
+    resp = session.post(
+        "https://sentinel.openai.com/backend-api/sentinel/req",
+        data=json.dumps({"p": requirements_token, "id": device_id, "flow": flow}),
+        headers={
+            "Content-Type": "text/plain;charset=UTF-8",
+            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+            "Origin": "https://sentinel.openai.com",
+            "User-Agent": ua,
+            "sec-ch-ua": ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        },
+        timeout=20,
+        verify=False,
+    )
+
+    try:
+        data = resp.json() if resp.text else {}
+    except Exception:
+        fallback = json.dumps(
+            {"p": generator.generate_requirements_token(), "t": "", "c": "", "id": device_id, "flow": flow},
+            separators=(",", ":"),
+        )
+        return fallback, "", ""
+
+    token = str(data.get("token") or "").strip()
+    if resp.status_code != 200 or not token:
+        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+
+    pow_data = data.get("proofofwork") or {}
+    p_value = (
+        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
+        if pow_data.get("required") and pow_data.get("seed")
+        else generator.generate_requirements_token()
+    )
+
+    turnstile_data = data.get("turnstile") or {}
+    so_token = ""
+    if turnstile_data.get("required") and turnstile_data.get("dx"):
+        # 等待 5000ms 以模拟浏览器采集过程（对齐官方 SDK 行为）
+        time.sleep(5.0)
+        so_token = solve_turnstile_token(str(turnstile_data.get("dx") or ""), requirements_token) or ""
+        if not so_token:
+            raise RuntimeError("sentinel_so_token_failed")
+
+    sentinel_value = json.dumps({"p": p_value, "t": so_token, "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+    oai_sc_value = "0" + token
+
+    return sentinel_value, so_token, oai_sc_value
