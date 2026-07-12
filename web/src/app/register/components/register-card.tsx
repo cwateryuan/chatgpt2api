@@ -62,6 +62,7 @@ export function RegisterCard() {
       ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
+      ...(type === "mailpit" ? { api_url: "", domain: "" } : {}),
     });
   };
 
@@ -190,6 +191,7 @@ export function RegisterCard() {
                             <SelectItem value="yyds_mail">yyds_mail</SelectItem>
                             <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
                             <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
+                            <SelectItem value="mailpit">mailpit (本地 Mailpit)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -217,6 +219,18 @@ export function RegisterCard() {
                               <Input value={String(provider.admin_password || "")} onChange={(event) => updateProvider(index, { admin_password: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
                             </div>
                           ) : null}
+                        </>
+                      ) : null}
+                      {type === "mailpit" ? (
+                        <>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">Messages API URL</label>
+                            <Input value={String(provider.api_url || "")} onChange={(event) => updateProvider(index, { api_url: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} placeholder="http://mailpit:8025" />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">邮箱后缀</label>
+                            <Input value={String(provider.domain || "")} onChange={(event) => updateProvider(index, { domain: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} placeholder="your-domain.com" />
+                          </div>
                         </>
                       ) : null}
                       {type === "ddg_mail" ? (
