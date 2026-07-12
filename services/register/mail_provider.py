@@ -1044,7 +1044,7 @@ class MailpitProvider(BaseMailProvider):
         )
         if not self.domain or "@" in self.domain:
             raise RuntimeError("Mailpit 邮箱后缀格式不正确，请填写 @example.com 或 example.com")
-        self.session = _create_session(conf)
+        self.session = _create_session({**conf, "proxy": ""})
         self.session.headers.update({
             "User-Agent": conf["user_agent"],
             "Accept": "application/json",
