@@ -13,6 +13,7 @@ from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any, Callable, TypeVar
+from urllib.parse import quote
 
 from curl_cffi import requests
 
@@ -1018,6 +1019,129 @@ class InbucketMailProvider(BaseMailProvider):
         self.session.close()
 
 
+class MailpitProvider(BaseMailProvider):
+    name = "mailpit"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or ""))
+        api_url = str(entry.get("api_url") or entry.get("api_base") or "").strip().rstrip("/")
+        if not api_url:
+            raise RuntimeError("Mailpit 需要配置 Messages API URL")
+        if api_url.endswith("/messages"):
+            self.messages_url = api_url
+            self.message_url = f"{api_url[:-len('/messages')]}/message"
+        elif api_url.endswith("/api/v1"):
+            self.messages_url = f"{api_url}/messages"
+            self.message_url = f"{api_url}/message"
+        else:
+            self.messages_url = f"{api_url}/api/v1/messages"
+            self.message_url = f"{api_url}/api/v1/message"
+        self.domain = (
+            str(entry.get("domain") or entry.get("suffix") or "")
+            .strip()
+            .lstrip("@")
+            .strip()
+        )
+        if not self.domain or "@" in self.domain:
+            raise RuntimeError("Mailpit 邮箱后缀格式不正确，请填写 @example.com 或 example.com")
+        self.session = _create_session(conf)
+        self.session.headers.update({
+            "User-Agent": conf["user_agent"],
+            "Accept": "application/json",
+        })
+
+    def _request(self, url: str) -> dict[str, Any]:
+        resp = self.session.request(
+            "GET",
+            url,
+            timeout=self.conf["request_timeout"],
+            verify=False,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Mailpit 请求失败: GET {url}, HTTP {resp.status_code}, body={resp.text[:300]}"
+            )
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Mailpit 返回格式不正确: GET {url}")
+        return data
+
+    @staticmethod
+    def _addresses(value: Any) -> list[str]:
+        if isinstance(value, list):
+            result: list[str] = []
+            for item in value:
+                result.extend(MailpitProvider._addresses(item))
+            return result
+        if isinstance(value, dict):
+            address = (
+                value.get("Address")
+                or value.get("address")
+                or value.get("Email")
+                or value.get("email")
+            )
+            return [str(address).strip()] if str(address or "").strip() else []
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        local_part = str(username or _random_mailbox_name()).strip()
+        if not local_part or "@" in local_part:
+            raise RuntimeError("Mailpit 随机邮箱前缀格式不正确")
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": f"{local_part}@{self.domain}",
+        }
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        data = self._request(self.messages_url)
+        raw_items = data.get("messages") or data.get("Messages") or []
+        items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        items.sort(
+            key=lambda value: (
+                (
+                    _parse_received_at(value.get("Created") or value.get("created"))
+                    or datetime.fromtimestamp(0, tz=timezone.utc)
+                ).timestamp(),
+                str(value.get("ID") or value.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        address = str(mailbox.get("address") or "").strip()
+        for item in items:
+            summary = {"to": self._addresses(item.get("To") or item.get("to"))}
+            if not _message_matches_email(summary, address):
+                continue
+            message_id = str(item.get("ID") or item.get("id") or "").strip()
+            if not message_id:
+                continue
+            detail = self._request(f"{self.message_url}/{quote(message_id, safe='')}")
+            to_addresses = self._addresses(detail.get("To") or detail.get("to")) or summary["to"]
+            normalized = {
+                "provider": self.name,
+                "mailbox": address,
+                "message_id": message_id,
+                "subject": str(detail.get("Subject") or detail.get("subject") or item.get("Subject") or ""),
+                "sender": ", ".join(
+                    self._addresses(detail.get("From") or detail.get("from") or item.get("From"))
+                ),
+                "text_content": str(detail.get("Text") or detail.get("text") or ""),
+                "html_content": str(detail.get("HTML") or detail.get("html") or ""),
+                "received_at": _parse_received_at(
+                    detail.get("Date") or detail.get("date") or item.get("Created") or item.get("created")
+                ),
+                "to": to_addresses,
+                "raw": detail,
+            }
+            if _message_matches_email(normalized, address):
+                return normalized
+        return None
+
+    def close(self) -> None:
+        self.session.close()
+
+
 class YydsMailProvider(BaseMailProvider):
     name = "yyds_mail"
 
@@ -1438,6 +1562,8 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
         return MoEmailProvider(entry, conf)
     if entry["type"] == "inbucket":
         return InbucketMailProvider(entry, conf)
+    if entry["type"] == "mailpit":
+        return MailpitProvider(entry, conf)
     if entry["type"] == "yyds_mail":
         return YydsMailProvider(entry, conf)
     if entry["type"] == "outlook_token":
