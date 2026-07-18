@@ -25,6 +25,13 @@ def _json_loads(value: object) -> object:
         return {}
 
 
+def is_multi_worker_runtime() -> bool:
+    try:
+        return int(str(os.getenv("UVICORN_WORKERS") or "1").strip()) > 1
+    except (TypeError, ValueError):
+        return False
+
+
 class RuntimeState:
     _ACQUIRE_IMAGE_SLOT_SCRIPT = """
 local rr_key = KEYS[1]
@@ -440,7 +447,13 @@ return current
         with self._lock:
             self._memory_progress.pop(key, None)
 
-    def acquire_lock(self, key: str, ttl_seconds: int = 300) -> str:
+    def acquire_lock(
+        self,
+        key: str,
+        ttl_seconds: int = 300,
+        *,
+        allow_memory_fallback: bool = True,
+    ) -> str:
         lock_key = _clean(key)
         if not lock_key:
             return ""
@@ -450,7 +463,10 @@ return current
             try:
                 return owner if self._redis.set(lock_key, owner, nx=True, ex=ttl) else ""
             except Exception:
-                pass
+                if not allow_memory_fallback:
+                    return ""
+        elif not allow_memory_fallback:
+            return ""
         with self._lock:
             self._cleanup_memory_locked()
             if lock_key in self._memory_locks:

@@ -13,7 +13,7 @@ from services.account_service import account_service
 from services.config import DATA_DIR
 from services.memory import trim_memory
 from services.register import mail_provider, openai_register
-from services.runtime_state import runtime_state
+from services.runtime_state import is_multi_worker_runtime, runtime_state
 from utils.log import logger
 
 
@@ -23,7 +23,8 @@ REGISTER_RUN_LOCK_TTL_SECONDS = 120
 REGISTER_STOP_KEY = "register:stop_requested"
 REGISTER_STOP_TTL_SECONDS = 86400
 REGISTER_LOG_LIMIT = 120
-REGISTER_SAVE_INTERVAL_SECONDS = 2.0
+REGISTER_SAVE_INTERVAL_SECONDS = 5.0
+REGISTER_LOCK_REFRESH_INTERVAL_SECONDS = 30.0
 REGISTER_SUPERVISOR_INTERVAL_SECONDS = 10.0
 REGISTER_SUPERVISOR_WAIT_LOG_INTERVAL_SECONDS = 30.0
 REGISTER_RUNTIME_KEYS = {"enabled", "stats", "logs"}
@@ -100,6 +101,7 @@ class RegisterService:
         self._runner: threading.Thread | None = None
         self._lock_owner = ""
         self._lock_lost = False
+        self._last_lock_extend_at = 0.0
         self._last_save_at = 0.0
         self._last_metrics_log: dict[str, tuple[int, int, float]] = {}
         self._last_supervisor_wait_log_at = 0.0
@@ -313,7 +315,11 @@ class RegisterService:
                 return {"state": "stopped", "pid": os.getpid()}
             if not bool(self._config.get("enabled")):
                 return {"state": "disabled", "pid": os.getpid()}
-            lock_owner = runtime_state.acquire_lock(REGISTER_RUN_LOCK, ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS)
+            lock_owner = runtime_state.acquire_lock(
+                REGISTER_RUN_LOCK,
+                ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS,
+                allow_memory_fallback=not is_multi_worker_runtime(),
+            )
             if not lock_owner:
                 self._log_recovery_wait_locked()
                 return {"state": "waiting_lock", "pid": os.getpid()}
@@ -462,7 +468,11 @@ class RegisterService:
             loaded = self._load()
             if loaded:
                 self._config = loaded
-            lock_owner = runtime_state.acquire_lock(REGISTER_RUN_LOCK, ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS)
+            lock_owner = runtime_state.acquire_lock(
+                REGISTER_RUN_LOCK,
+                ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS,
+                allow_memory_fallback=not is_multi_worker_runtime(),
+            )
             if not lock_owner:
                 self._refresh_persisted_runtime_locked()
                 self._clear_stop_requested()
@@ -563,7 +573,9 @@ class RegisterService:
     def _bump(self, **updates) -> None:
         with self._lock:
             lock_lost_now = False
-            if self._lock_owner and not self._lock_lost:
+            now = time.monotonic()
+            should_extend = now - self._last_lock_extend_at >= REGISTER_LOCK_REFRESH_INTERVAL_SECONDS
+            if self._lock_owner and not self._lock_lost and should_extend:
                 extended = runtime_state.extend_lock(
                     REGISTER_RUN_LOCK,
                     self._lock_owner,
@@ -573,6 +585,8 @@ class RegisterService:
                     self._lock_lost = True
                     self._config["enabled"] = False
                     lock_lost_now = True
+                else:
+                    self._last_lock_extend_at = now
             self._config["stats"].update(updates)
             stats = self._config["stats"]
             started_at = str(stats.get("started_at") or "")

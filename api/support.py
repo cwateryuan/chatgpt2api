@@ -8,10 +8,13 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.runtime_state import is_multi_worker_runtime, runtime_state
 from utils.log import logger
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
+ACCOUNT_WATCHER_LOCK = "lock:account:watcher"
+ACCOUNT_WATCHER_LOCK_TTL_SECONDS = 120
 
 
 def extract_bearer_token(authorization: str | None) -> str:
@@ -92,35 +95,78 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
+def _run_limited_account_refresh_cycle(stop_event: Event, *, hold_lock_seconds: float = 0.0) -> bool:
+    lock_owner = runtime_state.acquire_lock(
+        ACCOUNT_WATCHER_LOCK,
+        ttl_seconds=ACCOUNT_WATCHER_LOCK_TTL_SECONDS,
+        allow_memory_fallback=not is_multi_worker_runtime(),
+    )
+    if not lock_owner:
+        return False
+
+    lease_stop = Event()
+    lease_lost = Event()
+
+    def renew_lease() -> None:
+        interval = ACCOUNT_WATCHER_LOCK_TTL_SECONDS / 3
+        while not lease_stop.wait(interval):
+            if runtime_state.extend_lock(
+                ACCOUNT_WATCHER_LOCK,
+                lock_owner,
+                ttl_seconds=ACCOUNT_WATCHER_LOCK_TTL_SECONDS,
+            ):
+                continue
+            lease_lost.set()
+            logger.warning({"event": "account_watcher_lock_lost"})
+            return
+
+    renew_thread = Thread(target=renew_lease, name="account-watcher-lock", daemon=True)
+    renew_thread.start()
+    try:
+        limited_tokens = account_service.list_limited_tokens()
+        normal_tokens = account_service.list_normal_tokens()
+        expiring_tokens = account_service.list_expiring_access_tokens()
+        keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
+        tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
+        expiring_token_set = set(expiring_tokens)
+        keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
+        if tokens:
+            logger.info({
+                "event": "account_watcher_checking",
+                "limited_accounts": len(limited_tokens),
+                "normal_accounts": len(normal_tokens),
+                "expiring_access_tokens": len(expiring_tokens),
+            })
+            account_service.refresh_accounts(tokens)
+        if keepalive_tokens and not lease_lost.is_set() and not stop_event.is_set():
+            logger.info({"event": "account_watcher_keepalive", "refresh_tokens": len(keepalive_tokens)})
+            result = account_service.keepalive_refresh_tokens(keepalive_tokens)
+            if result.get("errors"):
+                logger.warning({"event": "account_watcher_keepalive_errors", "errors": result["errors"]})
+        if hold_lock_seconds > 0 and not lease_lost.is_set():
+            stop_event.wait(hold_lock_seconds)
+        return True
+    finally:
+        lease_stop.set()
+        renew_thread.join(timeout=1)
+        runtime_state.release_lock(ACCOUNT_WATCHER_LOCK, lock_owner)
+
+
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
 
     def worker() -> None:
         while not stop_event.is_set():
             try:
-                limited_tokens = account_service.list_limited_tokens()
-                normal_tokens = account_service.list_normal_tokens()
-                expiring_tokens = account_service.list_expiring_access_tokens()
-                keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
-                expiring_token_set = set(expiring_tokens)
-                keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
-                if tokens:
-                    logger.info({
-                        "event": "account_watcher_checking",
-                        "limited_accounts": len(limited_tokens),
-                        "normal_accounts": len(normal_tokens),
-                        "expiring_access_tokens": len(expiring_tokens),
-                    })
-                    account_service.refresh_accounts(tokens)
-                if keepalive_tokens:
-                    logger.info({"event": "account_watcher_keepalive", "refresh_tokens": len(keepalive_tokens)})
-                    result = account_service.keepalive_refresh_tokens(keepalive_tokens)
-                    if result.get("errors"):
-                        logger.warning({"event": "account_watcher_keepalive_errors", "errors": result["errors"]})
+                ran = _run_limited_account_refresh_cycle(
+                    stop_event,
+                    hold_lock_seconds=interval_seconds,
+                )
             except Exception as exc:
                 logger.warning({"event": "account_watcher_failed", "error": str(exc)})
-            stop_event.wait(interval_seconds)
+                ran = False
+            if not ran:
+                stop_event.wait(min(10.0, interval_seconds))
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
     thread.start()

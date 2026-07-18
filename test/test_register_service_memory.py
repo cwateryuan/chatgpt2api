@@ -14,12 +14,16 @@ class FakeRuntimeState:
         self.lock_available = True
         self.extend_ok = True
         self.acquire_calls = 0
+        self.acquire_kwargs: list[dict] = []
+        self.extend_calls = 0
 
     def acquire_lock(self, *_args, **_kwargs):
         self.acquire_calls += 1
+        self.acquire_kwargs.append(dict(_kwargs))
         return "owner" if self.lock_available else ""
 
     def extend_lock(self, *_args, **_kwargs):
+        self.extend_calls += 1
         return self.extend_ok
 
     def release_lock(self, *_args, **_kwargs):
@@ -177,6 +181,20 @@ class RegisterServiceMemoryTests(unittest.TestCase):
         self.assertTrue(snapshot["enabled"])
         self.assertIsNone(service._runner)
 
+    def test_start_requires_distributed_lock_with_multiple_workers(self):
+        runtime_state = FakeRuntimeState()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict("os.environ", {"UVICORN_WORKERS": "6"}),
+            mock.patch("services.register_service._db_backend", return_value=None),
+            mock.patch("services.register_service.runtime_state", runtime_state),
+            mock.patch.object(RegisterService, "_run", lambda self: None),
+        ):
+            service = RegisterService(Path(tmp) / "register.json")
+            service.start()
+
+        self.assertFalse(runtime_state.acquire_kwargs[-1]["allow_memory_fallback"])
+
     def test_supervisor_does_not_restart_after_user_stop(self):
         runtime_state = FakeRuntimeState()
         with (
@@ -210,6 +228,25 @@ class RegisterServiceMemoryTests(unittest.TestCase):
 
         self.assertTrue(service._lock_lost)
         self.assertFalse(service._config["enabled"])
+
+    def test_bump_throttles_lock_extension(self):
+        runtime_state = FakeRuntimeState()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("services.register_service._db_backend", return_value=None),
+            mock.patch("services.register_service.runtime_state", runtime_state),
+            mock.patch("services.register_service.time.monotonic", return_value=100.0),
+        ):
+            service = RegisterService(Path(tmp) / "register.json")
+            service._lock_owner = "owner"
+            service._last_lock_extend_at = 90.0
+            service._bump(running=1)
+            service._bump(running=1)
+            self.assertEqual(runtime_state.extend_calls, 0)
+
+            service._last_lock_extend_at = 0.0
+            service._bump(running=1)
+            self.assertEqual(runtime_state.extend_calls, 1)
 
 
 if __name__ == "__main__":
