@@ -203,8 +203,9 @@ class RegistrationHardeningTests(unittest.TestCase):
                 page.set_content("""
                     <input name="new-password" type="password" autocomplete="new-password">
                     <button onclick="document.body.dataset.passwordSubmitted='yes'">Continue</button>
-                    <button onclick="showSignupOtp()">Sign up with a one-time code</button>
+                    <button id="signup-otp">Sign up with a one-time code</button>
                     <script>
+                    setTimeout(() => document.querySelector('#signup-otp').addEventListener('click', showSignupOtp), 1200);
                     function showSignupOtp() { document.body.dataset.otpClicks = String(Number(document.body.dataset.otpClicks || '0') + 1); setTimeout(renderSignupOtp, 2500); }
                     function renderSignupOtp() { document.body.innerHTML = '<input name="otpCode" autocomplete="one-time-code"><button onclick="showSignupProfile()">Continue</button>'; }
                     function showSignupProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="showSignupConsent()">Continue</button>'; }

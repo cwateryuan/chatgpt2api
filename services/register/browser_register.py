@@ -207,7 +207,9 @@ class BrowserRegistrar:
         self._clearance_bundle = bundle
         step(
             index,
-            f"浏览器 clearance 已加载 cookies={len(bundle.cookies)} user_agent={'yes' if bundle.user_agent else 'no'}",
+            f"浏览器 clearance 已加载 cookies={len(bundle.cookies)} "
+            f"cf_clearance={'yes' if bundle.cookies.get('cf_clearance') else 'no'} "
+            f"user_agent={'yes' if bundle.user_agent else 'no'}",
             "yellow",
         )
         return bundle
@@ -274,6 +276,14 @@ class BrowserRegistrar:
         except Exception:
             pass
         page.wait_for_timeout(750)
+        self._check_challenge(page)
+
+    def _wait_for_initial_hydration(self, page) -> None:
+        try:
+            page.wait_for_load_state("load", timeout=min(5_000, self._remaining_ms()))
+        except Exception:
+            pass
+        page.wait_for_timeout(2_500)
         self._check_challenge(page)
 
     def _control_summary(self, page) -> str:
@@ -589,6 +599,7 @@ class BrowserRegistrar:
         birthdate: str,
         index: int,
     ) -> str:
+        self._wait_for_initial_hydration(page)
         email_done = False
         password_done = False
         otp_done = False
@@ -830,37 +841,35 @@ class BrowserRegistrar:
                     args=["--disable-dev-shm-usage"],
                 )
                 try:
-                    version = str(browser.version or "").strip()
-                    if clearance_bundle is not None and clearance_bundle.user_agent:
+                    use_clearance_identity = bool(
+                        clearance_bundle is not None
+                        and clearance_bundle.cookies
+                        and clearance_bundle.user_agent
+                    )
+                    if use_clearance_identity:
                         self.fingerprint = _align_fingerprint_platform(
                             _fingerprint_with_user_agent(
                                 self.fingerprint,
                                 clearance_bundle.user_agent,
                             )
                         )
-                    elif version:
-                        full_version = version.split(" ")[-1]
-                        major = full_version.split(".", 1)[0]
-                        user_agent = (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            f"Chrome/{full_version} Safari/537.36"
-                        )
-                        self.fingerprint = _fingerprint_with_user_agent(self.fingerprint, user_agent)
-                        self.fingerprint["impersonate"] = "chrome"
-                    context = browser.new_context(
-                        user_agent=self.fingerprint["user_agent"],
-                        locale=self.fingerprint["accept_language"].split(",", 1)[0],
-                        viewport={"width": 1365, "height": 768},
-                        ignore_https_errors=True,
-                        extra_http_headers={
+                    context_options: dict[str, Any] = {
+                        "locale": self.fingerprint["accept_language"].split(",", 1)[0],
+                        "viewport": {"width": 1365, "height": 768},
+                        "ignore_https_errors": True,
+                        "extra_http_headers": {
                             "Accept-Language": self.fingerprint["accept_language"],
                             "OAI-Device-Id": self.fingerprint["device_id"],
+                        },
+                    }
+                    if use_clearance_identity:
+                        context_options["user_agent"] = self.fingerprint["user_agent"]
+                        context_options["extra_http_headers"].update({
                             "Sec-Ch-Ua": self.fingerprint["sec_ch_ua"],
                             "Sec-Ch-Ua-Mobile": self.fingerprint["sec_ch_ua_mobile"],
                             "Sec-Ch-Ua-Platform": self.fingerprint["sec_ch_ua_platform"],
-                        },
-                    )
+                        })
+                    context = browser.new_context(**context_options)
                     context.set_default_timeout(BROWSER_NAVIGATION_TIMEOUT_MS)
                     context.add_cookies(_browser_auth_cookies(clearance_bundle, self.fingerprint["device_id"]))
                     context.on("request", lambda request: self._capture_callback(request.url))
@@ -868,6 +877,13 @@ class BrowserRegistrar:
                     page.on("response", self._record_auth_response)
                     page.on("framenavigated", lambda frame: self._capture_callback(frame.url))
                     page.goto(self._authorize_url(email), wait_until="domcontentloaded", timeout=self._remaining_ms())
+                    if not use_clearance_identity:
+                        actual_user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip()
+                        if actual_user_agent:
+                            self.fingerprint = _align_fingerprint_platform(
+                                _fingerprint_with_user_agent(self.fingerprint, actual_user_agent)
+                            )
+                            self.fingerprint["impersonate"] = "chrome"
                     password = self._run_authorization_flow(
                         page,
                         mailbox,
