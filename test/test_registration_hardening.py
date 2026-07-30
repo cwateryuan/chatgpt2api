@@ -251,6 +251,40 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertEqual(password, "Password123!")
         self.assertEqual(registrar.callback_code, "callback-code")
 
+    def test_browser_authorization_restarts_transition_with_same_email(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 30
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        stalled = browser_register.BrowserRegistrationError(
+            "browser_one_time_code_transition_timeout:path=/create-account/password"
+        )
+
+        with (
+            mock.patch.object(registrar, "_run_authorization_flow", side_effect=[stalled, ""]) as run_flow,
+            mock.patch.object(registrar, "_authorize_url", return_value="https://auth.openai.com/restart") as authorize,
+            mock.patch.object(browser_register, "step") as log_step,
+        ):
+            password = registrar._run_authorization_with_restarts(
+                page,
+                {"provider": "outlook_token"},
+                "same@example.com",
+                "UnusedPassword123!",
+                "Jane Doe",
+                "2000-01-02",
+                1,
+            )
+
+        self.assertEqual(password, "")
+        self.assertEqual(run_flow.call_count, 2)
+        authorize.assert_called_once_with("same@example.com")
+        page.goto.assert_called_once_with(
+            "https://auth.openai.com/restart",
+            wait_until="domcontentloaded",
+            timeout=mock.ANY,
+        )
+        self.assertIn("重新提交同一邮箱", " ".join(str(call) for call in log_step.call_args_list))
+
     def test_browser_start_fails_when_runtime_is_unavailable(self):
         with (
             tempfile.TemporaryDirectory() as tmp,

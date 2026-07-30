@@ -34,6 +34,17 @@ BROWSER_NAVIGATION_TIMEOUT_MS = 45_000
 BROWSER_TASK_TIMEOUT_SECONDS = 300
 BROWSER_ERROR_RETRY_LIMIT = 2
 BROWSER_ONE_TIME_CODE_RETRY_LIMIT = 3
+BROWSER_AUTH_RESTART_LIMIT = 3
+BROWSER_EMAIL_SELECTORS = (
+    'input[type="email"]',
+    'input[name="email"]',
+    'input[name="username"]',
+    'input[name="identifier"]',
+    'input[autocomplete="username"]',
+    'input[data-testid="email-input"]',
+    'input[placeholder*="Email" i]',
+    '#email',
+)
 BROWSER_ONE_TIME_CODE_SELECTORS = (
     'button:has-text("one-time code")',
     'a:has-text("one-time code")',
@@ -375,6 +386,31 @@ class BrowserRegistrar:
         locator.click(timeout=self._remaining_ms())
         self._wait_for_transition(page)
 
+    def _submit_email(self, page, email: str, index: int) -> None:
+        original_url = str(page.url or "")
+        email_input = self._editable(page, BROWSER_EMAIL_SELECTORS)
+        if email_input is None:
+            raise BrowserRegistrationError("browser_unexpected_state:email")
+        email_input.fill(email, timeout=self._remaining_ms())
+        self._continue(page, "email")
+        for _ in range(8):
+            self._capture_callback(page.url)
+            if self.callback_code:
+                return
+            self._check_challenge(page)
+            if str(page.url or "") != original_url:
+                return
+            if self._editable(page, BROWSER_EMAIL_SELECTORS) is None:
+                return
+            page.wait_for_timeout(500)
+        path = self._page_path(page)
+        step(
+            index,
+            f"浏览器邮箱提交未跳转 path={path} {self._control_summary(page)} {self._error_summary(page)}",
+            "yellow",
+        )
+        raise BrowserRegistrationError(f"browser_email_transition_timeout:path={path}")
+
     def _authorize_url(self, email: str) -> str:
         self.code_verifier, code_challenge = _generate_pkce()
         params = {
@@ -643,16 +679,7 @@ class BrowserRegistrar:
                 'input[autocomplete="new-password"]',
                 'input[autocomplete="current-password"]',
             ))
-            email_input = self._editable(page, (
-                'input[type="email"]',
-                'input[name="email"]',
-                'input[name="username"]',
-                'input[name="identifier"]',
-                'input[autocomplete="username"]',
-                'input[data-testid="email-input"]',
-                'input[placeholder*="Email" i]',
-                '#email',
-            ))
+            email_input = self._editable(page, BROWSER_EMAIL_SELECTORS)
             retry_control = self._visible(page, (
                 'button:has-text("Try again")',
                 'a:has-text("Try again")',
@@ -712,8 +739,7 @@ class BrowserRegistrar:
                     raise BrowserRegistrationError(f"browser_state_stalled:{state}:path={path}")
 
             if state == "email":
-                email_input.fill(email, timeout=self._remaining_ms())
-                self._continue(page, "email")
+                self._submit_email(page, email, index)
                 email_done = True
             elif state == "password":
                 is_login = (
@@ -781,6 +807,57 @@ class BrowserRegistrar:
             unknown_count = 0
 
         return password
+
+    @staticmethod
+    def _restartable_transition_error(error: BrowserRegistrationError) -> bool:
+        reason = str(error or "")
+        return reason.startswith((
+            "browser_email_transition_timeout:",
+            "browser_one_time_code_transition_timeout:",
+            "browser_state_stalled:email:",
+            "browser_state_stalled:one_time_code:",
+        ))
+
+    def _run_authorization_with_restarts(
+        self,
+        page,
+        mailbox: dict,
+        email: str,
+        password: str,
+        name: str,
+        birthdate: str,
+        index: int,
+    ) -> str:
+        total_attempts = BROWSER_AUTH_RESTART_LIMIT + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                return self._run_authorization_flow(
+                    page,
+                    mailbox,
+                    email,
+                    password,
+                    name,
+                    birthdate,
+                    index,
+                )
+            except BrowserRegistrationError as error:
+                if not self._restartable_transition_error(error) or attempt >= total_attempts:
+                    raise
+                next_attempt = attempt + 1
+                step(
+                    index,
+                    f"浏览器授权未跳转，刷新并重新提交同一邮箱 "
+                    f"attempt={next_attempt}/{total_attempts} reason={_sanitized_error(error)}",
+                    "yellow",
+                )
+                self.callback_code = ""
+                self._auth_responses.clear()
+                page.goto(
+                    self._authorize_url(email),
+                    wait_until="domcontentloaded",
+                    timeout=self._remaining_ms(),
+                )
+        raise BrowserRegistrationError("browser_authorization_retry_exhausted")
 
     def _exchange_token(self, context) -> dict[str, str]:
         if not self.callback_code:
@@ -884,7 +961,7 @@ class BrowserRegistrar:
                                 _fingerprint_with_user_agent(self.fingerprint, actual_user_agent)
                             )
                             self.fingerprint["impersonate"] = "chrome"
-                    password = self._run_authorization_flow(
+                    password = self._run_authorization_with_restarts(
                         page,
                         mailbox,
                         email,
