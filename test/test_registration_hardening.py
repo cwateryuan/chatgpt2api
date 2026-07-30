@@ -125,7 +125,7 @@ class RegistrationHardeningTests(unittest.TestCase):
         <input name="email" type="email"><button onclick="showPassword()">Continue</button>
         <script>
         function showPassword() { document.body.innerHTML = '<input name="newPassword" type="password" autocomplete="new-password"><button onclick="showOtp()">Continue</button>'; }
-        function showOtp() { document.body.innerHTML = '<input name="otpCode" autocomplete="one-time-code"><button onclick="showProfile()">Verify</button>'; }
+        function showOtp() { document.body.innerHTML = '<input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><button onclick="showProfile()">Verify</button>'; }
         function showProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="showConsent()">Continue</button>'; }
         function showConsent() { document.body.innerHTML = '<button onclick="finish()">Allow</button>'; }
         function finish() { location.hash = "done"; }
@@ -137,6 +137,8 @@ class RegistrationHardeningTests(unittest.TestCase):
             try:
                 page = browser.new_page()
                 page.set_content(html)
+                page.locator('input[name="email"]').fill("private@example.com")
+                self.assertNotIn("private@example.com", registrar._control_summary(page))
 
                 def capture_callback(url: str) -> None:
                     if str(url).endswith("#done"):

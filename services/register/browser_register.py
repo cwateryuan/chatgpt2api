@@ -188,6 +188,37 @@ class BrowserRegistrar:
         page.wait_for_timeout(750)
         self._check_challenge(page)
 
+    def _control_summary(self, page) -> str:
+        inputs: list[str] = []
+        buttons: list[str] = []
+        try:
+            fields = page.locator("input")
+            for field_index in range(min(fields.count(), 10)):
+                field = fields.nth(field_index)
+                if not field.is_visible():
+                    continue
+                attrs = []
+                for key in ("type", "name", "autocomplete", "inputmode", "maxlength", "data-testid"):
+                    value = str(field.get_attribute(key) or "").strip()
+                    if value:
+                        attrs.append(f"{key}={value[:40]}")
+                inputs.append("{" + ",".join(attrs) + "}")
+        except Exception:
+            pass
+        try:
+            controls = page.locator("button")
+            for button_index in range(min(controls.count(), 8)):
+                button = controls.nth(button_index)
+                if not button.is_visible():
+                    continue
+                label = " ".join(str(button.inner_text() or "").split())[:40]
+                label = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "***", label, flags=re.I)
+                button_type = str(button.get_attribute("type") or "").strip()
+                buttons.append("{" + ",".join(filter(None, (f"type={button_type}" if button_type else "", f"text={label}" if label else ""))) + "}")
+        except Exception:
+            pass
+        return f"inputs=[{','.join(inputs)}] buttons=[{','.join(buttons)}]"[:800]
+
     def _fill(self, page, selectors: tuple[str, ...], value: str, state: str) -> None:
         locator = self._visible(page, selectors)
         if locator is None:
@@ -306,7 +337,10 @@ class BrowserRegistrar:
         self._continue(page, "about_you")
 
     def _fill_otp(self, page, code: str) -> None:
-        fields = page.locator('input[inputmode="numeric"]')
+        fields = page.locator(
+            'input[inputmode="numeric"], input[maxlength="1"], '
+            'input[data-testid*="otp" i], input[aria-label*="digit" i]'
+        )
         visible_fields = []
         for field_index in range(fields.count()):
             field = fields.nth(field_index)
@@ -327,6 +361,9 @@ class BrowserRegistrar:
                 'input[name="otp"]',
                 'input[name="otpCode"]',
                 'input[data-testid="otp-input"]',
+                'input[data-testid*="otp" i]',
+                'input[aria-label*="digit" i]',
+                'input[maxlength="1"]',
                 'input[inputmode="numeric"]',
             ),
             code,
@@ -366,9 +403,11 @@ class BrowserRegistrar:
                 'input[name="otp"]',
                 'input[name="otpCode"]',
                 'input[data-testid="otp-input"]',
+                'input[data-testid*="otp" i]',
+                'input[aria-label*="digit" i]',
             )
-            if "verification" in url_lower or "otp" in url_lower:
-                otp_selectors += ('input[inputmode="numeric"]',)
+            if "/about-you" not in url_lower:
+                otp_selectors += ('input[inputmode="numeric"]', 'input[maxlength="1"]')
             otp_input = self._visible(page, otp_selectors)
             profile_input = self._visible(page, (
                 'input[name="birthdate"]',
@@ -461,6 +500,8 @@ class BrowserRegistrar:
                 self._wait_for_transition(page)
             else:
                 unknown_count += 1
+                if unknown_count == 1:
+                    step(index, f"浏览器控件诊断 path={path} {self._control_summary(page)}", "yellow")
                 if unknown_count >= 12:
                     raise BrowserRegistrationError(f"browser_unexpected_state:path={path}")
                 page.wait_for_timeout(750)
