@@ -395,6 +395,12 @@ class BrowserRegistrar:
     def _handle_existing_outlook(self, page, mailbox: dict, index: int) -> None:
         if str(mailbox.get("provider") or "") != "outlook_token":
             raise BrowserRegistrationError("browser_existing_account_login_unsupported")
+        otp_selectors = (
+            'input[autocomplete="one-time-code"]',
+            'input[name="code"]',
+            'input[name="otp"]',
+            'input[name="otpCode"]',
+        )
         alternative = self._visible(page, (
             'button:has-text("Try another way")',
             'a:has-text("Try another way")',
@@ -411,16 +417,19 @@ class BrowserRegistrar:
             'a:has-text("Continue with email")',
             'button:has-text("Email me a code")',
             'a:has-text("Email me a code")',
+            'button:has-text("Log in with a one-time code")',
+            'a:has-text("Log in with a one-time code")',
         ))
         if code_option is not None:
             code_option.click(timeout=self._remaining_ms())
+        otp_input = self._editable(page, otp_selectors)
+        for _ in range(12):
+            if otp_input is not None:
+                break
             page.wait_for_timeout(500)
-        if self._editable(page, (
-            'input[autocomplete="one-time-code"]',
-            'input[name="code"]',
-            'input[name="otp"]',
-            'input[name="otpCode"]',
-        )) is None:
+            self._check_challenge(page)
+            otp_input = self._editable(page, otp_selectors)
+        if otp_input is None:
             step(index, f"浏览器已有账号登录控件 {self._control_summary(page)}", "yellow")
             raise BrowserRegistrationError("browser_existing_account_login_unsupported")
         code = self._wait_for_otp(mailbox, index, login=True)
@@ -577,16 +586,20 @@ class BrowserRegistrar:
             elif email_input is not None and not email_done:
                 state = "email"
             else:
-                consent = self._visible(page, (
+                consent_selectors = (
                     'button[name="action"][value="accept"]',
-                    'button[data-testid="continue-button"]',
-                    'button:has-text("Continue")',
                     'button:has-text("Allow")',
                     'button:has-text("Agree")',
                     'button:has-text("Authorize")',
-                    'button:has-text("Next")',
                     'button:has-text("Confirm")',
-                ))
+                )
+                if profile_done or any(marker in url_lower for marker in ("/consent", "/authorize/resume", "/oauth/authorize")):
+                    consent_selectors += (
+                        'button[data-testid="continue-button"]',
+                        'button:has-text("Continue")',
+                        'button:has-text("Next")',
+                    )
+                consent = self._visible(page, consent_selectors)
                 if consent is not None:
                     state = "consent"
 
@@ -602,6 +615,11 @@ class BrowserRegistrar:
                     last_action_key = state_log_key
                     repeated_action_count = 1
                 if repeated_action_count >= 3:
+                    step(
+                        index,
+                        f"浏览器状态停滞 path={path} {self._control_summary(page)} {self._error_summary(page)}",
+                        "yellow",
+                    )
                     raise BrowserRegistrationError(f"browser_state_stalled:{state}:path={path}")
 
             if state == "email":
@@ -643,9 +661,9 @@ class BrowserRegistrar:
                 )
                 if retry_count > BROWSER_ERROR_RETRY_LIMIT:
                     raise BrowserRegistrationError(f"browser_retry_exhausted:path={path}")
-                if "password" in url_lower:
+                if "password" in url_lower or (password_done and not otp_done):
                     password_done = False
-                elif "email" in url_lower or "identifier" in url_lower:
+                elif "email" in url_lower or "identifier" in url_lower or not email_done:
                     email_done = False
                 elif "verification" in url_lower or "otp" in url_lower:
                     otp_done = False

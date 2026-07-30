@@ -161,7 +161,7 @@ class RegistrationHardeningTests(unittest.TestCase):
         <script>
         let passwordAttempts = 0;
         function showPassword() { document.body.innerHTML = '<input name="newPassword" type="password" autocomplete="new-password"><button onclick="submitPassword()">Continue</button>'; }
-        function submitPassword() { passwordAttempts += 1; if (passwordAttempts === 1) { document.body.innerHTML = '<main><h1>Something went wrong</h1><p>private@example.com could not continue</p><button onclick="showPassword()">Try again</button>'; } else { showOtp(); } }
+        function submitPassword() { passwordAttempts += 1; if (passwordAttempts === 1) { document.body.innerHTML = '<main><h1>Something went wrong</h1><p>private@example.com could not continue</p><button onclick="showPassword()">Try again</button>'; } else { setTimeout(showOtp, 1200); } }
         function showOtp() { document.body.innerHTML = '<input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><button onclick="showProfile()">Verify</button>'; }
         function showProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="showConsent()">Continue</button>'; }
         function showConsent() { document.body.innerHTML = '<button onclick="finish()">Allow</button>'; }
@@ -197,6 +197,18 @@ class RegistrationHardeningTests(unittest.TestCase):
                         "2000-01-02",
                         1,
                     )
+
+                page.set_content("""
+                    <input name="current-password" type="password" autocomplete="current-password webauthn">
+                    <button onclick="showLoginOtp()">Log in with a one-time code</button>
+                    <script>
+                    function showLoginOtp() { document.body.innerHTML = '<input name="otpCode" autocomplete="one-time-code"><button onclick="finishLogin()">Continue</button>'; }
+                    function finishLogin() { document.body.dataset.done = 'yes'; }
+                    </script>
+                """)
+                with mock.patch.object(browser_register.mail_provider, "wait_for_code", return_value="654321"):
+                    registrar._handle_existing_outlook(page, {"provider": "outlook_token"}, 1)
+                self.assertEqual(page.locator("body").get_attribute("data-done"), "yes")
             finally:
                 browser.close()
 
