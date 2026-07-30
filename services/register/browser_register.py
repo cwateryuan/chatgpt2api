@@ -161,13 +161,32 @@ class BrowserRegistrar:
 
     def _visible(self, page, selectors: tuple[str, ...]):
         for selector in selectors:
-            locator = page.locator(selector).first
             try:
-                if locator.is_visible(timeout=500):
+                matches = page.locator(selector)
+                if matches.count() < 1:
+                    continue
+                locator = matches.first
+                if locator.is_visible():
                     return locator
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    def _page_path(page) -> str:
+        try:
+            parsed = urlparse(str(page.url or ""))
+            return (parsed.path.rstrip("/") or "/")[:120]
+        except Exception:
+            return "unknown"
+
+    def _wait_for_transition(self, page) -> None:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=min(5_000, self._remaining_ms()))
+        except Exception:
+            pass
+        page.wait_for_timeout(750)
+        self._check_challenge(page)
 
     def _fill(self, page, selectors: tuple[str, ...], value: str, state: str) -> None:
         locator = self._visible(page, selectors)
@@ -187,8 +206,7 @@ class BrowserRegistrar:
         if locator is None:
             raise BrowserRegistrationError(f"browser_unexpected_state:{state}_continue")
         locator.click(timeout=self._remaining_ms())
-        page.wait_for_timeout(750)
-        self._check_challenge(page)
+        self._wait_for_transition(page)
 
     def _authorize_url(self, email: str) -> str:
         self.code_verifier, code_challenge = _generate_pkce()
@@ -214,7 +232,7 @@ class BrowserRegistrar:
 
     def _capture_callback(self, url: str) -> None:
         parsed = urlparse(str(url or ""))
-        if parsed.netloc != "platform.openai.com" or parsed.path != "/auth/callback":
+        if parsed.netloc.lower() != "platform.openai.com" or parsed.path.rstrip("/") != "/auth/callback":
             return
         self.callback_code = str((parse_qs(parsed.query).get("code") or [""])[0]).strip()
 
@@ -242,19 +260,39 @@ class BrowserRegistrar:
         if code_option is not None:
             code_option.click(timeout=self._remaining_ms())
             page.wait_for_timeout(500)
-        if self._visible(page, ('input[autocomplete="one-time-code"]', 'input[name="code"]')) is None:
+        if self._visible(page, (
+            'input[autocomplete="one-time-code"]',
+            'input[name="code"]',
+            'input[name="otp"]',
+            'input[name="otpCode"]',
+        )) is None:
             raise BrowserRegistrationError("browser_existing_account_login_unsupported")
         code = self._wait_for_otp(mailbox, index, login=True)
-        self._fill(page, ('input[autocomplete="one-time-code"]', 'input[name="code"]', 'input[inputmode="numeric"]'), code, "login_otp")
+        self._fill_otp(page, code)
         self._continue(page, "login_otp")
 
     def _complete_profile(self, page, name: str, birthdate: str) -> None:
-        name_input = self._visible(page, ('input[name="name"]', 'input[autocomplete="name"]'))
+        filled = False
+        name_input = self._visible(page, (
+            'input[name="name"]',
+            'input[autocomplete="name"]',
+            'input[data-testid="name-input"]',
+        ))
         if name_input is not None:
             name_input.fill(name, timeout=self._remaining_ms())
+            filled = True
+        else:
+            first_name, _, last_name = name.partition(" ")
+            first_input = self._visible(page, ('input[name="firstName"]', 'input[name="first_name"]'))
+            last_input = self._visible(page, ('input[name="lastName"]', 'input[name="last_name"]'))
+            if first_input is not None and last_input is not None:
+                first_input.fill(first_name, timeout=self._remaining_ms())
+                last_input.fill(last_name, timeout=self._remaining_ms())
+                filled = True
         birth_input = self._visible(page, ('input[name="birthdate"]', 'input[type="date"]'))
         if birth_input is not None:
             birth_input.fill(birthdate, timeout=self._remaining_ms())
+            filled = True
         else:
             year, month, day = birthdate.split("-")
             fields = page.locator('input[inputmode="numeric"]')
@@ -262,7 +300,174 @@ class BrowserRegistrar:
                 fields.nth(0).fill(month)
                 fields.nth(1).fill(day)
                 fields.nth(2).fill(year)
+                filled = True
+        if not filled:
+            raise BrowserRegistrationError(f"browser_unexpected_state:about_you:path={self._page_path(page)}")
         self._continue(page, "about_you")
+
+    def _fill_otp(self, page, code: str) -> None:
+        fields = page.locator('input[inputmode="numeric"]')
+        visible_fields = []
+        for field_index in range(fields.count()):
+            field = fields.nth(field_index)
+            try:
+                if field.is_visible(timeout=100):
+                    visible_fields.append(field)
+            except Exception:
+                continue
+        if len(visible_fields) >= len(code) and len(code) > 1:
+            for field, digit in zip(visible_fields, code):
+                field.fill(digit, timeout=self._remaining_ms())
+            return
+        self._fill(
+            page,
+            (
+                'input[autocomplete="one-time-code"]',
+                'input[name="code"]',
+                'input[name="otp"]',
+                'input[name="otpCode"]',
+                'input[data-testid="otp-input"]',
+                'input[inputmode="numeric"]',
+            ),
+            code,
+            "otp",
+        )
+
+    def _run_authorization_flow(
+        self,
+        page,
+        mailbox: dict,
+        email: str,
+        password: str,
+        name: str,
+        birthdate: str,
+        index: int,
+    ) -> str:
+        email_done = False
+        password_done = False
+        otp_done = False
+        profile_done = False
+        unknown_count = 0
+        last_logged_state = ""
+        last_action_key = ""
+        repeated_action_count = 0
+
+        while not self.callback_code:
+            self._capture_callback(page.url)
+            if self.callback_code:
+                break
+            self._check_challenge(page)
+            path = self._page_path(page)
+            url_lower = str(page.url or "").lower()
+
+            otp_selectors = (
+                'input[autocomplete="one-time-code"]',
+                'input[name="code"]',
+                'input[name="otp"]',
+                'input[name="otpCode"]',
+                'input[data-testid="otp-input"]',
+            )
+            if "verification" in url_lower or "otp" in url_lower:
+                otp_selectors += ('input[inputmode="numeric"]',)
+            otp_input = self._visible(page, otp_selectors)
+            profile_input = self._visible(page, (
+                'input[name="birthdate"]',
+                'input[type="date"]',
+                'input[name="name"]',
+                'input[data-testid="name-input"]',
+            ))
+            password_input = self._visible(page, (
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[name="newPassword"]',
+                'input[autocomplete="new-password"]',
+                'input[autocomplete="current-password"]',
+            ))
+            email_input = self._visible(page, (
+                'input[type="email"]',
+                'input[name="email"]',
+                'input[name="username"]',
+                'input[name="identifier"]',
+                'input[autocomplete="username"]',
+                'input[data-testid="email-input"]',
+                'input[placeholder*="Email" i]',
+                '#email',
+            ))
+
+            state = "unknown"
+            if otp_input is not None and not otp_done:
+                state = "otp"
+            elif ("/about-you" in url_lower or profile_input is not None) and not profile_done:
+                state = "about_you"
+            elif password_input is not None and not password_done:
+                state = "password"
+            elif email_input is not None and not email_done:
+                state = "email"
+            else:
+                consent = self._visible(page, (
+                    'button[name="action"][value="accept"]',
+                    'button[data-testid="continue-button"]',
+                    'button:has-text("Continue")',
+                    'button:has-text("Allow")',
+                    'button:has-text("Agree")',
+                    'button:has-text("Authorize")',
+                    'button:has-text("Next")',
+                    'button:has-text("Confirm")',
+                ))
+                if consent is not None:
+                    state = "consent"
+
+            state_log_key = f"{state}:{path}"
+            if state_log_key != last_logged_state:
+                step(index, f"浏览器状态[{state}] path={path}")
+                last_logged_state = state_log_key
+
+            if state != "unknown":
+                if state_log_key == last_action_key:
+                    repeated_action_count += 1
+                else:
+                    last_action_key = state_log_key
+                    repeated_action_count = 1
+                if repeated_action_count >= 3:
+                    raise BrowserRegistrationError(f"browser_state_stalled:{state}:path={path}")
+
+            if state == "email":
+                email_input.fill(email, timeout=self._remaining_ms())
+                self._continue(page, "email")
+                email_done = True
+            elif state == "password":
+                is_login = (
+                    "log-in" in url_lower
+                    or "login" in url_lower
+                    or str(password_input.get_attribute("autocomplete") or "") == "current-password"
+                )
+                if is_login:
+                    self._handle_existing_outlook(page, mailbox, index)
+                    password = ""
+                else:
+                    password_input.fill(password, timeout=self._remaining_ms())
+                    self._continue(page, "password")
+                password_done = True
+            elif state == "otp":
+                code = self._wait_for_otp(mailbox, index, login=not bool(password))
+                self._fill_otp(page, code)
+                self._continue(page, "otp")
+                otp_done = True
+            elif state == "about_you":
+                self._complete_profile(page, name, birthdate)
+                profile_done = True
+            elif state == "consent":
+                consent.click(timeout=self._remaining_ms())
+                self._wait_for_transition(page)
+            else:
+                unknown_count += 1
+                if unknown_count >= 12:
+                    raise BrowserRegistrationError(f"browser_unexpected_state:path={path}")
+                page.wait_for_timeout(750)
+                continue
+            unknown_count = 0
+
+        return password
 
     def _exchange_token(self, context) -> dict[str, str]:
         if not self.callback_code:
@@ -344,50 +549,15 @@ class BrowserRegistrar:
                     page = context.new_page()
                     page.on("framenavigated", lambda frame: self._capture_callback(frame.url))
                     page.goto(self._authorize_url(email), wait_until="domcontentloaded", timeout=self._remaining_ms())
-                    self._check_challenge(page)
-
-                    email_input = self._visible(page, ('input[type="email"]', 'input[name="username"]'))
-                    if email_input is not None:
-                        email_input.fill(email, timeout=self._remaining_ms())
-                        self._continue(page, "email")
-
-                    password_input = self._visible(page, ('input[type="password"]', 'input[name="password"]'))
-                    if password_input is not None:
-                        url = page.url.lower()
-                        if "log-in" in url or "login" in url:
-                            self._handle_existing_outlook(page, mailbox, index)
-                            password = ""
-                        else:
-                            password_input.fill(password, timeout=self._remaining_ms())
-                            self._continue(page, "password")
-
-                    otp_selectors = ('input[autocomplete="one-time-code"]', 'input[name="code"]')
-                    if "verification" in page.url.lower() or "otp" in page.url.lower():
-                        otp_selectors += ('input[inputmode="numeric"]',)
-                    otp_input = self._visible(page, otp_selectors)
-                    if otp_input is not None:
-                        code = self._wait_for_otp(mailbox, index)
-                        otp_input.fill(code, timeout=self._remaining_ms())
-                        self._continue(page, "otp")
-
-                    if "/about-you" in page.url or self._visible(page, ('input[name="birthdate"]', 'input[name="name"]')) is not None:
-                        self._complete_profile(page, name, birthdate)
-
-                    for _ in range(4):
-                        self._capture_callback(page.url)
-                        if self.callback_code:
-                            break
-                        consent = self._visible(page, (
-                            'button:has-text("Continue")',
-                            'button:has-text("Allow")',
-                            'button:has-text("Agree")',
-                        ))
-                        if consent is None:
-                            page.wait_for_timeout(750)
-                        else:
-                            consent.click(timeout=self._remaining_ms())
-                            page.wait_for_timeout(750)
-                        self._check_challenge(page)
+                    password = self._run_authorization_flow(
+                        page,
+                        mailbox,
+                        email,
+                        password,
+                        name,
+                        birthdate,
+                        index,
+                    )
                     tokens = self._exchange_token(context)
                 finally:
                     browser.close()

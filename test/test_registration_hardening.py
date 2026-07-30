@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,6 +112,52 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertTrue(status["browser_available"])
         self.assertEqual(len(probe_threads), 1)
         self.assertNotEqual(probe_threads[0], event_loop_thread)
+
+    def test_browser_authorization_state_machine_reaches_callback(self):
+        status = browser_register.browser_runtime_status()
+        if not status["browser_available"]:
+            self.skipTest(status["browser_error"])
+        from playwright.sync_api import sync_playwright
+
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 30
+        html = """
+        <input name="email" type="email"><button onclick="showPassword()">Continue</button>
+        <script>
+        function showPassword() { document.body.innerHTML = '<input name="newPassword" type="password" autocomplete="new-password"><button onclick="showOtp()">Continue</button>'; }
+        function showOtp() { document.body.innerHTML = '<input name="otpCode" autocomplete="one-time-code"><button onclick="showProfile()">Verify</button>'; }
+        function showProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="showConsent()">Continue</button>'; }
+        function showConsent() { document.body.innerHTML = '<button onclick="finish()">Allow</button>'; }
+        function finish() { location.hash = "done"; }
+        </script>
+        """
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(html)
+
+                def capture_callback(url: str) -> None:
+                    if str(url).endswith("#done"):
+                        registrar.callback_code = "callback-code"
+
+                registrar._capture_callback = capture_callback
+                with mock.patch.object(browser_register.mail_provider, "wait_for_code", return_value="123456"):
+                    password = registrar._run_authorization_flow(
+                        page,
+                        {"provider": "test"},
+                        "user@example.com",
+                        "Password123!",
+                        "Jane Doe",
+                        "2000-01-02",
+                        1,
+                    )
+            finally:
+                browser.close()
+
+        self.assertEqual(password, "Password123!")
+        self.assertEqual(registrar.callback_code, "callback-code")
 
     def test_browser_start_fails_when_runtime_is_unavailable(self):
         with (
