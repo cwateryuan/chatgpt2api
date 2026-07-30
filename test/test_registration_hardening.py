@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -11,7 +13,7 @@ from fastapi.testclient import TestClient
 from api import register as register_api
 from services.account_service import AccountService
 from services.openai_backend_api import OpenAIBackendAPI
-from services.register import openai_register
+from services.register import browser_register, openai_register
 from services.register_service import RegisterService, _normalize
 from services.storage.json_storage import JSONStorageBackend
 
@@ -91,6 +93,24 @@ class RegistrationHardeningTests(unittest.TestCase):
         config = _normalize({"engine": "browser", "threads": 9, "stats": {"threads": 9}})
         self.assertEqual(config["threads"], 9)
         self.assertEqual(config["stats"]["threads"], 1)
+
+    def test_browser_runtime_probe_runs_off_asyncio_thread(self):
+        event_loop_thread = threading.get_ident()
+        probe_threads: list[int] = []
+
+        def fake_probe():
+            probe_threads.append(threading.get_ident())
+            return {"browser_available": True, "browser_version": "test", "browser_error": ""}
+
+        async def check_status():
+            return browser_register.browser_runtime_status(refresh=True)
+
+        with mock.patch.object(browser_register, "_probe_browser_runtime", side_effect=fake_probe):
+            status = asyncio.run(check_status())
+
+        self.assertTrue(status["browser_available"])
+        self.assertEqual(len(probe_threads), 1)
+        self.assertNotEqual(probe_threads[0], event_loop_thread)
 
     def test_browser_start_fails_when_runtime_is_unavailable(self):
         with (

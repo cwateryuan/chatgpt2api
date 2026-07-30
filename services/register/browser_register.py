@@ -54,39 +54,59 @@ def _sanitized_error(error: BaseException) -> str:
     return text[:500]
 
 
+def _probe_browser_runtime() -> dict[str, Any]:
+    try:
+        from playwright.sync_api import sync_playwright
+
+        executable_override = str(os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or "").strip()
+        with sync_playwright() as playwright:
+            executable = executable_override or playwright.chromium.executable_path
+            if not executable or not Path(executable).is_file():
+                raise RuntimeError("Chromium executable is not installed")
+            browser = playwright.chromium.launch(
+                executable_path=executable_override or None,
+                headless=True,
+                args=["--disable-dev-shm-usage"],
+            )
+            try:
+                version = str(browser.version or importlib.metadata.version("playwright"))
+            finally:
+                browser.close()
+        return {
+            "browser_available": True,
+            "browser_version": version,
+            "browser_error": "",
+        }
+    except Exception as error:
+        return {
+            "browser_available": False,
+            "browser_version": "",
+            "browser_error": _sanitized_error(error),
+        }
+
+
 def browser_runtime_status(*, refresh: bool = False) -> dict[str, Any]:
     global _runtime_cache
     with _runtime_lock:
         if _runtime_cache is not None and not refresh:
             return dict(_runtime_cache)
-        try:
-            from playwright.sync_api import sync_playwright
 
-            executable_override = str(os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or "").strip()
-            with sync_playwright() as playwright:
-                executable = executable_override or playwright.chromium.executable_path
-                if not executable or not Path(executable).is_file():
-                    raise RuntimeError("Chromium executable is not installed")
-                browser = playwright.chromium.launch(
-                    executable_path=executable_override or None,
-                    headless=True,
-                    args=["--disable-dev-shm-usage"],
-                )
-                try:
-                    version = str(browser.version or importlib.metadata.version("playwright"))
-                finally:
-                    browser.close()
-            _runtime_cache = {
-                "browser_available": True,
-                "browser_version": version,
-                "browser_error": "",
-            }
-        except Exception as error:
-            _runtime_cache = {
+        result: dict[str, Any] = {}
+
+        def probe() -> None:
+            result.update(_probe_browser_runtime())
+
+        # Playwright's sync API refuses to run on FastAPI's asyncio thread.
+        probe_thread = threading.Thread(target=probe, name="browser-runtime-probe", daemon=True)
+        probe_thread.start()
+        probe_thread.join()
+        if not result:
+            result = {
                 "browser_available": False,
                 "browser_version": "",
-                "browser_error": _sanitized_error(error),
+                "browser_error": "Browser runtime probe did not return a result",
             }
+        _runtime_cache = result
         return dict(_runtime_cache)
 
 
