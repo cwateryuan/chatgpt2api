@@ -124,7 +124,9 @@ class RegistrationHardeningTests(unittest.TestCase):
         html = """
         <input name="email" type="email"><button onclick="showPassword()">Continue</button>
         <script>
-        function showPassword() { document.body.innerHTML = '<input name="newPassword" type="password" autocomplete="new-password"><button onclick="showOtp()">Continue</button>'; }
+        let passwordAttempts = 0;
+        function showPassword() { document.body.innerHTML = '<input name="newPassword" type="password" autocomplete="new-password"><button onclick="submitPassword()">Continue</button>'; }
+        function submitPassword() { passwordAttempts += 1; if (passwordAttempts === 1) { document.body.innerHTML = '<main><h1>Something went wrong</h1><p>private@example.com could not continue</p><button onclick="showPassword()">Try again</button>'; } else { showOtp(); } }
         function showOtp() { document.body.innerHTML = '<input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><input inputmode="numeric" maxlength="1"><button onclick="showProfile()">Verify</button>'; }
         function showProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="showConsent()">Continue</button>'; }
         function showConsent() { document.body.innerHTML = '<button onclick="finish()">Allow</button>'; }
@@ -139,6 +141,9 @@ class RegistrationHardeningTests(unittest.TestCase):
                 page.set_content(html)
                 page.locator('input[name="email"]').fill("private@example.com")
                 self.assertNotIn("private@example.com", registrar._control_summary(page))
+                page.set_content('<main><h1>Something went wrong</h1><p>private@example.com could not continue</p><button>Try again</button></main>')
+                self.assertNotIn("private@example.com", registrar._error_summary(page))
+                page.set_content(html)
 
                 def capture_callback(url: str) -> None:
                     if str(url).endswith("#done"):

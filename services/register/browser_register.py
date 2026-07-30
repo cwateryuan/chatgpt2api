@@ -32,6 +32,7 @@ from services.register.openai_register import (
 
 BROWSER_NAVIGATION_TIMEOUT_MS = 45_000
 BROWSER_TASK_TIMEOUT_SECONDS = 300
+BROWSER_ERROR_RETRY_LIMIT = 2
 BROWSER_CHALLENGE_MARKERS = (
     "verify you are human",
     "checking your browser",
@@ -135,6 +136,7 @@ class BrowserRegistrar:
         self.code_verifier = ""
         self.callback_code = ""
         self._deadline = 0.0
+        self._auth_responses: list[str] = []
 
     def _remaining_ms(self) -> int:
         remaining = self._deadline - time.monotonic()
@@ -218,6 +220,41 @@ class BrowserRegistrar:
         except Exception:
             pass
         return f"inputs=[{','.join(inputs)}] buttons=[{','.join(buttons)}]"[:800]
+
+    def _record_auth_response(self, response) -> None:
+        try:
+            parsed = urlparse(str(response.url or ""))
+            auth_host = urlparse(auth_base).hostname
+            resource_type = str(response.request.resource_type or "")
+            if parsed.hostname != auth_host or resource_type not in {"document", "fetch", "xhr"}:
+                return
+            path = (parsed.path.rstrip("/") or "/")[:120]
+            status = int(response.status)
+            if status < 400 and not path.startswith("/api/accounts/"):
+                return
+            entry = f"{status}:{path}"
+            if not self._auth_responses or self._auth_responses[-1] != entry:
+                self._auth_responses.append(entry)
+                self._auth_responses = self._auth_responses[-8:]
+        except Exception:
+            pass
+
+    def _error_summary(self, page) -> str:
+        messages: list[str] = []
+        try:
+            controls = page.locator('[role="alert"], main h1, main h2, main p')
+            for control_index in range(min(controls.count(), 8)):
+                control = controls.nth(control_index)
+                if not control.is_visible():
+                    continue
+                message = " ".join(str(control.inner_text() or "").split())[:120]
+                message = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "***", message, flags=re.I)
+                if message and message not in messages:
+                    messages.append(message)
+        except Exception:
+            pass
+        responses = ",".join(self._auth_responses[-5:])
+        return f"text=[{' | '.join(messages)}] responses=[{responses}]"[:800]
 
     def _fill(self, page, selectors: tuple[str, ...], value: str, state: str) -> None:
         locator = self._visible(page, selectors)
@@ -385,6 +422,7 @@ class BrowserRegistrar:
         otp_done = False
         profile_done = False
         unknown_count = 0
+        error_retry_counts: dict[str, int] = {}
         last_logged_state = ""
         last_action_key = ""
         repeated_action_count = 0
@@ -432,9 +470,17 @@ class BrowserRegistrar:
                 'input[placeholder*="Email" i]',
                 '#email',
             ))
+            retry_control = self._visible(page, (
+                'button:has-text("Try again")',
+                'a:has-text("Try again")',
+                'button:has-text("Retry")',
+                'a:has-text("Retry")',
+            ))
 
             state = "unknown"
-            if otp_input is not None and not otp_done:
+            if retry_control is not None:
+                state = "retry"
+            elif otp_input is not None and not otp_done:
                 state = "otp"
             elif ("/about-you" in url_lower or profile_input is not None) and not profile_done:
                 state = "about_you"
@@ -461,7 +507,7 @@ class BrowserRegistrar:
                 step(index, f"浏览器状态[{state}] path={path}")
                 last_logged_state = state_log_key
 
-            if state != "unknown":
+            if state not in {"unknown", "retry"}:
                 if state_log_key == last_action_key:
                     repeated_action_count += 1
                 else:
@@ -497,6 +543,29 @@ class BrowserRegistrar:
                 profile_done = True
             elif state == "consent":
                 consent.click(timeout=self._remaining_ms())
+                self._wait_for_transition(page)
+            elif state == "retry":
+                retry_count = error_retry_counts.get(path, 0) + 1
+                error_retry_counts[path] = retry_count
+                step(
+                    index,
+                    f"浏览器错误恢复 path={path} attempt={retry_count}/{BROWSER_ERROR_RETRY_LIMIT} "
+                    f"{self._error_summary(page)}",
+                    "yellow",
+                )
+                if retry_count > BROWSER_ERROR_RETRY_LIMIT:
+                    raise BrowserRegistrationError(f"browser_retry_exhausted:path={path}")
+                if "password" in url_lower:
+                    password_done = False
+                elif "email" in url_lower or "identifier" in url_lower:
+                    email_done = False
+                elif "verification" in url_lower or "otp" in url_lower:
+                    otp_done = False
+                elif "about-you" in url_lower:
+                    profile_done = False
+                last_action_key = ""
+                repeated_action_count = 0
+                retry_control.click(timeout=self._remaining_ms())
                 self._wait_for_transition(page)
             else:
                 unknown_count += 1
@@ -588,6 +657,7 @@ class BrowserRegistrar:
                     context.set_default_timeout(BROWSER_NAVIGATION_TIMEOUT_MS)
                     context.on("request", lambda request: self._capture_callback(request.url))
                     page = context.new_page()
+                    page.on("response", self._record_auth_response)
                     page.on("framenavigated", lambda frame: self._capture_callback(frame.url))
                     page.goto(self._authorize_url(email), wait_until="domcontentloaded", timeout=self._remaining_ms())
                     password = self._run_authorization_flow(
