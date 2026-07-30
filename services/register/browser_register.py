@@ -33,6 +33,19 @@ from services.register.openai_register import (
 BROWSER_NAVIGATION_TIMEOUT_MS = 45_000
 BROWSER_TASK_TIMEOUT_SECONDS = 300
 BROWSER_ERROR_RETRY_LIMIT = 2
+BROWSER_ONE_TIME_CODE_SELECTORS = (
+    'button:has-text("one-time code")',
+    'a:has-text("one-time code")',
+    '[role="button"]:has-text("one-time code")',
+    'button:has-text("one time code")',
+    'a:has-text("one time code")',
+    'button:has-text("verification code")',
+    'a:has-text("verification code")',
+    'button:has-text("一次性")',
+    'a:has-text("一次性")',
+    'button:has-text("验证码")',
+    'a:has-text("验证码")',
+)
 BROWSER_CHALLENGE_MARKERS = (
     "verify you are human",
     "checking your browser",
@@ -417,8 +430,7 @@ class BrowserRegistrar:
             'a:has-text("Continue with email")',
             'button:has-text("Email me a code")',
             'a:has-text("Email me a code")',
-            'button:has-text("Log in with a one-time code")',
-            'a:has-text("Log in with a one-time code")',
+            *BROWSER_ONE_TIME_CODE_SELECTORS,
         ))
         if code_option is not None:
             code_option.click(timeout=self._remaining_ms())
@@ -573,10 +585,13 @@ class BrowserRegistrar:
                 'button:has-text("Retry")',
                 'a:has-text("Retry")',
             ))
+            one_time_code_control = self._visible(page, BROWSER_ONE_TIME_CODE_SELECTORS)
 
             state = "unknown"
             if retry_control is not None:
                 state = "retry"
+            elif password_input is not None and one_time_code_control is not None:
+                state = "one_time_code"
             elif otp_input is not None and not otp_done:
                 state = "otp"
             elif ("/about-you" in url_lower or profile_input is not None) and not profile_done:
@@ -639,6 +654,17 @@ class BrowserRegistrar:
                     password_input.fill(password, timeout=self._remaining_ms())
                     self._continue(page, "password")
                 password_done = True
+            elif state == "one_time_code":
+                is_login = "log-in" in url_lower or "login" in url_lower
+                if is_login and str(mailbox.get("provider") or "") != "outlook_token":
+                    raise BrowserRegistrationError("browser_existing_account_login_unsupported")
+                step(index, "浏览器切换一次性验证码登录" if is_login else "浏览器切换一次性验证码注册")
+                mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+                one_time_code_control.click(timeout=self._remaining_ms())
+                password = ""
+                password_done = True
+                page.wait_for_timeout(1_500)
+                self._check_challenge(page)
             elif state == "otp":
                 code = self._wait_for_otp(mailbox, index, login=not bool(password))
                 self._fill_otp(page, code)

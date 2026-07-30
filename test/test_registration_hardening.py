@@ -198,6 +198,39 @@ class RegistrationHardeningTests(unittest.TestCase):
                         1,
                     )
 
+                otp_registrar = browser_register.BrowserRegistrar()
+                otp_registrar._deadline = time.monotonic() + 30
+                page.set_content("""
+                    <input name="new-password" type="password" autocomplete="new-password">
+                    <button onclick="document.body.dataset.passwordSubmitted='yes'">Continue</button>
+                    <button onclick="showSignupOtp()">Sign up with a one-time code</button>
+                    <script>
+                    function showSignupOtp() { document.body.innerHTML = '<input name="otpCode" autocomplete="one-time-code"><button onclick="showSignupProfile()">Continue</button>'; }
+                    function showSignupProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="showSignupConsent()">Continue</button>'; }
+                    function showSignupConsent() { document.body.innerHTML = '<button onclick="finishSignup()">Allow</button>'; }
+                    function finishSignup() { location.hash = 'otp-signup-done'; }
+                    </script>
+                """)
+
+                def capture_otp_signup(url: str) -> None:
+                    if str(url).endswith("#otp-signup-done"):
+                        otp_registrar.callback_code = "otp-signup-code"
+
+                otp_registrar._capture_callback = capture_otp_signup
+                with mock.patch.object(browser_register.mail_provider, "wait_for_code", return_value="246810"):
+                    otp_password = otp_registrar._run_authorization_flow(
+                        page,
+                        {"provider": "outlook_token"},
+                        "otp-user@example.com",
+                        "UnusedPassword123!",
+                        "Jane Doe",
+                        "2000-01-02",
+                        1,
+                    )
+                self.assertEqual(otp_password, "")
+                self.assertEqual(otp_registrar.callback_code, "otp-signup-code")
+                self.assertNotEqual(page.locator("body").get_attribute("data-password-submitted"), "yes")
+
                 page.set_content("""
                     <input name="current-password" type="password" autocomplete="current-password webauthn">
                     <button onclick="showLoginOtp()">Log in with a one-time code</button>
