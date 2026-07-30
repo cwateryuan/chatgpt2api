@@ -397,10 +397,43 @@ class RegistrationHardeningTests(unittest.TestCase):
     def test_browser_devtools_actions_use_native_input_events(self):
         email_script = browser_register._devtools_submit_email_js("same@example.com")
         code_script = browser_register._devtools_submit_code_js("246810")
+        profile_script = browser_register._devtools_submit_profile_js("Jane Doe", "2000-01-02")
         self.assertIn("InputEvent", email_script)
         self.assertIn("descriptor.set.call", email_script)
         self.assertIn("InputEvent", code_script)
         self.assertIn("code_submit_missing", code_script)
+        self.assertIn('element.name === "age"', profile_script)
+        self.assertIn("setValue(ageInput, age)", profile_script)
+        self.assertIn("finish creating account", profile_script)
+
+    def test_browser_devtools_launch_requires_and_applies_registration_proxy(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 30
+        process = mock.Mock()
+        proxy_profile = SimpleNamespace(proxy_url="http://privoxy:8118", proxy_source="runtime")
+
+        with (
+            mock.patch.object(browser_register.browser_devtools, "find_browser_executable", return_value="chromium"),
+            mock.patch.object(browser_register.browser_devtools, "free_local_port", return_value=12345),
+            mock.patch.object(browser_register.browser_devtools, "wait_for_devtools"),
+            mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=proxy_profile),
+            mock.patch.object(browser_register.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(browser_register, "step"),
+        ):
+            launched_process, port = registrar._launch_devtools_browser(Path("profile"), 1)
+
+        self.assertIs(launched_process, process)
+        self.assertEqual(port, 12345)
+        self.assertIn("--proxy-server=http://privoxy:8118", popen.call_args.args[0])
+
+        missing_profile = SimpleNamespace(proxy_url="", proxy_source="none")
+        with (
+            mock.patch.object(browser_register.browser_devtools, "find_browser_executable", return_value="chromium"),
+            mock.patch.object(browser_register.browser_devtools, "free_local_port", return_value=12345),
+            mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=missing_profile),
+        ):
+            with self.assertRaisesRegex(browser_register.BrowserRegistrationError, "browser_registration_proxy_missing"):
+                registrar._launch_devtools_browser(Path("profile"), 1)
 
     def test_browser_start_fails_when_runtime_is_unavailable(self):
         with (

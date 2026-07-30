@@ -213,10 +213,14 @@ def _devtools_submit_code_js(code: str) -> str:
 
 def _devtools_submit_profile_js(name: str, birthdate: str) -> str:
     year, month, day = birthdate.split("-")
+    today = datetime.now(timezone.utc).date()
+    born = datetime.strptime(birthdate, "%Y-%m-%d").date()
+    age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
     return f"""
 (async () => {{
   const profileName = {json.dumps(name)};
   const birthdate = {json.dumps(birthdate)};
+  const age = {json.dumps(str(age))};
   const year = {json.dumps(year)};
   const month = {json.dumps(month)};
   const day = {json.dumps(day)};
@@ -235,8 +239,12 @@ def _devtools_submit_profile_js(name: str, birthdate: str) -> str:
   const nameInput = inputs.find((element) => element.name === "name" || element.name === "fullName"
     || element.autocomplete === "name" || /full name|姓名/i.test(element.placeholder || element.getAttribute("aria-label") || ""));
   if (nameInput) setValue(nameInput, profileName);
+  const ageInput = inputs.find((element) => element.name === "age" || element.id === "age"
+    || /(^|\\s)age(\\s|$)|年龄/i.test(`${{element.name}} ${{element.id}} ${{element.placeholder}} ${{element.getAttribute("aria-label") || ""}}`));
   const birthInput = inputs.find((element) => element.type === "date" || /birth|birthday/i.test(element.name || element.id || ""));
-  if (birthInput) {{
+  if (ageInput) {{
+    setValue(ageInput, age);
+  }} else if (birthInput) {{
     setValue(birthInput, birthdate);
   }} else {{
     const numeric = inputs.filter((element) => (element.inputMode || "").toLowerCase() === "numeric" && element.maxLength !== 6);
@@ -252,7 +260,8 @@ def _devtools_submit_profile_js(name: str, birthdate: str) -> str:
   }}
   await sleep(300);
   const buttons = [...document.querySelectorAll("button,input[type=submit],[role=button]")].filter(visible);
-  const submit = buttons.find((element) => (element.innerText || element.value || "").trim().toLowerCase() === "continue")
+  const submit = buttons.find((element) => /finish creating account/i.test((element.innerText || element.value || "").trim()))
+    || buttons.find((element) => (element.innerText || element.value || "").trim().toLowerCase() === "continue")
     || buttons.find((element) => (element.innerText || element.value || "").trim() === "继续")
     || buttons.find((element) => /agree|accept|confirm|同意|确认/i.test((element.innerText || element.value || "").trim()))
     || buttons.find((element) => String(element.type || "").toLowerCase() === "submit");
@@ -773,7 +782,13 @@ class BrowserRegistrar:
         port = browser_devtools.free_local_port()
         profile = proxy_settings.get_profile(proxy=str(config.get("proxy") or ""), upstream=True)
         proxy_url = str(profile.proxy_url or "").strip()
-        step(index, f"浏览器网络 proxy={profile.proxy_source} engine=chrome-devtools clearance=disabled")
+        if not proxy_url:
+            raise BrowserRegistrationError("browser_registration_proxy_missing")
+        step(
+            index,
+            f"浏览器网络 proxy={profile.proxy_source} proxy_server=yes "
+            f"engine=chrome-devtools clearance=disabled",
+        )
         command = [
             executable,
             f"--remote-debugging-port={port}",
