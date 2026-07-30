@@ -60,8 +60,11 @@ docker compose -f docker-compose.warp.yml up -d --build
 git clone git@github.com:basketikun/chatgpt2api.git
 cd chatgpt2api
 uv sync
+uv run playwright install chromium
 uv run main.py
 ```
+
+注册页可手动选择 HTTP 或浏览器引擎。浏览器引擎使用无头 Chromium 且固定单任务执行；遇到需要人工处理的 Cloudflare/Turnstile 验证时会记录失败并结束，不会自动切回 HTTP。Docker 镜像已内置 Chromium；本地开发需执行上面的安装命令。Chromium 会增加镜像体积，并在注册期间占用更多内存。
 
 启动前端：
 

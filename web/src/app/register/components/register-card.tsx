@@ -18,6 +18,7 @@ export function RegisterCard() {
   const setProxy = useSettingsStore((state) => state.setRegisterProxy);
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
+  const setEngine = useSettingsStore((state) => state.setRegisterEngine);
   const setMode = useSettingsStore((state) => state.setRegisterMode);
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
@@ -48,6 +49,7 @@ export function RegisterCard() {
   const isEnabled = Boolean(config.enabled);
   const isStopping = !isEnabled && Number(stats.running || 0) > 0;
   const isRuntimeBusy = isEnabled || isStopping;
+  const browserUnavailable = config.engine === "browser" && !config.browser_available;
   const updateProviderType = (index: number, type: string) => {
     updateProvider(index, {
       type,
@@ -89,6 +91,20 @@ export function RegisterCard() {
             <span>如果注册日志出现 Cloudflare 拦截，可在设置页启用 FlareSolverr 清障；相关 Docker 容器需要先启动。</span>
           </div>
 
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">注册引擎</label>
+            <div className="grid h-10 grid-cols-2 border border-stone-200 bg-stone-50 p-1">
+              <button type="button" className={`text-sm transition ${config.engine === "http" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => setEngine("http")} disabled={isRuntimeBusy}>
+                HTTP
+              </button>
+              <button type="button" className={`text-sm transition disabled:cursor-not-allowed disabled:opacity-40 ${config.engine === "browser" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => setEngine("browser")} disabled={isRuntimeBusy || !config.browser_available} title={config.browser_available ? "Playwright Chromium" : config.browser_error || "浏览器运行环境不可用"}>
+                浏览器
+              </button>
+            </div>
+            {config.engine === "browser" && config.browser_available ? <p className="text-xs text-stone-500">Chromium {config.browser_version || "available"}，固定单任务运行。</p> : null}
+            {browserUnavailable ? <p className="text-xs text-rose-600">浏览器运行环境不可用：{config.browser_error || "Chromium 未安装"}</p> : null}
+          </div>
+
           <div className="grid gap-4 md:grid-cols-3">
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册模式</label>
@@ -108,8 +124,8 @@ export function RegisterCard() {
               <Input value={String(config.total)} onChange={(event) => setTotal(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy || config.mode !== "total"} />
             </div>
             <div className="space-y-2">
-              <label className="text-sm text-stone-700">线程数</label>
-              <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
+              <label className="text-sm text-stone-700">{config.engine === "browser" ? "并发数（固定）" : "线程数"}</label>
+              <Input value={config.engine === "browser" ? "1" : String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy || config.engine === "browser"} />
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册代理</label>
@@ -396,7 +412,7 @@ export function RegisterCard() {
               ))}
             </div>
             <div className="grid grid-cols-3 gap-2">
-              <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving || isStopping}>
+              <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving || isStopping || browserUnavailable}>
                 {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : isEnabled ? <Square className="size-4" /> : <Play className="size-4" />}
                 {isStopping ? "停止中" : isEnabled ? "停止" : "启动"}
               </Button>

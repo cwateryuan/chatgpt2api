@@ -132,6 +132,35 @@ class ProxyServiceTests(unittest.TestCase):
         self.assertEqual(headers_with_ua["Cookie"], "cf_clearance=caller-token; foo=bar; session=ok")
         self.assertNotIn("cf_clearance=manual-token", headers_with_ua["Cookie"])
 
+    def test_flaresolverr_clearance_cache_can_be_scoped_per_registration_device(self) -> None:
+        runtime = make_runtime(
+            enabled=True,
+            egress_mode="single_proxy",
+            proxy_url="http://runtime.example:8080",
+            clearance={"enabled": True, "mode": "flaresolverr"},
+        )
+        store = ProxySettingsStore(FakeConfig(runtime=runtime))
+        profile = store.get_profile(upstream=True)
+        bundle = ClearanceBundle(
+            target_host="auth.openai.com",
+            proxy_url=profile.proxy_url,
+            cookies={"cf_clearance": "device-one-token"},
+            user_agent="Device One UA",
+        )
+        store._set_cached_bundle(store._cache_key(profile.proxy_url, "auth.openai.com", "device-1"), bundle)
+
+        device_one = store.build_headers(
+            target_url="https://auth.openai.com/about-you",
+            clearance_scope="device-1",
+        )
+        device_two = store.build_headers(
+            target_url="https://auth.openai.com/about-you",
+            clearance_scope="device-2",
+        )
+
+        self.assertIn("device-one-token", str(device_one.get("Cookie")))
+        self.assertNotIn("Cookie", device_two)
+
     def test_flaresolverr_provider_parses_solution_and_filters_cookies_by_host(self) -> None:
         calls: list[tuple[str, dict[str, object], dict[str, str], float]] = []
 

@@ -12,7 +12,7 @@ from pathlib import Path
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.memory import trim_memory
-from services.register import mail_provider, openai_register
+from services.register import browser_register, mail_provider, openai_register
 from services.runtime_state import is_multi_worker_runtime, runtime_state
 from utils.log import logger
 
@@ -62,7 +62,7 @@ def _now() -> str:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {**openai_register.config, "engine": "http", "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
 def _normalize(raw: dict) -> dict:
@@ -70,6 +70,9 @@ def _normalize(raw: dict) -> dict:
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
     cfg["total"] = max(1, int(cfg.get("total") or 1))
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
+    cfg["engine"] = str(cfg.get("engine") or "http").strip().lower()
+    if cfg["engine"] not in {"http", "browser"}:
+        cfg["engine"] = "http"
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
@@ -79,7 +82,7 @@ def _normalize(raw: dict) -> dict:
         cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
-             "threads": cfg["threads"]}
+             "threads": 1 if cfg["engine"] == "browser" else cfg["threads"]}
     cfg["stats"] = stats
     logs = raw.get("logs") if isinstance(raw.get("logs"), list) else []
     cfg["logs"] = [
@@ -187,12 +190,14 @@ class RegisterService:
                 self._config[key] = loaded[key]
 
     def _snapshot(self, *, redact: bool = True, runtime_only: bool = False) -> dict:
+        browser_status = browser_register.browser_runtime_status()
         if runtime_only:
             stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
             logs = self._config.get("logs") if isinstance(self._config.get("logs"), list) else []
             return {
                 "enabled": bool(self._config.get("enabled")),
                 "mode": self._config.get("mode"),
+                "engine": self._config.get("engine"),
                 "total": self._config.get("total"),
                 "threads": self._config.get("threads"),
                 "target_quota": self._config.get("target_quota"),
@@ -200,8 +205,10 @@ class RegisterService:
                 "check_interval": self._config.get("check_interval"),
                 "stats": json.loads(json.dumps(stats, ensure_ascii=False)),
                 "logs": json.loads(json.dumps(logs[-REGISTER_LOG_LIMIT:], ensure_ascii=False)),
+                **browser_status,
             }
         snapshot = json.loads(json.dumps(self._config, ensure_ascii=False))
+        snapshot.update(browser_status)
         if redact:
             self._redact_outlook_pools(snapshot)
         return snapshot
@@ -210,6 +217,7 @@ class RegisterService:
         return {
             "enabled": bool(self._config.get("enabled")),
             "mode": str(self._config.get("mode") or "total"),
+            "engine": str(self._config.get("engine") or "http"),
             "total": int(self._config.get("total") or 1),
             "threads": int(self._config.get("threads") or 1),
             "target_quota": int(self._config.get("target_quota") or 1),
@@ -250,7 +258,7 @@ class RegisterService:
                 "fail": 0,
                 "done": 0,
                 "running": 0,
-                "threads": self._config["threads"],
+                "threads": 1 if self._config["engine"] == "browser" else self._config["threads"],
                 **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
@@ -260,12 +268,12 @@ class RegisterService:
             self._config["stats"] = {
                 **_default_config()["stats"],
                 **existing_stats,
-                "threads": self._config["threads"],
+                "threads": 1 if self._config["engine"] == "browser" else self._config["threads"],
                 "updated_at": _now(),
             }
             self._config["stats"].setdefault("job_id", uuid.uuid4().hex)
             self._config["stats"].setdefault("started_at", _now())
-        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine")})
         self._sync_register_stats_locked()
         if reset_runtime:
             self._save()
@@ -277,7 +285,7 @@ class RegisterService:
             "event": event,
             "pid": os.getpid(),
             "mode": self._config.get("mode"),
-            "threads": self._config.get("threads"),
+            "threads": 1 if self._config.get("engine") == "browser" else self._config.get("threads"),
         })
 
     def _log_recovery_wait_locked(self) -> None:
@@ -315,6 +323,11 @@ class RegisterService:
                 return {"state": "stopped", "pid": os.getpid()}
             if not bool(self._config.get("enabled")):
                 return {"state": "disabled", "pid": os.getpid()}
+            if self._config.get("engine") == "browser" and not browser_register.browser_runtime_status(refresh=True)["browser_available"]:
+                self._config["enabled"] = False
+                self._save_runtime(force=True)
+                self._append_log("浏览器运行环境不可用，注册任务恢复已停止", "red", force=True)
+                return {"state": "browser_unavailable", "pid": os.getpid()}
             lock_owner = runtime_state.acquire_lock(
                 REGISTER_RUN_LOCK,
                 ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS,
@@ -454,7 +467,7 @@ class RegisterService:
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine")})
             self._save()
             return self.get()
 
@@ -468,6 +481,8 @@ class RegisterService:
             loaded = self._load()
             if loaded:
                 self._config = loaded
+            if self._config.get("engine") == "browser" and not browser_register.browser_runtime_status(refresh=True)["browser_available"]:
+                raise RuntimeError("browser_runtime_unavailable")
             lock_owner = runtime_state.acquire_lock(
                 REGISTER_RUN_LOCK,
                 ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS,
@@ -484,7 +499,8 @@ class RegisterService:
             self._lock_owner = lock_owner
             self._clear_stop_requested()
             self._start_runner_locked(reset_runtime=True, recovered=False)
-            self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
+            effective_threads = 1 if self._config["engine"] == "browser" else self._config["threads"]
+            self._append_log(f"注册任务启动，引擎={self._config['engine']}，模式={self._config['mode']}，线程数={effective_threads}", "yellow")
             return self.get()
 
     def stop(self) -> dict:
@@ -508,7 +524,8 @@ class RegisterService:
             if loaded:
                 self._config = loaded
             self._config["logs"] = []
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
+            effective_threads = 1 if self._config["engine"] == "browser" else self._config["threads"]
+            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": effective_threads, "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
@@ -522,7 +539,7 @@ class RegisterService:
                 if loaded:
                     self._config = loaded
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine")})
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
@@ -633,7 +650,9 @@ class RegisterService:
 
     def _run(self) -> None:
         cfg = self._refresh_runtime_cfg_for_runner()
-        threads = int(cfg["threads"])
+        engine = str(cfg.get("engine") or "http")
+        threads = 1 if engine == "browser" else int(cfg["threads"])
+        worker = browser_register.worker if engine == "browser" else openai_register.worker
         with self._lock:
             stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
             done = max(0, int(stats.get("done") or 0))
@@ -649,7 +668,7 @@ class RegisterService:
                     lock_lost_exit = True
                 while bool(cfg.get("enabled")) and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
-                    futures.add(executor.submit(openai_register.worker, submitted))
+                    futures.add(executor.submit(worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
                 cfg = self._refresh_runtime_cfg_for_runner()
                 if self._lock_lost:

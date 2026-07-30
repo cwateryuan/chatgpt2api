@@ -31,7 +31,6 @@ class AccountWatcherTests(unittest.TestCase):
         fake_runtime.acquire_lock.return_value = "owner"
         fake_accounts = mock.Mock()
         fake_accounts.list_limited_tokens.return_value = ["limited"]
-        fake_accounts.list_normal_tokens.return_value = ["normal"]
         fake_accounts.list_expiring_access_tokens.return_value = ["expiring"]
         fake_accounts.list_refresh_token_keepalive_tokens.return_value = ["expiring", "keepalive"]
         fake_accounts.keepalive_refresh_tokens.return_value = {"errors": []}
@@ -49,8 +48,9 @@ class AccountWatcherTests(unittest.TestCase):
             ttl_seconds=support.ACCOUNT_WATCHER_LOCK_TTL_SECONDS,
             allow_memory_fallback=False,
         )
-        fake_accounts.refresh_accounts.assert_called_once_with(["limited", "normal", "expiring"])
-        fake_accounts.keepalive_refresh_tokens.assert_called_once_with(["keepalive"])
+        fake_accounts.list_normal_tokens.assert_not_called()
+        fake_accounts.refresh_accounts.assert_called_once_with(["limited"])
+        fake_accounts.keepalive_refresh_tokens.assert_called_once_with(["expiring", "keepalive"])
         fake_runtime.release_lock.assert_called_once_with(support.ACCOUNT_WATCHER_LOCK, "owner")
 
     def test_watcher_skips_refresh_without_the_lease(self) -> None:

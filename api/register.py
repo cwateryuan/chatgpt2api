@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -12,6 +12,7 @@ from services.register_service import register_service
 
 
 class RegisterConfigRequest(BaseModel):
+    engine: str | None = None
     mail: dict | None = None
     proxy: str | None = None
     total: int | None = None
@@ -42,7 +43,15 @@ def create_router() -> APIRouter:
     @router.post("/api/register/start")
     async def start_register(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"register": register_service.start()}
+        try:
+            return {"register": register_service.start()}
+        except RuntimeError as error:
+            if str(error) == "browser_runtime_unavailable":
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "browser_runtime_unavailable", "message": "Browser runtime is unavailable"},
+                ) from error
+            raise
 
     @router.post("/api/register/stop")
     async def stop_register(authorization: str | None = Header(default=None)):

@@ -21,6 +21,7 @@ from curl_cffi import CurlOpt, requests
 from PIL import Image
 
 from services.account_service import account_service
+from services.browser_fingerprint import account_fingerprint
 from services.config import config
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.proxy_service import proxy_settings
@@ -176,9 +177,9 @@ class OpenAIBackendAPI:
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
         self.fp = self._build_fp()
-        self.user_agent = self.fp["user-agent"]
-        self.device_id = self.fp["oai-device-id"]
-        self.session_id = self.fp["oai-session-id"]
+        self.user_agent = self.fp["user_agent"]
+        self.device_id = self.fp["device_id"]
+        self.session_id = self.fp["session_id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
@@ -192,19 +193,13 @@ class OpenAIBackendAPI:
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
             "Referer": self.base_url + "/",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+            "Accept-Language": self.fp["accept_language"],
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Priority": "u=1, i",
-            "Sec-Ch-Ua": self.fp["sec-ch-ua"],
-            "Sec-Ch-Ua-Arch": '"x86"',
-            "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
-            "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
-            "Sec-Ch-Ua-Model": '""',
-            "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
-            "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
+            "Sec-Ch-Ua": self.fp["sec_ch_ua"],
+            "Sec-Ch-Ua-Mobile": self.fp["sec_ch_ua_mobile"],
+            "Sec-Ch-Ua-Platform": self.fp["sec_ch_ua_platform"],
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
@@ -230,33 +225,9 @@ class OpenAIBackendAPI:
         self.close()
 
     def _build_fp(self) -> Dict[str, str]:
-        account = self.account
-        raw_fp = account.get("fp")
-        fp = {str(k).lower(): str(v) for k, v in raw_fp.items()} if isinstance(raw_fp, dict) else {}
-        for key in (
-                "user-agent",
-                "impersonate",
-                "oai-device-id",
-                "oai-session-id",
-                "sec-ch-ua",
-                "sec-ch-ua-mobile",
-                "sec-ch-ua-platform",
-        ):
-            value = str(account.get(key) or "").strip()
-            if value:
-                fp[key] = value
-        fp.setdefault(
-            "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-        )
-        fp.setdefault("impersonate", "chrome110")
-        fp.setdefault("oai-device-id", new_uuid())
-        fp.setdefault("oai-session-id", new_uuid())
-        fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
-        fp.setdefault("sec-ch-ua-mobile", "?0")
-        fp.setdefault("sec-ch-ua-platform", '"Windows"')
-        return fp
+        if self.access_token:
+            return account_service.get_or_create_fingerprint(self.access_token)
+        return account_fingerprint(self.account)
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
@@ -378,12 +349,29 @@ class OpenAIBackendAPI:
         })
         return result
 
+    def get_image_quota_info(self, deadline: ImageRequestDeadline | None = None) -> Dict[str, Any]:
+        """Bootstrap only image quota without the three-request account profile fan-out."""
+        if not self.access_token:
+            raise RuntimeError("access_token is required")
+        init_payload = self._get_conversation_init(deadline)
+        limits_progress = init_payload.get("limits_progress")
+        limits_progress = limits_progress if isinstance(limits_progress, list) else []
+        quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        return {
+            "quota": quota,
+            "image_quota_unknown": image_quota_unknown,
+            "limits_progress": limits_progress,
+            "default_model_slug": init_payload.get("default_model_slug"),
+            "restore_at": restore_at,
+            "status": "正常" if image_quota_unknown or quota > 0 else "限流",
+        }
+
     def _bootstrap_headers(self) -> Dict[str, str]:
         """构造首页预热请求头。"""
         return {
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Language": self.fp["accept_language"],
             "Sec-Ch-Ua": self.session.headers["Sec-Ch-Ua"],
             "Sec-Ch-Ua-Mobile": self.session.headers["Sec-Ch-Ua-Mobile"],
             "Sec-Ch-Ua-Platform": self.session.headers["Sec-Ch-Ua-Platform"],

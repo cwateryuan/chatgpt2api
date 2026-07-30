@@ -4,7 +4,6 @@ import base64
 import json
 import secrets
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +12,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from services.config import config
+from services.browser_fingerprint import account_fingerprint
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
@@ -37,11 +37,6 @@ class AccountService:
     _ACCOUNT_CACHE_TTL_SECONDS = 2.0
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
-    _OAUTH_USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
-    )
 
     # 刷新进度追踪
     _refresh_progress: dict[str, dict] = {}
@@ -304,6 +299,8 @@ class AccountService:
         if not source_type and str(normalized.get("export_type") or "").strip().lower() == "codex":
             source_type = "codex"
         normalized["source_type"] = self._normalize_source_type(source_type)
+        if isinstance(normalized.get("fp"), dict):
+            normalized["fp"] = account_fingerprint(normalized, generate_ids=False)
         limits_progress = normalized.get("limits_progress")
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
@@ -435,14 +432,20 @@ class AccountService:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
-        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
+        fp = account_fingerprint(account)
+        session = requests.Session(**proxy_settings.build_session_kwargs(
+            account=account,
+            impersonate=fp["impersonate"],
+            verify=True,
+        ))
         try:
             response = session.post(
                 self._OAUTH_TOKEN_URL,
                 headers={
                     "Accept": "application/json",
                     "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": self._OAUTH_USER_AGENT,
+                    "User-Agent": fp["user_agent"],
+                    "Accept-Language": fp["accept_language"],
                 },
                 data={
                     "grant_type": "refresh_token",
@@ -528,6 +531,7 @@ class AccountService:
                 return active_token
             if not force and self._recent_token_refresh_error(account):
                 return active_token
+            account = {**account, "fp": self.get_or_create_fingerprint(active_token)}
             lock_key = f"lock:account_refresh:{active_token}"
             lock_owner = runtime_state.acquire_lock(lock_key, ttl_seconds=180)
             if not lock_owner:
@@ -565,7 +569,8 @@ class AccountService:
                 self.update_relogin_progress(progress_id, access_token, "跳过", "已有重登任务")
             return
         try:
-            result = self._login_with_password(email, password)
+            self.get_or_create_fingerprint(access_token)
+            result = self._login_with_password(email, password, self.get_account(access_token))
             if result.get("ok"):
                 # 登录成功，更新账号
                 new_access_token = result.get("access_token", "")
@@ -676,7 +681,7 @@ class AccountService:
         finally:
             runtime_state.release_lock(lock_key, lock_owner)
 
-    def _login_with_password(self, email: str, password: str) -> dict:
+    def _login_with_password(self, email: str, password: str, account: dict | None = None) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
         from curl_cffi import requests
         
@@ -686,17 +691,21 @@ class AccountService:
         platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
         platform_oauth_client_id = self._OAUTH_CLIENT_ID
         platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
-        user_agent = self._OAUTH_USER_AGENT
+        fp = account_fingerprint(account)
+        user_agent = fp["user_agent"]
         
         # 创建 session
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
-        proxy = config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
+        from services.proxy_service import proxy_settings
+        session_kwargs = proxy_settings.build_session_kwargs(
+            account=account,
+            impersonate=fp["impersonate"],
+            upstream=True,
+            verify=False,
+        )
         session = requests.Session(**session_kwargs)
         
         try:
-            device_id = str(uuid.uuid4())
+            device_id = fp["device_id"]
             
             # ─── 方式2: OAuth authorize 流程 ──────────────────────────
             # 使用 Platform Client + PKCE（与注册流程相同）
@@ -730,11 +739,11 @@ class AccountService:
                 authorize_url,
                 headers={
                     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "accept-language": fp["accept_language"],
                     "user-agent": user_agent,
-                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-ch-ua": fp["sec_ch_ua"],
+                    "sec-ch-ua-mobile": fp["sec_ch_ua_mobile"],
+                    "sec-ch-ua-platform": fp["sec_ch_ua_platform"],
                     "sec-fetch-dest": "document",
                     "sec-fetch-mode": "navigate",
                     "sec-fetch-site": "cross-site",
@@ -769,14 +778,14 @@ class AccountService:
             # ③ 提交密码验证
             login_headers = {
                 "accept": "application/json",
-                "accept-language": "zh-CN,zh;q=0.9",
+                "accept-language": fp["accept_language"],
                 "content-type": "application/json",
                 "origin": auth_base,
                 "priority": "u=1, i",
                 "user-agent": user_agent,
-                "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
+                "sec-ch-ua": fp["sec_ch_ua"],
+                "sec-ch-ua-mobile": fp["sec_ch_ua_mobile"],
+                "sec-ch-ua-platform": fp["sec_ch_ua_platform"],
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
@@ -787,7 +796,13 @@ class AccountService:
             # 添加 sentinel token
             try:
                 from utils.sentinel import build_sentinel_token
-                sentinel_val, oai_sc_val = build_sentinel_token(session, device_id, "password_verify")
+                sentinel_val, oai_sc_val = build_sentinel_token(
+                    session,
+                    device_id,
+                    "password_verify",
+                    user_agent=user_agent,
+                    sec_ch_ua=fp["sec_ch_ua"],
+                )
                 login_headers["openai-sentinel-token"] = sentinel_val
                 if oai_sc_val:
                     session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
@@ -845,7 +860,7 @@ class AccountService:
                 f"{auth_base}/api/accounts/oauth/token",
                 headers={
                     "accept": "*/*",
-                    "accept-language": "zh-CN,zh;q=0.9",
+                    "accept-language": fp["accept_language"],
                     "auth0-client": platform_auth0_client,
                     "cache-control": "no-cache",
                     "content-type": "application/json",
@@ -853,9 +868,9 @@ class AccountService:
                     "pragma": "no-cache",
                     "priority": "u=1, i",
                     "referer": f"{platform_base}/",
-                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-ch-ua": fp["sec_ch_ua"],
+                    "sec-ch-ua-mobile": fp["sec_ch_ua_mobile"],
+                    "sec-ch-ua-platform": fp["sec_ch_ua_platform"],
                     "sec-fetch-dest": "empty",
                     "sec-fetch-mode": "cors",
                     "sec-fetch-site": "same-site",
@@ -1304,6 +1319,22 @@ class AccountService:
             if (payload := self._prepare_account_payload(item)) is not None
         ]
         return self._add_account_payloads(payloads)
+
+    def get_or_create_fingerprint(self, access_token: str) -> dict[str, str]:
+        """Return the account fingerprint and persist generated IDs exactly once."""
+        if not access_token:
+            return account_fingerprint({})
+        with self._lock:
+            resolved, current = self._load_account_for_token_locked(access_token)
+            if current is None:
+                return account_fingerprint({})
+            fp = account_fingerprint(current)
+            if current.get("fp") != fp:
+                next_item = self._normalize_account({**current, "fp": fp})
+                if next_item is not None:
+                    self._accounts[resolved] = next_item
+                    self._save_account(next_item)
+            return dict(fp)
 
     def add_accounts(self, tokens: list[str], source_type: str = "web") -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))

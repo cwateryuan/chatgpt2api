@@ -367,6 +367,10 @@ export type OutlookPoolStats = {
 
 export type RegisterConfig = {
   enabled: boolean;
+  engine: "http" | "browser";
+  browser_available: boolean;
+  browser_version: string;
+  browser_error: string;
   mail: {
     request_timeout: number;
     wait_timeout: number;

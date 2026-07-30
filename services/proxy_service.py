@@ -163,9 +163,9 @@ class ProxySettingsStore:
     ) -> None:
         self._config = config_store or config
         self._clearance_provider_factory = clearance_provider_factory or FlareSolverrClearanceProvider
-        self._clearance_cache: dict[tuple[str, str], ClearanceBundle] = {}
+        self._clearance_cache: dict[tuple[str, str, str], ClearanceBundle] = {}
         self._provider_cache: dict[str, FlareSolverrClearanceProvider] = {}
-        self._flight_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._flight_locks: dict[tuple[str, str, str], threading.Lock] = {}
         self._lock = threading.RLock()
 
     def get_profile(
@@ -240,6 +240,7 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = True,
+        clearance_scope: str = "",
     ) -> dict[str, object]:
         merged_headers: dict[str, object] = dict(headers or {})
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
@@ -247,7 +248,7 @@ class ProxySettingsStore:
             return merged_headers
 
         target_host = _host_from_url(target_url)
-        bundle = self._bundle_for_headers(profile, target_host)
+        bundle = self._bundle_for_headers(profile, target_host, clearance_scope)
         if bundle is None or not bundle.is_valid_for(target_host, profile.proxy_url):
             return merged_headers
 
@@ -270,13 +271,14 @@ class ProxySettingsStore:
         resource: bool = False,
         force: bool = False,
         upstream: bool = True,
+        clearance_scope: str = "",
     ) -> ClearanceBundle | None:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
         if not profile.clearance_enabled:
             return None
 
         target_host = _host_from_url(target_url)
-        key = self._cache_key(profile.proxy_url, target_host)
+        key = self._cache_key(profile.proxy_url, target_host, clearance_scope)
         if profile.clearance_mode == "manual":
             bundle = self._build_manual_bundle(profile, target_host)
             if bundle is not None:
@@ -329,17 +331,18 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = True,
+        clearance_scope: str = "",
     ) -> None:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
         target_host = _host_from_url(target_url)
-        key = self._cache_key(profile.proxy_url, target_host)
+        key = self._cache_key(profile.proxy_url, target_host, clearance_scope)
         with self._lock:
             self._clearance_cache.pop(key, None)
 
     def get_runtime_status(self) -> dict[str, object]:
         profile = self.get_profile(upstream=True)
         with self._lock:
-            cached_hosts = [host for _proxy, host in self._clearance_cache]
+            cached_hosts = [host for _proxy, host, _scope in self._clearance_cache]
             cached_count = len(self._clearance_cache)
         return {
             "enabled": profile.runtime_enabled,
@@ -359,8 +362,13 @@ class ProxySettingsStore:
             runtime = {}
         return runtime if isinstance(runtime, dict) else {}
 
-    def _bundle_for_headers(self, profile: ProxyRuntimeProfile, target_host: str) -> ClearanceBundle | None:
-        key = self._cache_key(profile.proxy_url, target_host)
+    def _bundle_for_headers(
+        self,
+        profile: ProxyRuntimeProfile,
+        target_host: str,
+        clearance_scope: str = "",
+    ) -> ClearanceBundle | None:
+        key = self._cache_key(profile.proxy_url, target_host, clearance_scope)
         if profile.clearance_mode == "manual":
             bundle = self._build_manual_bundle(profile, target_host)
             if bundle is not None:
@@ -399,7 +407,7 @@ class ProxySettingsStore:
                 self._provider_cache[url] = provider
             return provider
 
-    def _get_flight_lock(self, key: tuple[str, str]) -> threading.Lock:
+    def _get_flight_lock(self, key: tuple[str, str, str]) -> threading.Lock:
         with self._lock:
             lock = self._flight_locks.get(key)
             if lock is None:
@@ -407,17 +415,17 @@ class ProxySettingsStore:
                 self._flight_locks[key] = lock
             return lock
 
-    def _get_cached_bundle(self, key: tuple[str, str]) -> ClearanceBundle | None:
+    def _get_cached_bundle(self, key: tuple[str, str, str]) -> ClearanceBundle | None:
         with self._lock:
             return self._clearance_cache.get(key)
 
-    def _set_cached_bundle(self, key: tuple[str, str], bundle: ClearanceBundle) -> None:
+    def _set_cached_bundle(self, key: tuple[str, str, str], bundle: ClearanceBundle) -> None:
         with self._lock:
             self._clearance_cache[key] = bundle
 
     @staticmethod
-    def _cache_key(proxy_url: str, target_host: str) -> tuple[str, str]:
-        return (normalize_proxy_url(proxy_url), _normalize_host(target_host))
+    def _cache_key(proxy_url: str, target_host: str, clearance_scope: str = "") -> tuple[str, str, str]:
+        return (normalize_proxy_url(proxy_url), _normalize_host(target_host), str(clearance_scope or ""))
 
 
 def _clean(value: object) -> str:

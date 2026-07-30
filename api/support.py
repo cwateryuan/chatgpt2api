@@ -124,23 +124,22 @@ def _run_limited_account_refresh_cycle(stop_event: Event, *, hold_lock_seconds: 
     renew_thread.start()
     try:
         limited_tokens = account_service.list_limited_tokens()
-        normal_tokens = account_service.list_normal_tokens()
         expiring_tokens = account_service.list_expiring_access_tokens()
         keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-        tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
-        expiring_token_set = set(expiring_tokens)
-        keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
-        if tokens:
+        token_refreshes = list(dict.fromkeys([*expiring_tokens, *keepalive_tokens]))
+        if limited_tokens:
             logger.info({
                 "event": "account_watcher_checking",
                 "limited_accounts": len(limited_tokens),
-                "normal_accounts": len(normal_tokens),
-                "expiring_access_tokens": len(expiring_tokens),
             })
-            account_service.refresh_accounts(tokens)
-        if keepalive_tokens and not lease_lost.is_set() and not stop_event.is_set():
-            logger.info({"event": "account_watcher_keepalive", "refresh_tokens": len(keepalive_tokens)})
-            result = account_service.keepalive_refresh_tokens(keepalive_tokens)
+            account_service.refresh_accounts(limited_tokens)
+        if token_refreshes and not lease_lost.is_set() and not stop_event.is_set():
+            logger.info({
+                "event": "account_watcher_token_maintenance",
+                "expiring_access_tokens": len(expiring_tokens),
+                "refresh_tokens": len(token_refreshes),
+            })
+            result = account_service.keepalive_refresh_tokens(token_refreshes)
             if result.get("errors"):
                 logger.warning({"event": "account_watcher_keepalive_errors", "errors": result["errors"]})
         if hold_lock_seconds > 0 and not lease_lost.is_set():

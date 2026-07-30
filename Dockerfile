@@ -23,6 +23,7 @@ ARG TARGETARCH
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
@@ -35,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     gcc \
     openssl \
+    chromium \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv

@@ -282,6 +282,10 @@ function normalizeRegisterConfig(config: RegisterUpdate, previous?: RegisterConf
 
   return {
     enabled: Boolean(config.enabled ?? previous?.enabled ?? false),
+    engine: config.engine === "browser" ? "browser" : previous?.engine || "http",
+    browser_available: Boolean(config.browser_available ?? previous?.browser_available ?? false),
+    browser_version: String(config.browser_version ?? previous?.browser_version ?? ""),
+    browser_error: String(config.browser_error ?? previous?.browser_error ?? ""),
     mail: {
       ...DEFAULT_REGISTER_MAIL,
       ...(previous?.mail || {}),
@@ -388,6 +392,7 @@ type SettingsStore = {
   setRegisterProxy: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
+  setRegisterEngine: (value: "http" | "browser") => void;
   setRegisterMode: (value: "total" | "quota" | "available") => void;
   setRegisterTargetQuota: (value: string) => void;
   setRegisterTargetAvailable: (value: string) => void;
@@ -969,6 +974,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, threads: Number(value) || 0 } } : {});
   },
 
+  setRegisterEngine: (value) => {
+    set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, engine: value } } : {});
+  },
+
   setRegisterMode: (value) => {
     set((state) => state.registerConfig ? { registerConfig: { ...state.registerConfig, mode: value } } : {});
   },
@@ -1036,6 +1045,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       set({ isSavingRegister: true });
       const data = await updateRegisterConfig({
+        engine: registerConfig.engine,
         mail: registerConfig.mail,
         proxy: registerConfig.proxy.trim(),
         total: Math.max(1, Number(registerConfig.total) || 1),
@@ -1061,6 +1071,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       if (!registerConfig.enabled) {
         await updateRegisterConfig({
+          engine: registerConfig.engine,
           mail: registerConfig.mail,
           proxy: registerConfig.proxy.trim(),
           total: Math.max(1, Number(registerConfig.total) || 1),
