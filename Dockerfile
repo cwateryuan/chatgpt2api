@@ -22,7 +22,8 @@ ARG TARGETARCH
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    PLAYWRIGHT_HEADLESS=false
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
@@ -37,6 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     openssl \
     chromium \
+    xvfb \
+    xauth \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
@@ -55,4 +58,4 @@ COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80
 
-CMD ["sh", "-c", "uv run uvicorn main:app --host 0.0.0.0 --port 80 --workers ${UVICORN_WORKERS:-1} --no-access-log --log-level warning"]
+CMD ["sh", "-c", "xvfb-run -a -s '-screen 0 1365x768x24 -nolisten tcp' uv run uvicorn main:app --host 0.0.0.0 --port 80 --workers ${UVICORN_WORKERS:-1} --no-access-log --log-level warning"]

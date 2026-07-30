@@ -141,6 +141,8 @@ class RegistrationHardeningTests(unittest.TestCase):
                 page.set_content(html)
                 page.locator('input[name="email"]').fill("private@example.com")
                 self.assertNotIn("private@example.com", registrar._control_summary(page))
+                page.set_content('<input readonly type="text" placeholder="Email address" value="private@example.com">')
+                self.assertIsNone(registrar._editable(page, ('input[placeholder*="Email" i]',)))
                 page.set_content('<main><h1>Something went wrong</h1><p>private@example.com could not continue</p><button>Try again</button></main>')
                 self.assertNotIn("private@example.com", registrar._error_summary(page))
                 page.set_content(html)

@@ -66,7 +66,7 @@ def _probe_browser_runtime() -> dict[str, Any]:
                 raise RuntimeError("Chromium executable is not installed")
             browser = playwright.chromium.launch(
                 executable_path=executable_override or None,
-                headless=True,
+                headless=_playwright_headless(),
                 args=["--disable-dev-shm-usage"],
             )
             try:
@@ -130,6 +130,11 @@ def _playwright_proxy() -> dict[str, str] | None:
     return result
 
 
+def _playwright_headless() -> bool:
+    value = str(os.getenv("PLAYWRIGHT_HEADLESS") or "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 class BrowserRegistrar:
     def __init__(self) -> None:
         self.fingerprint = make_fingerprint()
@@ -174,6 +179,18 @@ class BrowserRegistrar:
                 continue
         return None
 
+    def _editable(self, page, selectors: tuple[str, ...]):
+        for selector in selectors:
+            try:
+                matches = page.locator(selector)
+                for match_index in range(matches.count()):
+                    locator = matches.nth(match_index)
+                    if locator.is_visible() and locator.is_editable():
+                        return locator
+            except Exception:
+                continue
+        return None
+
     @staticmethod
     def _page_path(page) -> str:
         try:
@@ -200,7 +217,10 @@ class BrowserRegistrar:
                 if not field.is_visible():
                     continue
                 attrs = []
-                for key in ("type", "name", "autocomplete", "inputmode", "maxlength", "data-testid"):
+                for key in (
+                    "type", "name", "autocomplete", "inputmode", "maxlength", "data-testid",
+                    "readonly", "disabled", "aria-readonly",
+                ):
                     value = str(field.get_attribute(key) or "").strip()
                     if value:
                         attrs.append(f"{key}={value[:40]}")
@@ -257,7 +277,7 @@ class BrowserRegistrar:
         return f"text=[{' | '.join(messages)}] responses=[{responses}]"[:800]
 
     def _fill(self, page, selectors: tuple[str, ...], value: str, state: str) -> None:
-        locator = self._visible(page, selectors)
+        locator = self._editable(page, selectors)
         if locator is None:
             raise BrowserRegistrationError(f"browser_unexpected_state:{state}")
         locator.fill(value, timeout=self._remaining_ms())
@@ -328,7 +348,7 @@ class BrowserRegistrar:
         if code_option is not None:
             code_option.click(timeout=self._remaining_ms())
             page.wait_for_timeout(500)
-        if self._visible(page, (
+        if self._editable(page, (
             'input[autocomplete="one-time-code"]',
             'input[name="code"]',
             'input[name="otp"]',
@@ -341,7 +361,7 @@ class BrowserRegistrar:
 
     def _complete_profile(self, page, name: str, birthdate: str) -> None:
         filled = False
-        name_input = self._visible(page, (
+        name_input = self._editable(page, (
             'input[name="name"]',
             'input[autocomplete="name"]',
             'input[data-testid="name-input"]',
@@ -351,13 +371,13 @@ class BrowserRegistrar:
             filled = True
         else:
             first_name, _, last_name = name.partition(" ")
-            first_input = self._visible(page, ('input[name="firstName"]', 'input[name="first_name"]'))
-            last_input = self._visible(page, ('input[name="lastName"]', 'input[name="last_name"]'))
+            first_input = self._editable(page, ('input[name="firstName"]', 'input[name="first_name"]'))
+            last_input = self._editable(page, ('input[name="lastName"]', 'input[name="last_name"]'))
             if first_input is not None and last_input is not None:
                 first_input.fill(first_name, timeout=self._remaining_ms())
                 last_input.fill(last_name, timeout=self._remaining_ms())
                 filled = True
-        birth_input = self._visible(page, ('input[name="birthdate"]', 'input[type="date"]'))
+        birth_input = self._editable(page, ('input[name="birthdate"]', 'input[type="date"]'))
         if birth_input is not None:
             birth_input.fill(birthdate, timeout=self._remaining_ms())
             filled = True
@@ -382,7 +402,7 @@ class BrowserRegistrar:
         for field_index in range(fields.count()):
             field = fields.nth(field_index)
             try:
-                if field.is_visible(timeout=100):
+                if field.is_visible(timeout=100) and field.is_editable():
                     visible_fields.append(field)
             except Exception:
                 continue
@@ -446,21 +466,21 @@ class BrowserRegistrar:
             )
             if "/about-you" not in url_lower:
                 otp_selectors += ('input[inputmode="numeric"]', 'input[maxlength="1"]')
-            otp_input = self._visible(page, otp_selectors)
-            profile_input = self._visible(page, (
+            otp_input = self._editable(page, otp_selectors)
+            profile_input = self._editable(page, (
                 'input[name="birthdate"]',
                 'input[type="date"]',
                 'input[name="name"]',
                 'input[data-testid="name-input"]',
             ))
-            password_input = self._visible(page, (
+            password_input = self._editable(page, (
                 'input[type="password"]',
                 'input[name="password"]',
                 'input[name="newPassword"]',
                 'input[autocomplete="new-password"]',
                 'input[autocomplete="current-password"]',
             ))
-            email_input = self._visible(page, (
+            email_input = self._editable(page, (
                 'input[type="email"]',
                 'input[name="email"]',
                 'input[name="username"]',
@@ -632,7 +652,7 @@ class BrowserRegistrar:
                 executable = str(os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or "").strip() or None
                 browser = playwright.chromium.launch(
                     executable_path=executable,
-                    headless=True,
+                    headless=_playwright_headless(),
                     proxy=_playwright_proxy(),
                     args=["--disable-dev-shm-usage"],
                 )
