@@ -234,6 +234,33 @@ class RegistrationHardeningTests(unittest.TestCase):
                 self.assertNotEqual(page.locator("body").get_attribute("data-password-submitted"), "yes")
                 self.assertEqual(page.locator("body").get_attribute("data-otp-clicks"), "1")
 
+                direct_otp_registrar = browser_register.BrowserRegistrar()
+                direct_otp_registrar._deadline = time.monotonic() + 30
+                page.set_content("""
+                    <input name="code" autocomplete="one-time-code"><button onclick="showDirectProfile()">Continue</button>
+                    <script>
+                    function showDirectProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="finishDirectSignup()">Continue</button>'; }
+                    function finishDirectSignup() { location.hash = 'direct-otp-signup-done'; }
+                    </script>
+                """)
+
+                def capture_direct_otp_signup(url: str) -> None:
+                    if str(url).endswith("#direct-otp-signup-done"):
+                        direct_otp_registrar.callback_code = "direct-otp-signup-code"
+
+                direct_otp_registrar._capture_callback = capture_direct_otp_signup
+                with mock.patch.object(browser_register.mail_provider, "wait_for_code", return_value="135790"):
+                    direct_otp_password = direct_otp_registrar._run_authorization_flow(
+                        page,
+                        {"provider": "outlook_token"},
+                        "direct-otp@example.com",
+                        "UnusedPassword123!",
+                        "Jane Doe",
+                        "2000-01-02",
+                        1,
+                    )
+                self.assertEqual(direct_otp_password, "")
+
                 page.set_content("""
                     <input name="current-password" type="password" autocomplete="current-password webauthn">
                     <button onclick="showLoginOtp()">Log in with a one-time code</button>
@@ -262,7 +289,7 @@ class RegistrationHardeningTests(unittest.TestCase):
 
         with (
             mock.patch.object(registrar, "_run_authorization_flow", side_effect=[stalled, ""]) as run_flow,
-            mock.patch.object(registrar, "_authorize_url", return_value="https://auth.openai.com/restart") as authorize,
+            mock.patch.object(registrar, "_registration_url", return_value="https://chatgpt.com/auth/login") as registration_url,
             mock.patch.object(browser_register, "step") as log_step,
         ):
             password = registrar._run_authorization_with_restarts(
@@ -277,13 +304,42 @@ class RegistrationHardeningTests(unittest.TestCase):
 
         self.assertEqual(password, "")
         self.assertEqual(run_flow.call_count, 2)
-        authorize.assert_called_once_with("same@example.com")
+        self.assertEqual([call.args[2] for call in run_flow.call_args_list], ["same@example.com"] * 2)
+        registration_url.assert_called_once_with()
         page.goto.assert_called_once_with(
-            "https://auth.openai.com/restart",
+            "https://chatgpt.com/auth/login",
             wait_until="domcontentloaded",
             timeout=mock.ANY,
         )
         self.assertIn("重新提交同一邮箱", " ".join(str(call) for call in log_step.call_args_list))
+
+    def test_browser_chatgpt_session_token_is_read_after_registration(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 30
+        page = mock.Mock()
+        page.evaluate.side_effect = [
+            {"status": 200, "data": {"user": {"email": "same@example.com"}}},
+            {"status": 200, "data": {"accessToken": "session-access-token"}},
+        ]
+
+        with mock.patch.object(browser_register, "step"):
+            tokens = registrar._chatgpt_session_tokens(page, 1)
+
+        self.assertEqual(tokens["access_token"], "session-access-token")
+        self.assertEqual(tokens["refresh_token"], "")
+        self.assertEqual(page.evaluate.call_count, 2)
+        page.wait_for_timeout.assert_called_once_with(1_000)
+
+    def test_browser_registration_uses_chatgpt_login_entry(self):
+        registrar = browser_register.BrowserRegistrar()
+        self.assertEqual(registrar._registration_url(), "https://chatgpt.com/auth/login")
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        self.assertTrue(registrar._registration_complete(page))
+        page.url = "https://chatgpt.com/auth/login"
+        self.assertFalse(registrar._registration_complete(page))
+        page.url = "https://chatgpt.com/api/auth/callback/openai"
+        self.assertFalse(registrar._registration_complete(page))
 
     def test_browser_start_fails_when_runtime_is_unavailable(self):
         with (

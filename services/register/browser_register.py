@@ -8,24 +8,18 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from services.browser_fingerprint import make_fingerprint
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
 from services.register.openai_register import (
-    _generate_pkce,
     _fingerprint_with_user_agent,
     _random_birthdate,
     _random_name,
     _random_password,
     auth_base,
     config,
-    platform_auth0_client,
-    platform_base,
-    platform_oauth_audience,
-    platform_oauth_client_id,
-    platform_oauth_redirect_uri,
     step,
 )
 
@@ -35,6 +29,9 @@ BROWSER_TASK_TIMEOUT_SECONDS = 300
 BROWSER_ERROR_RETRY_LIMIT = 2
 BROWSER_ONE_TIME_CODE_RETRY_LIMIT = 3
 BROWSER_AUTH_RESTART_LIMIT = 3
+CHATGPT_BASE = "https://chatgpt.com"
+CHATGPT_LOGIN_URL = f"{CHATGPT_BASE}/auth/login"
+CHATGPT_SESSION_URL = f"{CHATGPT_BASE}/api/auth/session"
 BROWSER_EMAIL_SELECTORS = (
     'input[type="email"]',
     'input[name="email"]',
@@ -192,7 +189,6 @@ def _align_fingerprint_platform(fingerprint: dict[str, str]) -> dict[str, str]:
 class BrowserRegistrar:
     def __init__(self) -> None:
         self.fingerprint = make_fingerprint()
-        self.code_verifier = ""
         self.callback_code = ""
         self._deadline = 0.0
         self._auth_responses: list[str] = []
@@ -335,12 +331,13 @@ class BrowserRegistrar:
         try:
             parsed = urlparse(str(response.url or ""))
             auth_host = urlparse(auth_base).hostname
+            chatgpt_host = urlparse(CHATGPT_BASE).hostname
             resource_type = str(response.request.resource_type or "")
-            if parsed.hostname != auth_host or resource_type not in {"document", "fetch", "xhr"}:
+            if parsed.hostname not in {auth_host, chatgpt_host} or resource_type not in {"document", "fetch", "xhr"}:
                 return
             path = (parsed.path.rstrip("/") or "/")[:120]
             status = int(response.status)
-            if status < 400 and not path.startswith("/api/accounts/"):
+            if status < 400 and not path.startswith(("/api/accounts/", "/api/auth/")):
                 return
             entry = f"{status}:{path}"
             if not self._auth_responses or self._auth_responses[-1] != entry:
@@ -411,33 +408,73 @@ class BrowserRegistrar:
         )
         raise BrowserRegistrationError(f"browser_email_transition_timeout:path={path}")
 
-    def _authorize_url(self, email: str) -> str:
-        self.code_verifier, code_challenge = _generate_pkce()
-        params = {
-            "issuer": auth_base,
-            "client_id": platform_oauth_client_id,
-            "audience": platform_oauth_audience,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "device_id": self.fingerprint["device_id"],
-            "screen_hint": "signup",
-            "max_age": "0",
-            "login_hint": email,
-            "scope": "openid profile email offline_access",
-            "response_type": "code",
-            "response_mode": "query",
-            "state": os.urandom(24).hex(),
-            "nonce": os.urandom(24).hex(),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "auth0Client": platform_auth0_client,
-        }
-        return f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+    @staticmethod
+    def _registration_url() -> str:
+        return CHATGPT_LOGIN_URL
 
     def _capture_callback(self, url: str) -> None:
         parsed = urlparse(str(url or ""))
         if parsed.netloc.lower() != "platform.openai.com" or parsed.path.rstrip("/") != "/auth/callback":
             return
         self.callback_code = str((parse_qs(parsed.query).get("code") or [""])[0]).strip()
+
+    def _registration_complete(self, page) -> bool:
+        self._capture_callback(page.url)
+        if self.callback_code:
+            return True
+        parsed = urlparse(str(page.url or ""))
+        return (
+            parsed.hostname == urlparse(CHATGPT_BASE).hostname
+            and parsed.path.rstrip("/") == ""
+        )
+
+    @staticmethod
+    def _find_access_token(payload: Any) -> str:
+        if isinstance(payload, dict):
+            for key in ("accessToken", "access_token"):
+                token = str(payload.get(key) or "").strip()
+                if token:
+                    return token
+            for value in payload.values():
+                token = BrowserRegistrar._find_access_token(value)
+                if token:
+                    return token
+        elif isinstance(payload, list):
+            for value in payload:
+                token = BrowserRegistrar._find_access_token(value)
+                if token:
+                    return token
+        return ""
+
+    def _chatgpt_session_tokens(self, page, index: int) -> dict[str, str]:
+        step(index, "ChatGPT 注册完成，读取浏览器 session token")
+        last_status = 0
+        for _ in range(10):
+            result = page.evaluate(
+                """
+                async (sessionUrl) => {
+                    const response = await fetch(sessionUrl, {
+                        credentials: "include",
+                        cache: "no-store",
+                    });
+                    let data = null;
+                    try { data = await response.json(); } catch (_) {}
+                    return {status: response.status, data};
+                }
+                """,
+                CHATGPT_SESSION_URL,
+            )
+            if isinstance(result, dict):
+                last_status = int(result.get("status") or 0)
+                access_token = self._find_access_token(result.get("data"))
+                if access_token:
+                    return {
+                        "access_token": access_token,
+                        "refresh_token": "",
+                        "id_token": "",
+                    }
+            page.wait_for_timeout(1_000)
+        raise BrowserRegistrationError(f"browser_session_token_missing:http_{last_status or 'unknown'}")
 
     def _wait_for_otp(self, mailbox: dict, index: int, *, login: bool = False) -> str:
         mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
@@ -646,10 +683,7 @@ class BrowserRegistrar:
         last_action_key = ""
         repeated_action_count = 0
 
-        while not self.callback_code:
-            self._capture_callback(page.url)
-            if self.callback_code:
-                break
+        while not self._registration_complete(page):
             self._check_challenge(page)
             path = self._page_path(page)
             url_lower = str(page.url or "").lower()
@@ -763,9 +797,12 @@ class BrowserRegistrar:
                 password = ""
                 password_done = True
             elif state == "otp":
-                code = self._wait_for_otp(mailbox, index, login=not bool(password))
+                is_login = "log-in" in url_lower or "login" in url_lower
+                code = self._wait_for_otp(mailbox, index, login=is_login)
                 self._fill_otp(page, code)
                 self._continue(page, "otp")
+                if not password_done:
+                    password = ""
                 otp_done = True
             elif state == "about_you":
                 self._complete_profile(page, name, birthdate)
@@ -853,42 +890,11 @@ class BrowserRegistrar:
                 self.callback_code = ""
                 self._auth_responses.clear()
                 page.goto(
-                    self._authorize_url(email),
+                    self._registration_url(),
                     wait_until="domcontentloaded",
                     timeout=self._remaining_ms(),
                 )
         raise BrowserRegistrationError("browser_authorization_retry_exhausted")
-
-    def _exchange_token(self, context) -> dict[str, str]:
-        if not self.callback_code:
-            raise BrowserRegistrationError("browser_callback_code_missing")
-        response = context.request.post(
-            f"{auth_base}/api/accounts/oauth/token",
-            headers={
-                "accept": "*/*",
-                "auth0-client": platform_auth0_client,
-                "content-type": "application/json",
-                "origin": platform_base,
-                "referer": f"{platform_base}/",
-            },
-            data={
-                "client_id": platform_oauth_client_id,
-                "code_verifier": self.code_verifier,
-                "grant_type": "authorization_code",
-                "code": self.callback_code,
-                "redirect_uri": platform_oauth_redirect_uri,
-            },
-            timeout=self._remaining_ms(),
-        )
-        data = response.json() if response.ok else {}
-        access_token = str(data.get("access_token") or "").strip() if isinstance(data, dict) else ""
-        if not access_token:
-            raise BrowserRegistrationError(f"browser_oauth_token_http_{response.status}")
-        return {
-            "access_token": access_token,
-            "refresh_token": str(data.get("refresh_token") or "").strip(),
-            "id_token": str(data.get("id_token") or "").strip(),
-        }
 
     def register(self, index: int) -> dict[str, Any]:
         status = browser_runtime_status()
@@ -953,7 +959,7 @@ class BrowserRegistrar:
                     page = context.new_page()
                     page.on("response", self._record_auth_response)
                     page.on("framenavigated", lambda frame: self._capture_callback(frame.url))
-                    page.goto(self._authorize_url(email), wait_until="domcontentloaded", timeout=self._remaining_ms())
+                    page.goto(self._registration_url(), wait_until="domcontentloaded", timeout=self._remaining_ms())
                     if not use_clearance_identity:
                         actual_user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip()
                         if actual_user_agent:
@@ -970,7 +976,7 @@ class BrowserRegistrar:
                         birthdate,
                         index,
                     )
-                    tokens = self._exchange_token(context)
+                    tokens = self._chatgpt_session_tokens(page, index)
                 finally:
                     browser.close()
         except BrowserRegistrationError as error:
