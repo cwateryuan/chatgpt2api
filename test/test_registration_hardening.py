@@ -143,10 +143,29 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertTrue(fp["device_id"])
         self.assertTrue(fp["session_id"])
 
-    def test_browser_engine_normalizes_to_single_effective_thread(self):
+    def test_browser_engine_preserves_configured_threads(self):
         config = _normalize({"engine": "browser", "threads": 9, "stats": {"threads": 9}})
         self.assertEqual(config["threads"], 9)
-        self.assertEqual(config["stats"]["threads"], 1)
+        self.assertEqual(config["stats"]["threads"], 9)
+
+    def test_browser_runner_uses_configured_thread_pool_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = RegisterService(Path(tmp) / "register.json")
+            service._config = _normalize({"engine": "browser", "threads": 4, "enabled": False})
+            with (
+                mock.patch("services.register_service.ThreadPoolExecutor") as executor,
+                mock.patch.object(service, "_refresh_runtime_cfg_for_runner", return_value=service._config),
+                mock.patch.object(service, "_bump"),
+                mock.patch.object(service, "_save"),
+                mock.patch.object(service, "_save_runtime"),
+                mock.patch.object(service, "_stop_requested", return_value=False),
+                mock.patch.object(service, "_clear_stop_requested"),
+                mock.patch.object(service, "_append_log"),
+                mock.patch("services.register_service.trim_memory"),
+            ):
+                service._run()
+
+        executor.assert_called_once_with(max_workers=4)
 
     def test_browser_runtime_probe_runs_off_asyncio_thread(self):
         event_loop_thread = threading.get_ident()

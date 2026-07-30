@@ -81,8 +81,11 @@ def _normalize(raw: dict) -> dict:
     if isinstance(cfg.get("mail"), dict):
         cfg["mail"].pop("proxy", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
-    stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
-             "threads": 1 if cfg["engine"] == "browser" else cfg["threads"]}
+    stats = {
+        **_default_config()["stats"],
+        **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
+        "threads": cfg["threads"],
+    }
     cfg["stats"] = stats
     logs = raw.get("logs") if isinstance(raw.get("logs"), list) else []
     cfg["logs"] = [
@@ -258,7 +261,7 @@ class RegisterService:
                 "fail": 0,
                 "done": 0,
                 "running": 0,
-                "threads": 1 if self._config["engine"] == "browser" else self._config["threads"],
+                "threads": self._config["threads"],
                 **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
@@ -268,7 +271,7 @@ class RegisterService:
             self._config["stats"] = {
                 **_default_config()["stats"],
                 **existing_stats,
-                "threads": 1 if self._config["engine"] == "browser" else self._config["threads"],
+                "threads": self._config["threads"],
                 "updated_at": _now(),
             }
             self._config["stats"].setdefault("job_id", uuid.uuid4().hex)
@@ -285,7 +288,7 @@ class RegisterService:
             "event": event,
             "pid": os.getpid(),
             "mode": self._config.get("mode"),
-            "threads": 1 if self._config.get("engine") == "browser" else self._config.get("threads"),
+            "threads": self._config.get("threads"),
         })
 
     def _log_recovery_wait_locked(self) -> None:
@@ -499,8 +502,10 @@ class RegisterService:
             self._lock_owner = lock_owner
             self._clear_stop_requested()
             self._start_runner_locked(reset_runtime=True, recovered=False)
-            effective_threads = 1 if self._config["engine"] == "browser" else self._config["threads"]
-            self._append_log(f"注册任务启动，引擎={self._config['engine']}，模式={self._config['mode']}，线程数={effective_threads}", "yellow")
+            self._append_log(
+                f"注册任务启动，引擎={self._config['engine']}，模式={self._config['mode']}，线程数={self._config['threads']}",
+                "yellow",
+            )
             return self.get()
 
     def stop(self) -> dict:
@@ -524,8 +529,7 @@ class RegisterService:
             if loaded:
                 self._config = loaded
             self._config["logs"] = []
-            effective_threads = 1 if self._config["engine"] == "browser" else self._config["threads"]
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": effective_threads, "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
+            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
@@ -651,7 +655,7 @@ class RegisterService:
     def _run(self) -> None:
         cfg = self._refresh_runtime_cfg_for_runner()
         engine = str(cfg.get("engine") or "http")
-        threads = 1 if engine == "browser" else int(cfg["threads"])
+        threads = int(cfg["threads"])
         worker = browser_register.worker if engine == "browser" else openai_register.worker
         with self._lock:
             stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}

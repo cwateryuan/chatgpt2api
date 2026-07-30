@@ -97,11 +97,11 @@ export function RegisterCard() {
               <button type="button" className={`text-sm transition ${config.engine === "http" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => setEngine("http")} disabled={isRuntimeBusy}>
                 HTTP
               </button>
-              <button type="button" className={`text-sm transition disabled:cursor-not-allowed disabled:opacity-40 ${config.engine === "browser" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => setEngine("browser")} disabled={isRuntimeBusy || !config.browser_available} title={config.browser_available ? "Playwright Chromium" : config.browser_error || "浏览器运行环境不可用"}>
+              <button type="button" className={`text-sm transition disabled:cursor-not-allowed disabled:opacity-40 ${config.engine === "browser" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => setEngine("browser")} disabled={isRuntimeBusy || !config.browser_available} title={config.browser_available ? "Chromium" : config.browser_error || "浏览器运行环境不可用"}>
                 浏览器
               </button>
             </div>
-            {config.engine === "browser" && config.browser_available ? <p className="text-xs text-stone-500">Chromium {config.browser_version || "available"}，固定单任务运行。</p> : null}
+            {config.engine === "browser" && config.browser_available ? <p className="text-xs text-stone-500">Chromium {config.browser_version || "available"}，每个并发任务使用独立浏览器实例。</p> : null}
             {browserUnavailable ? <p className="text-xs text-rose-600">浏览器运行环境不可用：{config.browser_error || "Chromium 未安装"}</p> : null}
           </div>
 
@@ -124,8 +124,8 @@ export function RegisterCard() {
               <Input value={String(config.total)} onChange={(event) => setTotal(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy || config.mode !== "total"} />
             </div>
             <div className="space-y-2">
-              <label className="text-sm text-stone-700">{config.engine === "browser" ? "并发数（固定）" : "线程数"}</label>
-              <Input value={config.engine === "browser" ? "1" : String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy || config.engine === "browser"} />
+              <label className="text-sm text-stone-700">{config.engine === "browser" ? "浏览器并发数" : "线程数"}</label>
+              <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">注册代理</label>
