@@ -341,6 +341,67 @@ class RegistrationHardeningTests(unittest.TestCase):
         page.url = "https://chatgpt.com/api/auth/callback/openai"
         self.assertFalse(registrar._registration_complete(page))
 
+    def test_browser_devtools_registration_follows_reference_retry_flow(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 120
+        process = mock.Mock()
+        code_state = {
+            "url": "https://auth.openai.com/email-verification",
+            "inputs": [{"visible": True, "name": "code", "autocomplete": "one-time-code", "maxLength": 6}],
+            "buttons": [{"type": "submit", "text": "Continue"}],
+        }
+        profile_state = {
+            "url": "https://auth.openai.com/about-you",
+            "body": "Full name Birthday",
+            "inputs": [{"visible": True, "name": "name"}, {"visible": True, "name": "birthdate"}],
+            "buttons": [{"type": "submit", "text": "Continue"}],
+        }
+        logged_in_state = {"url": "https://chatgpt.com/", "inputs": [], "buttons": []}
+
+        with (
+            mock.patch.object(registrar, "_launch_devtools_browser", return_value=(process, 12345)),
+            mock.patch.object(registrar, "_wait_for_otp", return_value="246810") as wait_for_otp,
+            mock.patch.object(browser_register.browser_devtools, "wait_for", return_value={"url": "https://chatgpt.com/auth/login"}),
+            mock.patch.object(
+                browser_register.browser_devtools,
+                "submit_until",
+                side_effect=[code_state, profile_state, logged_in_state],
+            ) as submit_until,
+            mock.patch.object(
+                browser_register.browser_devtools,
+                "evaluate_json",
+                return_value={"userAgent": "Mozilla/5.0 Chrome/136.0.0.0"},
+            ),
+            mock.patch.object(
+                browser_register.browser_devtools,
+                "response_body_for_request",
+                return_value='{"accessToken":"session-token"}',
+            ),
+            mock.patch.object(browser_register.browser_devtools, "close_browser") as close_browser,
+            mock.patch.object(browser_register, "step"),
+        ):
+            tokens = registrar._run_devtools_registration(
+                {"provider": "outlook_token"},
+                "same@example.com",
+                "Jane Doe",
+                "2000-01-02",
+                1,
+            )
+
+        self.assertEqual(tokens["access_token"], "session-token")
+        self.assertEqual(submit_until.call_count, 3)
+        wait_for_otp.assert_called_once()
+        close_browser.assert_called_once_with(12345, process)
+        self.assertIn("Chrome/136", registrar.fingerprint["user_agent"])
+
+    def test_browser_devtools_actions_use_native_input_events(self):
+        email_script = browser_register._devtools_submit_email_js("same@example.com")
+        code_script = browser_register._devtools_submit_code_js("246810")
+        self.assertIn("InputEvent", email_script)
+        self.assertIn("descriptor.set.call", email_script)
+        self.assertIn("InputEvent", code_script)
+        self.assertIn("code_submit_missing", code_script)
+
     def test_browser_start_fails_when_runtime_is_unavailable(self):
         with (
             tempfile.TemporaryDirectory() as tmp,

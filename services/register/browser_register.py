@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
 import re
+import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -12,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 from services.browser_fingerprint import make_fingerprint
 from services.proxy_service import ClearanceBundle, proxy_settings
-from services.register import mail_provider
+from services.register import browser_devtools, mail_provider
 from services.register.openai_register import (
     _fingerprint_with_user_agent,
     _random_birthdate,
@@ -65,6 +68,243 @@ BROWSER_CHALLENGE_MARKERS = (
 )
 _runtime_lock = threading.Lock()
 _runtime_cache: dict[str, Any] | None = None
+
+
+DEVTOOLS_STATE_JS = r"""
+JSON.stringify({
+  url: location.href,
+  title: document.title,
+  body: (document.body?.innerText || document.documentElement?.innerText || "").trim().slice(0, 5000),
+  inputs: [...document.querySelectorAll("input,textarea")].map((element) => ({
+    type: element.type || "",
+    name: element.name || "",
+    id: element.id || "",
+    placeholder: element.placeholder || "",
+    aria: element.getAttribute("aria-label") || "",
+    autocomplete: element.autocomplete || "",
+    inputmode: element.inputMode || "",
+    maxLength: element.maxLength,
+    visible: !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+  })),
+  buttons: [...document.querySelectorAll("button,a,[role=button],input[type=submit],input[type=button]")]
+    .filter((element) => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length))
+    .map((element) => ({
+      tag: element.tagName,
+      text: (element.innerText || element.textContent || element.value || element.getAttribute("aria-label") || "")
+        .trim().replace(/\s+/g, " ").slice(0, 160),
+      type: element.type || "",
+      id: element.id || ""
+    })).slice(0, 60)
+})
+"""
+
+
+def _devtools_submit_email_js(email: str) -> str:
+    return f"""
+(async () => {{
+  const email = {json.dumps(email)};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => {{
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  }};
+  const setValue = (element, value) => {{
+    element.focus();
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value")
+      || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+    if (descriptor && descriptor.set) descriptor.set.call(element, value);
+    else element.value = value;
+    element.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: value }}));
+    element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  }};
+  const input = [...document.querySelectorAll("input")]
+    .find((element) => visible(element) && ((element.type || "").toLowerCase() === "email" || element.name === "email" || element.id === "email"));
+  if (!input) throw new Error("email_input_missing");
+  setValue(input, email);
+  await sleep(300);
+  const buttons = [...document.querySelectorAll("button,input[type=submit]")].filter(visible);
+  const submit = buttons.find((element) => (element.innerText || element.value || "").trim() === "继续")
+    || buttons.find((element) => (element.innerText || element.value || "").trim().toLowerCase() === "continue")
+    || buttons.find((element) => String(element.type || "").toLowerCase() === "submit");
+  if (!submit) throw new Error("email_submit_missing");
+  submit.click();
+  await sleep(2500);
+  const codeLogin = [...document.querySelectorAll("button,a,[role=button]")].filter(visible)
+    .find((element) => {{
+      const text = (element.innerText || element.textContent || element.value || element.getAttribute("aria-label") || "").trim().toLowerCase();
+      return text.includes("one-time code") || text.includes("one time code") || text.includes("verification code")
+        || text.includes("一次性") || text.includes("验证码") || text.includes("驗證碼");
+    }});
+  if (codeLogin) {{
+    codeLogin.click();
+    await sleep(1500);
+  }}
+  return JSON.stringify({{ url: location.href, title: document.title }});
+}})()
+"""
+
+
+DEVTOOLS_CLICK_ONE_TIME_CODE_JS = r"""
+(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  };
+  const textOf = (element) => (element.innerText || element.textContent || element.value || element.getAttribute("aria-label") || "")
+    .trim().replace(/\s+/g, " ").toLowerCase();
+  const target = [...document.querySelectorAll("button,a,[role=button],input[type=button],input[type=submit]")]
+    .filter(visible)
+    .find((element) => {
+      const text = textOf(element);
+      return text.includes("one-time code") || text.includes("one time code") || text.includes("verification code")
+        || text.includes("一次性") || text.includes("验证码") || text.includes("驗證碼");
+    });
+  if (!target) throw new Error("one_time_code_button_missing");
+  target.scrollIntoView({ block: "center", inline: "center" });
+  target.click();
+  await sleep(1500);
+  return JSON.stringify({ url: location.href, title: document.title });
+})()
+"""
+
+
+def _devtools_submit_code_js(code: str) -> str:
+    return f"""
+(async () => {{
+  const code = {json.dumps(code)};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => {{
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  }};
+  const setValue = (element, value) => {{
+    element.focus();
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value")
+      || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+    if (descriptor && descriptor.set) descriptor.set.call(element, value);
+    else element.value = value;
+    element.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: value }}));
+    element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  }};
+  const input = [...document.querySelectorAll("input")]
+    .find((element) => visible(element) && (element.name === "code" || /code/i.test(element.id || "")
+      || /code/i.test(element.autocomplete || "") || (element.placeholder || "").includes("验证码") || element.maxLength === 6));
+  if (!input) throw new Error("code_input_missing");
+  setValue(input, code);
+  await sleep(300);
+  const buttons = [...document.querySelectorAll("button,input[type=submit]")].filter(visible);
+  const submit = buttons.find((element) => (element.innerText || element.value || "").trim() === "继续")
+    || buttons.find((element) => (element.innerText || element.value || "").trim().toLowerCase() === "continue")
+    || buttons.find((element) => String(element.type || "").toLowerCase() === "submit");
+  if (!submit) throw new Error("code_submit_missing");
+  submit.click();
+  await sleep(1000);
+  return JSON.stringify({{ url: location.href, title: document.title }});
+}})()
+"""
+
+
+def _devtools_submit_profile_js(name: str, birthdate: str) -> str:
+    year, month, day = birthdate.split("-")
+    return f"""
+(async () => {{
+  const profileName = {json.dumps(name)};
+  const birthdate = {json.dumps(birthdate)};
+  const year = {json.dumps(year)};
+  const month = {json.dumps(month)};
+  const day = {json.dumps(day)};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => !!element && !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+  const setValue = (element, value) => {{
+    element.focus();
+    const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), "value")
+      || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+    if (descriptor && descriptor.set) descriptor.set.call(element, value);
+    else element.value = value;
+    element.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: value }}));
+    element.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  }};
+  const inputs = [...document.querySelectorAll("input")].filter(visible);
+  const nameInput = inputs.find((element) => element.name === "name" || element.name === "fullName"
+    || element.autocomplete === "name" || /full name|姓名/i.test(element.placeholder || element.getAttribute("aria-label") || ""));
+  if (nameInput) setValue(nameInput, profileName);
+  const birthInput = inputs.find((element) => element.type === "date" || /birth|birthday/i.test(element.name || element.id || ""));
+  if (birthInput) {{
+    setValue(birthInput, birthdate);
+  }} else {{
+    const numeric = inputs.filter((element) => (element.inputMode || "").toLowerCase() === "numeric" && element.maxLength !== 6);
+    const findPart = (pattern) => numeric.find((element) => pattern.test(`${{element.name}} ${{element.id}} ${{element.placeholder}} ${{element.getAttribute("aria-label") || ""}}`));
+    const monthInput = findPart(/month|月份/i) || numeric[0];
+    const dayInput = findPart(/day|日期|日/i) || numeric[1];
+    const yearInput = findPart(/year|年份|年/i) || numeric[2];
+    if (monthInput && dayInput && yearInput) {{
+      setValue(monthInput, month);
+      setValue(dayInput, day);
+      setValue(yearInput, year);
+    }}
+  }}
+  await sleep(300);
+  const buttons = [...document.querySelectorAll("button,input[type=submit],[role=button]")].filter(visible);
+  const submit = buttons.find((element) => (element.innerText || element.value || "").trim().toLowerCase() === "continue")
+    || buttons.find((element) => (element.innerText || element.value || "").trim() === "继续")
+    || buttons.find((element) => /agree|accept|confirm|同意|确认/i.test((element.innerText || element.value || "").trim()))
+    || buttons.find((element) => String(element.type || "").toLowerCase() === "submit");
+  if (!submit) throw new Error("profile_submit_missing");
+  submit.click();
+  await sleep(1000);
+  return JSON.stringify({{ url: location.href, title: document.title }});
+}})()
+"""
+
+
+def _devtools_visible_inputs(state: dict[str, Any]) -> list[dict[str, Any]]:
+    inputs = state.get("inputs") if isinstance(state.get("inputs"), list) else []
+    return [item for item in inputs if isinstance(item, dict) and item.get("visible")]
+
+
+def _devtools_is_logged_in(state: dict[str, Any]) -> bool:
+    url = str(state.get("url") or "")
+    body = str(state.get("body") or "")
+    return url.rstrip("/") == CHATGPT_BASE or url.startswith(f"{CHATGPT_BASE}/?") or "Message ChatGPT" in body
+
+
+def _devtools_is_password_page(state: dict[str, Any]) -> bool:
+    url = str(state.get("url") or "")
+    body = str(state.get("body") or "")
+    title = str(state.get("title") or "")
+    return (
+        "/log-in/password" in url
+        or "Enter your password" in title
+        or "Enter your password" in body
+        or "Log in with a one-time code" in body
+        or "Sign up with a one-time code" in body
+    )
+
+
+def _devtools_is_code_page(state: dict[str, Any]) -> bool:
+    url = str(state.get("url") or "")
+    body = str(state.get("body") or "")
+    has_code_input = any(
+        str(item.get("name") or "").lower() == "code"
+        or "code" in str(item.get("id") or "").lower()
+        or "one-time-code" in str(item.get("autocomplete") or "").lower()
+        or int(item.get("maxLength") or 0) == 6
+        for item in _devtools_visible_inputs(state)
+    )
+    return ("email-verification" in url or "verification" in body.lower() or "检查你的收件箱" in body) and has_code_input
+
+
+def _devtools_is_profile_page(state: dict[str, Any]) -> bool:
+    url = str(state.get("url") or "")
+    body = str(state.get("body") or "").lower()
+    return "/about-you" in url or ("full name" in body and ("birthday" in body or "date of birth" in body))
 
 
 class BrowserRegistrationError(RuntimeError):
@@ -475,6 +715,222 @@ class BrowserRegistrar:
                     }
             page.wait_for_timeout(1_000)
         raise BrowserRegistrationError(f"browser_session_token_missing:http_{last_status or 'unknown'}")
+
+    def _devtools_timeout(self, limit: float = BROWSER_NAVIGATION_TIMEOUT_MS / 1000) -> float:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise BrowserRegistrationError("browser_task_timeout")
+        return max(1.0, min(float(limit), remaining))
+
+    def _devtools_state(self, port: int) -> dict[str, Any]:
+        state = browser_devtools.evaluate_json(
+            port,
+            DEVTOOLS_STATE_JS,
+            timeout=self._devtools_timeout(20),
+            hosts=("chatgpt.com", "auth.openai.com"),
+        )
+        title = str(state.get("title") or "")
+        body = str(state.get("body") or "")
+        haystack = f"{title}\n{body}".lower()
+        if any(marker in haystack for marker in BROWSER_CHALLENGE_MARKERS):
+            raise BrowserRegistrationError("browser_interactive_challenge")
+        terminal_markers = {
+            "account_deactivated": "account_deactivated",
+            "deleted or deactivated": "account_deleted_or_deactivated",
+            "account has been deleted": "account_deleted_or_deactivated",
+            "account is disabled": "account_disabled",
+        }
+        for marker, reason in terminal_markers.items():
+            if marker in haystack:
+                raise BrowserRegistrationError(f"terminal_auth_error:{reason}")
+        return state
+
+    @staticmethod
+    def _devtools_state_summary(state: dict[str, Any]) -> str:
+        path = urlparse(str(state.get("url") or "")).path or "/"
+        inputs = [
+            "{" + ",".join(filter(None, (
+                f"type={str(item.get('type') or '')[:20]}" if item.get("type") else "",
+                f"name={str(item.get('name') or '')[:30]}" if item.get("name") else "",
+                f"autocomplete={str(item.get('autocomplete') or '')[:30]}" if item.get("autocomplete") else "",
+                f"maxlength={item.get('maxLength')}" if item.get("maxLength") not in (None, -1) else "",
+            ))) + "}"
+            for item in _devtools_visible_inputs(state)[:8]
+        ]
+        buttons = state.get("buttons") if isinstance(state.get("buttons"), list) else []
+        safe_buttons = [
+            "{" + ",".join(filter(None, (
+                f"type={str(item.get('type') or '')[:20]}" if item.get("type") else "",
+                f"text={re.sub(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', '***', ' '.join(str(item.get('text') or '').split()), flags=re.I)[:40]}" if item.get("text") else "",
+            ))) + "}"
+            for item in buttons[:8]
+            if isinstance(item, dict)
+        ]
+        return f"path={path[:120]} inputs=[{','.join(inputs)}] buttons=[{','.join(safe_buttons)}]"[:800]
+
+    def _launch_devtools_browser(self, profile_dir: Path, index: int) -> tuple[subprocess.Popen[Any], int]:
+        executable = browser_devtools.find_browser_executable()
+        port = browser_devtools.free_local_port()
+        profile = proxy_settings.get_profile(proxy=str(config.get("proxy") or ""), upstream=True)
+        proxy_url = str(profile.proxy_url or "").strip()
+        step(index, f"浏览器网络 proxy={profile.proxy_source} engine=chrome-devtools clearance=disabled")
+        command = [
+            executable,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+            "--remote-allow-origins=*",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-quic",
+            "--disable-features=UseDnsHttpsSvcb,AsyncDns",
+            "--window-size=1365,768",
+            "--new-window",
+        ]
+        if _playwright_headless():
+            command.extend(["--headless=new", "--disable-gpu"])
+        if proxy_url:
+            command.append(f"--proxy-server={browser_devtools.browser_proxy_arg(proxy_url)}")
+        command.append(CHATGPT_LOGIN_URL)
+        process_options: dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            process_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = subprocess.Popen(command, **process_options)
+        browser_devtools.wait_for_devtools(port, self._devtools_timeout(30))
+        return process, port
+
+    def _devtools_access_token(self, port: int) -> str:
+        last_status = "empty"
+        for _ in range(10):
+            text = browser_devtools.response_body_for_request(
+                port,
+                CHATGPT_SESSION_URL,
+                timeout=self._devtools_timeout(20),
+                hosts=("chatgpt.com",),
+            )
+            try:
+                payload = json.loads(text)
+            except Exception:
+                payload = None
+                last_status = "invalid_json"
+            access_token = self._find_access_token(payload)
+            if access_token:
+                return access_token
+            time.sleep(1)
+        raise BrowserRegistrationError(f"browser_session_token_missing:{last_status}")
+
+    def _run_devtools_registration(
+        self,
+        mailbox: dict,
+        email: str,
+        name: str,
+        birthdate: str,
+        index: int,
+    ) -> dict[str, str]:
+        process: subprocess.Popen[Any] | None = None
+        port = 0
+        with tempfile.TemporaryDirectory(prefix="chatgpt2api-browser-") as profile_dir:
+            try:
+                process, port = self._launch_devtools_browser(Path(profile_dir), index)
+                state_reader = lambda: self._devtools_state(port)
+                step(index, "浏览器等待 ChatGPT 登录页")
+                browser_devtools.wait_for(
+                    state_reader,
+                    lambda state: (
+                        "chatgpt.com/auth/login" in str(state.get("url") or "")
+                        and any(str(item.get("type") or "").lower() == "email" for item in _devtools_visible_inputs(state))
+                    ),
+                    timeout=self._devtools_timeout(),
+                )
+
+                step(index, "浏览器重复提交邮箱，直到页面状态改变")
+                state = browser_devtools.submit_until(
+                    lambda: browser_devtools.evaluate_json(
+                        port,
+                        _devtools_submit_email_js(email),
+                        timeout=self._devtools_timeout(),
+                        hosts=("chatgpt.com", "auth.openai.com"),
+                    ),
+                    state_reader,
+                    lambda item: _devtools_is_code_page(item) or _devtools_is_logged_in(item) or _devtools_is_password_page(item),
+                    timeout=self._devtools_timeout(),
+                )
+                step(index, f"浏览器邮箱状态已改变 {self._devtools_state_summary(state)}")
+
+                if _devtools_is_password_page(state):
+                    step(index, "浏览器重复切换一次性验证码，直到验证码页出现")
+                    state = browser_devtools.submit_until(
+                        lambda: browser_devtools.evaluate_json(
+                            port,
+                            DEVTOOLS_CLICK_ONE_TIME_CODE_JS,
+                            timeout=self._devtools_timeout(),
+                            hosts=("auth.openai.com", "chatgpt.com"),
+                        ),
+                        state_reader,
+                        lambda item: _devtools_is_code_page(item) or _devtools_is_logged_in(item),
+                        timeout=self._devtools_timeout(),
+                    )
+                    step(index, f"浏览器验证码入口状态已改变 {self._devtools_state_summary(state)}")
+
+                if not _devtools_is_logged_in(state):
+                    if not _devtools_is_code_page(state):
+                        raise BrowserRegistrationError(
+                            f"browser_unexpected_state_after_email:{self._devtools_state_summary(state)}"
+                        )
+                    code = self._wait_for_otp(mailbox, index)
+                    step(index, "浏览器重复提交验证码，直到进入资料页或登录完成")
+                    state = browser_devtools.submit_until(
+                        lambda: browser_devtools.evaluate_json(
+                            port,
+                            _devtools_submit_code_js(code),
+                            timeout=self._devtools_timeout(),
+                            hosts=("auth.openai.com", "chatgpt.com"),
+                        ),
+                        state_reader,
+                        lambda item: _devtools_is_profile_page(item) or _devtools_is_logged_in(item),
+                        timeout=self._devtools_timeout(),
+                    )
+                    step(index, f"浏览器验证码状态已改变 {self._devtools_state_summary(state)}")
+
+                if _devtools_is_profile_page(state):
+                    step(index, "浏览器重复提交姓名生日，直到登录完成")
+                    state = browser_devtools.submit_until(
+                        lambda: browser_devtools.evaluate_json(
+                            port,
+                            _devtools_submit_profile_js(name, birthdate),
+                            timeout=self._devtools_timeout(),
+                            hosts=("auth.openai.com", "chatgpt.com"),
+                        ),
+                        state_reader,
+                        _devtools_is_logged_in,
+                        timeout=self._devtools_timeout(),
+                    )
+                    step(index, f"浏览器资料状态已改变 {self._devtools_state_summary(state)}")
+
+                if not _devtools_is_logged_in(state):
+                    raise BrowserRegistrationError(f"browser_login_incomplete:{self._devtools_state_summary(state)}")
+                fingerprint_state = browser_devtools.evaluate_json(
+                    port,
+                    'JSON.stringify({userAgent: navigator.userAgent})',
+                    timeout=self._devtools_timeout(10),
+                    hosts=("chatgpt.com",),
+                )
+                actual_user_agent = str(fingerprint_state.get("userAgent") or "").strip()
+                if actual_user_agent:
+                    self.fingerprint = _align_fingerprint_platform(
+                        _fingerprint_with_user_agent(self.fingerprint, actual_user_agent)
+                    )
+                    self.fingerprint["impersonate"] = "chrome"
+                step(index, "ChatGPT 注册完成，读取浏览器 session token")
+                access_token = self._devtools_access_token(port)
+                return {"access_token": access_token, "refresh_token": "", "id_token": ""}
+            finally:
+                if port:
+                    browser_devtools.close_browser(port, process)
 
     def _wait_for_otp(self, mailbox: dict, index: int, *, login: bool = False) -> str:
         mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
@@ -900,7 +1356,6 @@ class BrowserRegistrar:
         status = browser_runtime_status()
         if not status["browser_available"]:
             raise BrowserRegistrationError("browser_runtime_unavailable")
-        from playwright.sync_api import sync_playwright
 
         mailbox = mail_provider.create_mailbox(_mail_config())
         email = str(mailbox.get("address") or "").strip()
@@ -914,71 +1369,8 @@ class BrowserRegistrar:
         self._deadline = time.monotonic() + BROWSER_TASK_TIMEOUT_SECONDS
         step(index, "浏览器注册任务启动")
         try:
-            clearance_bundle = self._load_clearance(index)
-            with sync_playwright() as playwright:
-                executable = str(os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or "").strip() or None
-                browser = playwright.chromium.launch(
-                    executable_path=executable,
-                    headless=_playwright_headless(),
-                    proxy=_playwright_proxy(),
-                    args=["--disable-dev-shm-usage"],
-                )
-                try:
-                    use_clearance_identity = bool(
-                        clearance_bundle is not None
-                        and clearance_bundle.cookies
-                        and clearance_bundle.user_agent
-                    )
-                    if use_clearance_identity:
-                        self.fingerprint = _align_fingerprint_platform(
-                            _fingerprint_with_user_agent(
-                                self.fingerprint,
-                                clearance_bundle.user_agent,
-                            )
-                        )
-                    context_options: dict[str, Any] = {
-                        "locale": self.fingerprint["accept_language"].split(",", 1)[0],
-                        "viewport": {"width": 1365, "height": 768},
-                        "ignore_https_errors": True,
-                        "extra_http_headers": {
-                            "Accept-Language": self.fingerprint["accept_language"],
-                            "OAI-Device-Id": self.fingerprint["device_id"],
-                        },
-                    }
-                    if use_clearance_identity:
-                        context_options["user_agent"] = self.fingerprint["user_agent"]
-                        context_options["extra_http_headers"].update({
-                            "Sec-Ch-Ua": self.fingerprint["sec_ch_ua"],
-                            "Sec-Ch-Ua-Mobile": self.fingerprint["sec_ch_ua_mobile"],
-                            "Sec-Ch-Ua-Platform": self.fingerprint["sec_ch_ua_platform"],
-                        })
-                    context = browser.new_context(**context_options)
-                    context.set_default_timeout(BROWSER_NAVIGATION_TIMEOUT_MS)
-                    context.add_cookies(_browser_auth_cookies(clearance_bundle, self.fingerprint["device_id"]))
-                    context.on("request", lambda request: self._capture_callback(request.url))
-                    page = context.new_page()
-                    page.on("response", self._record_auth_response)
-                    page.on("framenavigated", lambda frame: self._capture_callback(frame.url))
-                    page.goto(self._registration_url(), wait_until="domcontentloaded", timeout=self._remaining_ms())
-                    if not use_clearance_identity:
-                        actual_user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip()
-                        if actual_user_agent:
-                            self.fingerprint = _align_fingerprint_platform(
-                                _fingerprint_with_user_agent(self.fingerprint, actual_user_agent)
-                            )
-                            self.fingerprint["impersonate"] = "chrome"
-                    password = self._run_authorization_with_restarts(
-                        page,
-                        mailbox,
-                        email,
-                        password,
-                        name,
-                        birthdate,
-                        index,
-                    )
-                    tokens = self._chatgpt_session_tokens(page, index)
-                finally:
-                    browser.close()
+            tokens = self._run_devtools_registration(mailbox, email, name, birthdate, index)
+            password = ""
         except BrowserRegistrationError as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
