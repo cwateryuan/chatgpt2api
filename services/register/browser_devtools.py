@@ -236,6 +236,14 @@ def response_body_for_request(port: int, url: str, *, timeout: float, hosts: tup
     return str((((result.get("result") or {}) if isinstance(result, dict) else {}).get("value") or ""))
 
 
+def get_all_cookies(port: int, *, timeout: float, hosts: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    with DevToolsSocket(page_websocket(port, hosts), timeout) as devtools:
+        devtools.call("Network.enable")
+        result = devtools.call("Network.getAllCookies", timeout=timeout)
+    cookies = result.get("cookies") if isinstance(result, dict) else []
+    return [item for item in cookies if isinstance(item, dict)] if isinstance(cookies, list) else []
+
+
 def navigate_to(port: int, url: str, timeout: float) -> None:
     with DevToolsSocket(page_websocket(port), timeout) as devtools:
         devtools.call("Page.enable")

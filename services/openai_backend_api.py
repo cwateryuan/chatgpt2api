@@ -180,6 +180,9 @@ class OpenAIBackendAPI:
         self.user_agent = self.fp["user_agent"]
         self.device_id = self.fp["device_id"]
         self.session_id = self.fp["session_id"]
+        self.timezone = str(self.fp.get("timezone") or "Asia/Shanghai")
+        self.timezone_offset_min = self._fp_int("timezone_offset_min", -480)
+        self.language = str(self.fp.get("language") or self.fp["accept_language"].split(",", 1)[0] or "zh-CN")
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
@@ -205,10 +208,24 @@ class OpenAIBackendAPI:
             "Sec-Fetch-Site": "same-origin",
             "OAI-Device-Id": self.device_id,
             "OAI-Session-Id": self.session_id,
-            "OAI-Language": "zh-CN",
+            "OAI-Language": self.language,
             "OAI-Client-Version": self.client_version,
             "OAI-Client-Build-Number": self.client_build_number,
         })
+        optional_client_hints = {
+            "Sec-Ch-Ua-Arch": self.fp.get("architecture"),
+            "Sec-Ch-Ua-Bitness": self.fp.get("bitness"),
+            "Sec-Ch-Ua-Model": self.fp.get("model"),
+            "Sec-Ch-Ua-Platform-Version": self.fp.get("platform_version"),
+        }
+        for header, value in optional_client_hints.items():
+            text = str(value or "").strip()
+            if text:
+                self.session.headers[header] = f'"{text}"'
+        try:
+            self.session.cookies.set("oai-did", self.device_id, domain=".chatgpt.com", path="/")
+        except Exception:
+            pass
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
@@ -228,6 +245,32 @@ class OpenAIBackendAPI:
         if self.access_token:
             return account_service.get_or_create_fingerprint(self.access_token)
         return account_fingerprint(self.account)
+
+    def _fp_int(self, key: str, default: int) -> int:
+        try:
+            return int(float(str(self.fp.get(key) or default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _fp_float(self, key: str, default: float) -> float:
+        try:
+            return float(str(self.fp.get(key) or default))
+        except (TypeError, ValueError):
+            return default
+
+    def _client_contextual_info(self, *, time_since_loaded: int, app_name: bool = False) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "is_dark_mode": False,
+            "time_since_loaded": time_since_loaded,
+            "page_height": self._fp_int("page_height", 900),
+            "page_width": self._fp_int("page_width", 1400),
+            "pixel_ratio": self._fp_float("pixel_ratio", 2.0),
+            "screen_height": self._fp_int("screen_height", 1440),
+            "screen_width": self._fp_int("screen_width", 2560),
+        }
+        if app_name:
+            context["app_name"] = "chatgpt.com"
+        return context
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
@@ -266,7 +309,7 @@ class OpenAIBackendAPI:
                 "gizmo_id": None,
                 "requested_default_model": None,
                 "conversation_id": None,
-                "timezone_offset_min": -480,
+                "timezone_offset_min": self.timezone_offset_min,
             },
             timeout=_timeout(20, deadline),
         )
@@ -276,7 +319,7 @@ class OpenAIBackendAPI:
 
     def _get_default_account(self, deadline: ImageRequestDeadline | None = None) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
+        response = self.session.get(self.base_url + path + f"?timezone_offset_min={self.timezone_offset_min}", headers=self._headers(path),
                                     timeout=_timeout(20, deadline))
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -516,19 +559,11 @@ class OpenAIBackendAPI:
             "suggestions": [],
             "supported_encodings": [],
             "system_hints": [],
-            "timezone": timezone,
-            "timezone_offset_min": -480,
+            "timezone": self.timezone or timezone,
+            "timezone_offset_min": self.timezone_offset_min,
             "variant_purpose": "comparison_implicit",
             "websocket_request_id": new_uuid(),
-            "client_contextual_info": {
-                "is_dark_mode": False,
-                "time_since_loaded": 120,
-                "page_height": 900,
-                "page_width": 1400,
-                "pixel_ratio": 2,
-                "screen_height": 1440,
-                "screen_width": 2560,
-            },
+            "client_contextual_info": self._client_contextual_info(time_since_loaded=120),
         }
 
     def _image_model_slug(self, model: str) -> str:
@@ -842,8 +877,8 @@ class OpenAIBackendAPI:
             "parent_message_id": new_uuid(),
             "model": self._image_model_slug(model),
             "client_prepare_state": "success",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": self.timezone_offset_min,
+            "timezone": self.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "system_hints": ["picture_v2"],
             "partial_query": {
@@ -853,7 +888,7 @@ class OpenAIBackendAPI:
             },
             "supports_buffering": True,
             "supported_encodings": ["v1"],
-            "client_contextual_info": {"app_name": "chatgpt.com"},
+            "client_contextual_info": self._client_contextual_info(time_since_loaded=120, app_name=True),
         }
         response = self.session.post(
             self.base_url + path,
@@ -992,23 +1027,14 @@ class OpenAIBackendAPI:
             "parent_message_id": new_uuid(),
             "model": self._image_model_slug(model),
             "client_prepare_state": "sent",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": self.timezone_offset_min,
+            "timezone": self.timezone,
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
             "system_hints": ["picture_v2"],
             "supports_buffering": True,
             "supported_encodings": ["v1"],
-            "client_contextual_info": {
-                "is_dark_mode": False,
-                "time_since_loaded": 1200,
-                "page_height": 1072,
-                "page_width": 1724,
-                "pixel_ratio": 1.2,
-                "screen_height": 1440,
-                "screen_width": 2560,
-                "app_name": "chatgpt.com",
-            },
+            "client_contextual_info": self._client_contextual_info(time_since_loaded=1200, app_name=True),
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }

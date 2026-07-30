@@ -99,6 +99,62 @@ JSON.stringify({
 """
 
 
+DEVTOOLS_FINGERPRINT_JS = r"""
+(async () => {
+  const userAgentData = navigator.userAgentData || null;
+  let highEntropy = {};
+  if (userAgentData && userAgentData.getHighEntropyValues) {
+    try {
+      highEntropy = await userAgentData.getHighEntropyValues([
+        "architecture", "bitness", "fullVersionList", "model", "platformVersion", "uaFullVersion"
+      ]);
+    } catch (_) {}
+  }
+  const storage = {};
+  for (const storageName of ["localStorage", "sessionStorage"]) {
+    try {
+      const source = window[storageName];
+      for (let index = 0; index < source.length; index += 1) {
+        const key = source.key(index);
+        if (key) storage[key] = source.getItem(key) || "";
+      }
+    } catch (_) {}
+  }
+  const storedUuid = (pattern) => {
+    for (const [key, value] of Object.entries(storage)) {
+      if (pattern.test(key) && /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(value)) return value;
+    }
+    return "";
+  };
+  return JSON.stringify({
+    user_agent: navigator.userAgent || "",
+    platform: (userAgentData && userAgentData.platform) || navigator.platform || "",
+    mobile: !!(userAgentData && userAgentData.mobile),
+    brands: (userAgentData && userAgentData.brands) || [],
+    full_version_list: highEntropy.fullVersionList || [],
+    ua_full_version: highEntropy.uaFullVersion || "",
+    platform_version: highEntropy.platformVersion || "",
+    architecture: highEntropy.architecture || "",
+    bitness: highEntropy.bitness || "",
+    model: highEntropy.model || "",
+    language: navigator.language || "",
+    languages: navigator.languages || [],
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+    timezone_offset_min: new Date().getTimezoneOffset(),
+    screen_width: screen.width || 0,
+    screen_height: screen.height || 0,
+    page_width: innerWidth || 0,
+    page_height: innerHeight || 0,
+    pixel_ratio: devicePixelRatio || 1,
+    hardware_concurrency: navigator.hardwareConcurrency || 0,
+    device_memory: navigator.deviceMemory || 0,
+    stored_device_id: storedUuid(/device|oai.did/i),
+    stored_session_id: storedUuid(/session/i)
+  });
+})()
+"""
+
+
 def _devtools_submit_email_js(email: str) -> str:
     return f"""
 (async () => {{
@@ -442,6 +498,7 @@ class BrowserRegistrar:
         self._deadline = 0.0
         self._auth_responses: list[str] = []
         self._clearance_bundle: ClearanceBundle | None = None
+        self.registration_proxy_url = ""
 
     def _load_clearance(self, index: int, *, force: bool = True) -> ClearanceBundle | None:
         proxy = str(config.get("proxy") or "")
@@ -784,6 +841,7 @@ class BrowserRegistrar:
         proxy_url = str(profile.proxy_url or "").strip()
         if not proxy_url:
             raise BrowserRegistrationError("browser_registration_proxy_missing")
+        self.registration_proxy_url = proxy_url
         step(
             index,
             f"浏览器网络 proxy={profile.proxy_source} proxy_server=yes "
@@ -837,6 +895,115 @@ class BrowserRegistrar:
                 return access_token
             time.sleep(1)
         raise BrowserRegistrationError(f"browser_session_token_missing:{last_status}")
+
+    @staticmethod
+    def _client_hint_brands(items: object) -> str:
+        if not isinstance(items, list):
+            return ""
+        values: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            brand = str(item.get("brand") or "").replace("\\", "\\\\").replace('"', '\\"').strip()
+            version = str(item.get("version") or "").replace("\\", "\\\\").replace('"', '\\"').strip()
+            if brand and version:
+                values.append(f'"{brand}";v="{version}"')
+        return ", ".join(values)
+
+    @staticmethod
+    def _browser_accept_language(snapshot: dict[str, Any]) -> str:
+        raw_languages = snapshot.get("languages")
+        languages = [str(item or "").strip() for item in raw_languages] if isinstance(raw_languages, list) else []
+        languages = [item for item in languages if item]
+        if not languages:
+            language = str(snapshot.get("language") or "").strip()
+            languages = [language] if language else []
+        if not languages:
+            return ""
+        parts = [languages[0]]
+        for index, language in enumerate(languages[1:5], start=1):
+            parts.append(f"{language};q={max(0.5, 1.0 - index * 0.1):.1f}")
+        return ",".join(parts)
+
+    def _capture_devtools_fingerprint(self, port: int, index: int) -> None:
+        snapshot = browser_devtools.evaluate_json(
+            port,
+            DEVTOOLS_FINGERPRINT_JS,
+            timeout=self._devtools_timeout(15),
+            hosts=("chatgpt.com",),
+        )
+        actual_user_agent = str(snapshot.get("user_agent") or "").strip()
+        if actual_user_agent:
+            self.fingerprint = _align_fingerprint_platform(
+                _fingerprint_with_user_agent(self.fingerprint, actual_user_agent)
+            )
+
+        updates: dict[str, str] = {}
+        accept_language = self._browser_accept_language(snapshot)
+        if accept_language:
+            updates["accept_language"] = accept_language
+        language = str(snapshot.get("language") or "").strip()
+        if language:
+            updates["language"] = language
+        timezone_name = str(snapshot.get("timezone") or "").strip()
+        if timezone_name:
+            updates["timezone"] = timezone_name
+        platform = str(snapshot.get("platform") or "").strip()
+        if platform:
+            updates["sec_ch_ua_platform"] = f'"{platform}"'
+        brands = self._client_hint_brands(snapshot.get("brands"))
+        if brands:
+            updates["sec_ch_ua"] = brands
+        full_version_list = self._client_hint_brands(snapshot.get("full_version_list"))
+        if full_version_list:
+            updates["sec_ch_ua_full_version_list"] = full_version_list
+        for source_key, target_key in (
+            ("platform_version", "platform_version"),
+            ("architecture", "architecture"),
+            ("bitness", "bitness"),
+            ("model", "model"),
+            ("timezone_offset_min", "timezone_offset_min"),
+            ("screen_width", "screen_width"),
+            ("screen_height", "screen_height"),
+            ("page_width", "page_width"),
+            ("page_height", "page_height"),
+            ("pixel_ratio", "pixel_ratio"),
+            ("hardware_concurrency", "hardware_concurrency"),
+            ("device_memory", "device_memory"),
+        ):
+            value = str(snapshot.get(source_key) if snapshot.get(source_key) is not None else "").strip()
+            if value:
+                updates[target_key] = value
+        updates["sec_ch_ua_mobile"] = "?1" if bool(snapshot.get("mobile")) else "?0"
+
+        stored_device_id = str(snapshot.get("stored_device_id") or "").strip()
+        stored_session_id = str(snapshot.get("stored_session_id") or "").strip()
+        try:
+            cookies = browser_devtools.get_all_cookies(
+                port,
+                timeout=self._devtools_timeout(10),
+                hosts=("chatgpt.com", "auth.openai.com"),
+            )
+        except Exception:
+            cookies = []
+        cookie_device_id = next((
+            str(item.get("value") or "").strip()
+            for item in cookies
+            if str(item.get("name") or "").lower() == "oai-did" and str(item.get("value") or "").strip()
+        ), "")
+        if cookie_device_id or stored_device_id:
+            updates["device_id"] = cookie_device_id or stored_device_id
+        if stored_session_id:
+            updates["session_id"] = stored_session_id
+
+        self.fingerprint.update(updates)
+        major = str(self.fingerprint.get("major") or "")
+        self.fingerprint["impersonate"] = f"chrome{major}" if major in {"131", "136", "142", "145", "146"} else "chrome"
+        step(
+            index,
+            f"浏览器身份快照已保存 device_id={'browser' if cookie_device_id or stored_device_id else 'generated'} "
+            f"timezone={'yes' if timezone_name else 'no'} screen={'yes' if updates.get('screen_width') else 'no'}",
+        )
 
     def _run_devtools_registration(
         self,
@@ -928,18 +1095,7 @@ class BrowserRegistrar:
 
                 if not _devtools_is_logged_in(state):
                     raise BrowserRegistrationError(f"browser_login_incomplete:{self._devtools_state_summary(state)}")
-                fingerprint_state = browser_devtools.evaluate_json(
-                    port,
-                    'JSON.stringify({userAgent: navigator.userAgent})',
-                    timeout=self._devtools_timeout(10),
-                    hosts=("chatgpt.com",),
-                )
-                actual_user_agent = str(fingerprint_state.get("userAgent") or "").strip()
-                if actual_user_agent:
-                    self.fingerprint = _align_fingerprint_platform(
-                        _fingerprint_with_user_agent(self.fingerprint, actual_user_agent)
-                    )
-                    self.fingerprint["impersonate"] = "chrome"
+                self._capture_devtools_fingerprint(port, index)
                 step(index, "ChatGPT 注册完成，读取浏览器 session token")
                 access_token = self._devtools_access_token(port)
                 return {"access_token": access_token, "refresh_token": "", "id_token": ""}
@@ -1401,6 +1557,7 @@ class BrowserRegistrar:
             **tokens,
             "source_type": "microsoft" if not password else "web",
             "registration_engine": "browser",
+            "proxy": self.registration_proxy_url,
             "fp": dict(self.fingerprint),
             "status": "正常",
             "quota": 0,

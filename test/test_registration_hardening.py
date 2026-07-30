@@ -25,6 +25,7 @@ class FakeSession:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.headers: dict[str, str] = {}
+        self.cookies = mock.Mock()
 
     def close(self):
         return None
@@ -93,9 +94,18 @@ class RegistrationHardeningTests(unittest.TestCase):
             "sec_ch_ua": '"Chromium";v="136"',
             "sec_ch_ua_mobile": "?0",
             "sec_ch_ua_platform": '"Windows"',
+            "language": "en-US",
+            "timezone": "UTC",
+            "timezone_offset_min": "0",
+            "screen_width": "1365",
+            "screen_height": "768",
+            "page_width": "1280",
+            "page_height": "681",
+            "pixel_ratio": "1",
         }
+        account = {"fp": fp, "proxy": "http://privoxy:8118"}
         with (
-            mock.patch("services.openai_backend_api.account_service.get_account", return_value={"fp": fp}),
+            mock.patch("services.openai_backend_api.account_service.get_account", return_value=account),
             mock.patch("services.openai_backend_api.account_service.get_or_create_fingerprint", return_value=fp),
             mock.patch("services.openai_backend_api.proxy_settings.build_session_kwargs", return_value={}) as build,
             mock.patch("services.openai_backend_api.requests.Session", FakeSession),
@@ -105,7 +115,15 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertEqual(build.call_args.kwargs["impersonate"], "chrome136")
         self.assertEqual(backend.session.headers["User-Agent"], "Stable UA")
         self.assertEqual(backend.session.headers["OAI-Device-Id"], "device-1")
+        self.assertEqual(backend.session.headers["OAI-Language"], "en-US")
         self.assertNotIn("Sec-Ch-Ua-Full-Version-List", backend.session.headers)
+        self.assertEqual(build.call_args.kwargs["account"]["proxy"], "http://privoxy:8118")
+        backend.session.cookies.set.assert_called_once_with("oai-did", "device-1", domain=".chatgpt.com", path="/")
+        payload = backend._conversation_payload([], "auto", "Asia/Shanghai")
+        self.assertEqual(payload["timezone"], "UTC")
+        self.assertEqual(payload["timezone_offset_min"], 0)
+        self.assertEqual(payload["client_contextual_info"]["screen_width"], 1365)
+        self.assertEqual(payload["client_contextual_info"]["page_height"], 681)
 
     def test_oauth_refresh_persists_and_reuses_account_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,7 +388,26 @@ class RegistrationHardeningTests(unittest.TestCase):
             mock.patch.object(
                 browser_register.browser_devtools,
                 "evaluate_json",
-                return_value={"userAgent": "Mozilla/5.0 Chrome/136.0.0.0"},
+                return_value={
+                    "user_agent": "Mozilla/5.0 Chrome/136.0.0.0",
+                    "platform": "Linux",
+                    "mobile": False,
+                    "brands": [{"brand": "Chromium", "version": "136"}],
+                    "languages": ["en-US", "en"],
+                    "language": "en-US",
+                    "timezone": "UTC",
+                    "timezone_offset_min": 0,
+                    "screen_width": 1365,
+                    "screen_height": 768,
+                    "page_width": 1365,
+                    "page_height": 681,
+                    "pixel_ratio": 1,
+                },
+            ),
+            mock.patch.object(
+                browser_register.browser_devtools,
+                "get_all_cookies",
+                return_value=[{"name": "oai-did", "value": "browser-device-id"}],
             ),
             mock.patch.object(
                 browser_register.browser_devtools,
@@ -393,6 +430,9 @@ class RegistrationHardeningTests(unittest.TestCase):
         wait_for_otp.assert_called_once()
         close_browser.assert_called_once_with(12345, process)
         self.assertIn("Chrome/136", registrar.fingerprint["user_agent"])
+        self.assertEqual(registrar.fingerprint["device_id"], "browser-device-id")
+        self.assertEqual(registrar.fingerprint["timezone"], "UTC")
+        self.assertEqual(registrar.fingerprint["screen_width"], "1365")
 
     def test_browser_devtools_actions_use_native_input_events(self):
         email_script = browser_register._devtools_submit_email_js("same@example.com")
@@ -425,6 +465,7 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertIs(launched_process, process)
         self.assertEqual(port, 12345)
         self.assertIn("--proxy-server=http://privoxy:8118", popen.call_args.args[0])
+        self.assertEqual(registrar.registration_proxy_url, "http://privoxy:8118")
 
         missing_profile = SimpleNamespace(proxy_url="", proxy_source="none")
         with (
