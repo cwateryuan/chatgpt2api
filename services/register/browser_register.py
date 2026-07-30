@@ -33,6 +33,7 @@ from services.register.openai_register import (
 BROWSER_NAVIGATION_TIMEOUT_MS = 45_000
 BROWSER_TASK_TIMEOUT_SECONDS = 300
 BROWSER_ERROR_RETRY_LIMIT = 2
+BROWSER_ONE_TIME_CODE_RETRY_LIMIT = 3
 BROWSER_ONE_TIME_CODE_SELECTORS = (
     'button:has-text("one-time code")',
     'a:has-text("one-time code")',
@@ -405,6 +406,68 @@ class BrowserRegistrar:
             raise BrowserRegistrationError("browser_otp_timeout")
         return code
 
+    def _switch_to_one_time_code(self, page, index: int, *, login: bool) -> None:
+        original_url = str(page.url or "")
+        otp_selectors = (
+            'input[autocomplete="one-time-code"]',
+            'input[name="code"]',
+            'input[name="otp"]',
+            'input[name="otpCode"]',
+            'input[data-testid*="otp" i]',
+            'input[aria-label*="digit" i]',
+            'input[inputmode="numeric"]',
+            'input[maxlength="1"]',
+        )
+        for attempt in range(1, BROWSER_ONE_TIME_CODE_RETRY_LIMIT + 1):
+            action = "登录" if login else "注册"
+            step(index, f"浏览器切换一次性验证码{action} attempt={attempt}/{BROWSER_ONE_TIME_CODE_RETRY_LIMIT}")
+            clicked = page.evaluate(
+                r"""
+                () => {
+                    const visible = (element) => {
+                        if (!element) return false;
+                        const rect = element.getBoundingClientRect();
+                        const style = getComputedStyle(element);
+                        return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+                    };
+                    const textOf = (element) => (element.innerText || element.textContent || element.value || element.getAttribute("aria-label") || "")
+                        .trim().replace(/\s+/g, " ").toLowerCase();
+                    const target = [...document.querySelectorAll("button,a,[role=button],input[type=button],input[type=submit]")]
+                        .filter(visible)
+                        .find((element) => {
+                            const text = textOf(element);
+                            return text.includes("one-time code") || text.includes("one time code") || text.includes("verification code")
+                                || text.includes("一次性") || text.includes("验证码") || text.includes("驗證碼");
+                        });
+                    if (!target) return false;
+                    target.scrollIntoView({block: "center", inline: "center"});
+                    target.click();
+                    return true;
+                }
+                """
+            )
+            if not clicked:
+                break
+            for _ in range(8):
+                page.wait_for_timeout(500)
+                self._capture_callback(page.url)
+                if self.callback_code:
+                    return
+                self._check_challenge(page)
+                if self._editable(page, otp_selectors) is not None:
+                    return
+                if str(page.url or "") != original_url:
+                    return
+                if self._visible(page, BROWSER_ONE_TIME_CODE_SELECTORS) is None:
+                    return
+        path = self._page_path(page)
+        step(
+            index,
+            f"浏览器一次性验证码入口未跳转 path={path} {self._control_summary(page)} {self._error_summary(page)}",
+            "yellow",
+        )
+        raise BrowserRegistrationError(f"browser_one_time_code_transition_timeout:path={path}")
+
     def _handle_existing_outlook(self, page, mailbox: dict, index: int) -> None:
         if str(mailbox.get("provider") or "") != "outlook_token":
             raise BrowserRegistrationError("browser_existing_account_login_unsupported")
@@ -658,13 +721,10 @@ class BrowserRegistrar:
                 is_login = "log-in" in url_lower or "login" in url_lower
                 if is_login and str(mailbox.get("provider") or "") != "outlook_token":
                     raise BrowserRegistrationError("browser_existing_account_login_unsupported")
-                step(index, "浏览器切换一次性验证码登录" if is_login else "浏览器切换一次性验证码注册")
                 mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-                one_time_code_control.click(timeout=self._remaining_ms())
+                self._switch_to_one_time_code(page, index, login=is_login)
                 password = ""
                 password_done = True
-                page.wait_for_timeout(1_500)
-                self._check_challenge(page)
             elif state == "otp":
                 code = self._wait_for_otp(mailbox, index, login=not bool(password))
                 self._fill_otp(page, code)

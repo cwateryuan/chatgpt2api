@@ -205,7 +205,8 @@ class RegistrationHardeningTests(unittest.TestCase):
                     <button onclick="document.body.dataset.passwordSubmitted='yes'">Continue</button>
                     <button onclick="showSignupOtp()">Sign up with a one-time code</button>
                     <script>
-                    function showSignupOtp() { document.body.innerHTML = '<input name="otpCode" autocomplete="one-time-code"><button onclick="showSignupProfile()">Continue</button>'; }
+                    function showSignupOtp() { document.body.dataset.otpClicks = String(Number(document.body.dataset.otpClicks || '0') + 1); setTimeout(renderSignupOtp, 2500); }
+                    function renderSignupOtp() { document.body.innerHTML = '<input name="otpCode" autocomplete="one-time-code"><button onclick="showSignupProfile()">Continue</button>'; }
                     function showSignupProfile() { document.body.innerHTML = '<input name="name"><input name="birthdate" type="date"><button onclick="showSignupConsent()">Continue</button>'; }
                     function showSignupConsent() { document.body.innerHTML = '<button onclick="finishSignup()">Allow</button>'; }
                     function finishSignup() { location.hash = 'otp-signup-done'; }
@@ -230,6 +231,7 @@ class RegistrationHardeningTests(unittest.TestCase):
                 self.assertEqual(otp_password, "")
                 self.assertEqual(otp_registrar.callback_code, "otp-signup-code")
                 self.assertNotEqual(page.locator("body").get_attribute("data-password-submitted"), "yes")
+                self.assertEqual(page.locator("body").get_attribute("data-otp-clicks"), "1")
 
                 page.set_content("""
                     <input name="current-password" type="password" autocomplete="current-password webauthn">
