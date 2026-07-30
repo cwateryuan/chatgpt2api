@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from services.browser_fingerprint import make_fingerprint
-from services.proxy_service import proxy_settings
+from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
 from services.register.openai_register import (
     _generate_pkce,
@@ -135,6 +135,35 @@ def _playwright_headless() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def _browser_auth_cookies(bundle: ClearanceBundle | None, device_id: str) -> list[dict[str, Any]]:
+    parsed = urlparse(auth_base)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    cookies: list[dict[str, Any]] = []
+    if bundle is not None:
+        for name, value in bundle.cookies.items():
+            if name and value:
+                cookies.append({"name": str(name), "value": str(value), "url": base_url})
+    if device_id and not any(item["name"] == "oai-did" for item in cookies):
+        cookies.append({"name": "oai-did", "value": device_id, "url": base_url})
+    return cookies
+
+
+def _align_fingerprint_platform(fingerprint: dict[str, str]) -> dict[str, str]:
+    result = dict(fingerprint)
+    user_agent = str(result.get("user_agent") or "").lower()
+    if "windows" in user_agent:
+        result["sec_ch_ua_platform"] = '"Windows"'
+    elif "android" in user_agent:
+        result["sec_ch_ua_platform"] = '"Android"'
+    elif "iphone" in user_agent or "ipad" in user_agent:
+        result["sec_ch_ua_platform"] = '"iOS"'
+    elif "mac os x" in user_agent or "macintosh" in user_agent:
+        result["sec_ch_ua_platform"] = '"macOS"'
+    elif "linux" in user_agent:
+        result["sec_ch_ua_platform"] = '"Linux"'
+    return result
+
+
 class BrowserRegistrar:
     def __init__(self) -> None:
         self.fingerprint = make_fingerprint()
@@ -142,6 +171,32 @@ class BrowserRegistrar:
         self.callback_code = ""
         self._deadline = 0.0
         self._auth_responses: list[str] = []
+        self._clearance_bundle: ClearanceBundle | None = None
+
+    def _load_clearance(self, index: int, *, force: bool = True) -> ClearanceBundle | None:
+        proxy = str(config.get("proxy") or "")
+        profile = proxy_settings.get_profile(proxy=proxy, upstream=True)
+        clearance_mode = profile.clearance_mode if profile.clearance_enabled else "disabled"
+        step(index, f"浏览器网络 proxy={profile.proxy_source} clearance={clearance_mode}")
+        if not profile.clearance_enabled:
+            return None
+        bundle = proxy_settings.refresh_clearance(
+            target_url=auth_base,
+            proxy=proxy,
+            force=force,
+            upstream=True,
+            clearance_scope=f"browser:{self.fingerprint['device_id']}",
+        )
+        if bundle is None:
+            step(index, "浏览器 clearance 获取失败，请检查 FlareSolverr、代理和出口一致性", "yellow")
+            return None
+        self._clearance_bundle = bundle
+        step(
+            index,
+            f"浏览器 clearance 已加载 cookies={len(bundle.cookies)} user_agent={'yes' if bundle.user_agent else 'no'}",
+            "yellow",
+        )
+        return bundle
 
     def _remaining_ms(self) -> int:
         remaining = self._deadline - time.monotonic()
@@ -340,11 +395,23 @@ class BrowserRegistrar:
     def _handle_existing_outlook(self, page, mailbox: dict, index: int) -> None:
         if str(mailbox.get("provider") or "") != "outlook_token":
             raise BrowserRegistrationError("browser_existing_account_login_unsupported")
-        alternative = self._visible(page, ('button:has-text("Try another way")', 'button:has-text("Use a code")'))
+        alternative = self._visible(page, (
+            'button:has-text("Try another way")',
+            'a:has-text("Try another way")',
+            'button:has-text("Use a code")',
+            'a:has-text("Use a code")',
+        ))
         if alternative is not None:
             alternative.click(timeout=self._remaining_ms())
             page.wait_for_timeout(500)
-        code_option = self._visible(page, ('button:has-text("Email code")', 'button:has-text("Continue with email")'))
+        code_option = self._visible(page, (
+            'button:has-text("Email code")',
+            'a:has-text("Email code")',
+            'button:has-text("Continue with email")',
+            'a:has-text("Continue with email")',
+            'button:has-text("Email me a code")',
+            'a:has-text("Email me a code")',
+        ))
         if code_option is not None:
             code_option.click(timeout=self._remaining_ms())
             page.wait_for_timeout(500)
@@ -354,6 +421,7 @@ class BrowserRegistrar:
             'input[name="otp"]',
             'input[name="otpCode"]',
         )) is None:
+            step(index, f"浏览器已有账号登录控件 {self._control_summary(page)}", "yellow")
             raise BrowserRegistrationError("browser_existing_account_login_unsupported")
         code = self._wait_for_otp(mailbox, index, login=True)
         self._fill_otp(page, code)
@@ -648,6 +716,7 @@ class BrowserRegistrar:
         self._deadline = time.monotonic() + BROWSER_TASK_TIMEOUT_SECONDS
         step(index, "浏览器注册任务启动")
         try:
+            clearance_bundle = self._load_clearance(index)
             with sync_playwright() as playwright:
                 executable = str(os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH") or "").strip() or None
                 browser = playwright.chromium.launch(
@@ -658,7 +727,14 @@ class BrowserRegistrar:
                 )
                 try:
                     version = str(browser.version or "").strip()
-                    if version:
+                    if clearance_bundle is not None and clearance_bundle.user_agent:
+                        self.fingerprint = _align_fingerprint_platform(
+                            _fingerprint_with_user_agent(
+                                self.fingerprint,
+                                clearance_bundle.user_agent,
+                            )
+                        )
+                    elif version:
                         full_version = version.split(" ")[-1]
                         major = full_version.split(".", 1)[0]
                         user_agent = (
@@ -673,8 +749,16 @@ class BrowserRegistrar:
                         locale=self.fingerprint["accept_language"].split(",", 1)[0],
                         viewport={"width": 1365, "height": 768},
                         ignore_https_errors=True,
+                        extra_http_headers={
+                            "Accept-Language": self.fingerprint["accept_language"],
+                            "OAI-Device-Id": self.fingerprint["device_id"],
+                            "Sec-Ch-Ua": self.fingerprint["sec_ch_ua"],
+                            "Sec-Ch-Ua-Mobile": self.fingerprint["sec_ch_ua_mobile"],
+                            "Sec-Ch-Ua-Platform": self.fingerprint["sec_ch_ua_platform"],
+                        },
                     )
                     context.set_default_timeout(BROWSER_NAVIGATION_TIMEOUT_MS)
+                    context.add_cookies(_browser_auth_cookies(clearance_bundle, self.fingerprint["device_id"]))
                     context.on("request", lambda request: self._capture_callback(request.url))
                     page = context.new_page()
                     page.on("response", self._record_auth_response)

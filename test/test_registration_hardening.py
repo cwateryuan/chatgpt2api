@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from fastapi import FastAPI
@@ -14,6 +15,7 @@ from fastapi.testclient import TestClient
 from api import register as register_api
 from services.account_service import AccountService
 from services.openai_backend_api import OpenAIBackendAPI
+from services.proxy_service import ClearanceBundle
 from services.register import browser_register, openai_register
 from services.register_service import RegisterService, _normalize
 from services.storage.json_storage import JSONStorageBackend
@@ -29,6 +31,39 @@ class FakeSession:
 
 
 class RegistrationHardeningTests(unittest.TestCase):
+    def test_browser_clearance_uses_matching_proxy_scope_and_safe_cookie_import(self):
+        registrar = browser_register.BrowserRegistrar()
+        bundle = ClearanceBundle(
+            target_host="auth.openai.com",
+            proxy_url="http://proxy.example:8080",
+            cookies={"cf_clearance": "secret-clearance"},
+            user_agent="Clearance UA",
+        )
+        profile = SimpleNamespace(
+            clearance_enabled=True,
+            clearance_mode="flaresolverr",
+            proxy_source="runtime",
+        )
+        with (
+            mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=profile),
+            mock.patch.object(browser_register.proxy_settings, "refresh_clearance", return_value=bundle) as refresh,
+            mock.patch.object(browser_register, "step") as log_step,
+        ):
+            loaded = registrar._load_clearance(1)
+
+        self.assertIs(loaded, bundle)
+        self.assertEqual(refresh.call_args.kwargs["target_url"], browser_register.auth_base)
+        self.assertTrue(refresh.call_args.kwargs["upstream"])
+        self.assertTrue(refresh.call_args.kwargs["force"])
+        self.assertIn(registrar.fingerprint["device_id"], refresh.call_args.kwargs["clearance_scope"])
+        self.assertNotIn("secret-clearance", " ".join(str(call) for call in log_step.call_args_list))
+
+        cookies = browser_register._browser_auth_cookies(bundle, registrar.fingerprint["device_id"])
+        self.assertEqual({item["name"] for item in cookies}, {"cf_clearance", "oai-did"})
+        self.assertTrue(all(item["url"].startswith("https://auth.openai.com") for item in cookies))
+        linux_fp = browser_register._align_fingerprint_platform({"user_agent": "Chrome on Linux"})
+        self.assertEqual(linux_fp["sec_ch_ua_platform"], '"Linux"')
+
     def test_existing_account_fingerprint_is_generated_once_and_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "accounts.json"

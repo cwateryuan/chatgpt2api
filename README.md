@@ -64,7 +64,7 @@ uv run playwright install chromium
 uv run main.py
 ```
 
-注册页可手动选择 HTTP 或浏览器引擎。浏览器引擎固定单任务执行；Docker 镜像使用 Xvfb 虚拟显示器运行有头 Chromium，本地默认使用无头模式，可通过 `PLAYWRIGHT_HEADLESS=false` 切换。遇到需要人工处理的 Cloudflare/Turnstile 验证时会记录失败并结束，不会自动切回 HTTP。Docker 镜像已内置 Chromium；本地开发需执行上面的安装命令。Chromium 会增加镜像体积，并在注册期间占用更多内存。
+注册页可手动选择 HTTP 或浏览器引擎。浏览器引擎固定单任务执行，并复用稳定代理运行时的 FlareSolverr clearance、User-Agent 与出口代理；Docker 镜像使用 Xvfb 虚拟显示器运行有头 Chromium，本地默认使用无头模式，可通过 `PLAYWRIGHT_HEADLESS=false` 切换。遇到仍需人工处理的 Cloudflare/Turnstile 验证时会记录失败并结束，不会自动切回 HTTP。Docker 镜像已内置 Chromium；本地开发需执行上面的安装命令。Chromium 会增加镜像体积，并在注册期间占用更多内存。
 
 启动前端：
 
