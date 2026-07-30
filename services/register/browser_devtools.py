@@ -7,10 +7,11 @@ import shutil
 import socket
 import struct
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import urlopen
 
 
@@ -39,11 +40,28 @@ def find_browser_executable() -> str:
     raise RuntimeError("browser_not_found: install Chrome/Edge or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
 
 
-def browser_proxy_arg(proxy: str) -> str:
+def browser_proxy_config(proxy: str) -> tuple[str, str, str]:
     value = str(proxy or "").strip()
-    if value.startswith("socks5h://"):
-        return "socks5://" + value[len("socks5h://"):]
-    return value
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    if scheme == "socks5h":
+        scheme = "socks5"
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeError("browser_proxy_url_invalid") from error
+    if scheme not in {"http", "https", "socks5"} or not parsed.hostname or not port:
+        raise RuntimeError("browser_proxy_url_invalid")
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    if username and scheme == "socks5":
+        raise RuntimeError("browser_authenticated_socks5_unsupported")
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{scheme}://{host}:{port}", username, password
+
+
+def browser_proxy_arg(proxy: str) -> str:
+    return browser_proxy_config(proxy)[0]
 
 
 def free_local_port() -> int:
@@ -144,10 +162,14 @@ class DevToolsSocket:
             if opcode in (1, 2):
                 return payload.decode("utf-8", errors="replace")
 
-    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float | None = None) -> dict[str, Any]:
+    def send(self, method: str, params: dict[str, Any] | None = None) -> int:
         call_id = self.next_id
         self.next_id += 1
         self._send_frame(json.dumps({"id": call_id, "method": method, "params": params or {}}, separators=(",", ":")))
+        return call_id
+
+    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float | None = None) -> dict[str, Any]:
+        call_id = self.send(method, params)
         deadline = time.monotonic() + float(timeout or self.timeout)
         while time.monotonic() < deadline:
             message = json.loads(self._recv_frame())
@@ -157,6 +179,71 @@ class DevToolsSocket:
                 raise RuntimeError(f"devtools_{method}_error: {message['error']}")
             return message.get("result") if isinstance(message.get("result"), dict) else {}
         raise RuntimeError(f"devtools_{method}_timeout")
+
+
+class ProxyAuthHandler:
+    """Keep one CDP session open to answer HTTP proxy authentication challenges."""
+
+    def __init__(self, port: int, username: str, password: str) -> None:
+        self.port = port
+        self.username = username
+        self.password = password
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: Exception | None = None
+
+    def start(self, timeout: float = 5.0) -> None:
+        if not self.username:
+            return
+        self._thread = threading.Thread(target=self._run, name=f"browser-proxy-auth-{self.port}", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=max(1.0, timeout)):
+            raise RuntimeError("browser_proxy_auth_start_timeout")
+        if self._error is not None:
+            raise RuntimeError(f"browser_proxy_auth_start_failed:{self._error}") from self._error
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        try:
+            websocket_url = page_websocket(self.port)
+            with DevToolsSocket(websocket_url, 0.5) as devtools:
+                devtools.call("Fetch.enable", {"handleAuthRequests": True}, timeout=3.0)
+                self._ready.set()
+                while not self._stop.is_set():
+                    try:
+                        message = json.loads(devtools._recv_frame())
+                    except socket.timeout:
+                        continue
+                    method = str(message.get("method") or "")
+                    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+                    request_id = str(params.get("requestId") or "")
+                    if not request_id:
+                        continue
+                    if method == "Fetch.requestPaused":
+                        devtools.send("Fetch.continueRequest", {"requestId": request_id})
+                    elif method == "Fetch.authRequired":
+                        challenge = params.get("authChallenge") if isinstance(params.get("authChallenge"), dict) else {}
+                        response: dict[str, str] = {"response": "Default"}
+                        if str(challenge.get("source") or "").lower() == "proxy":
+                            response = {
+                                "response": "ProvideCredentials",
+                                "username": self.username,
+                                "password": self.password,
+                            }
+                        devtools.send(
+                            "Fetch.continueWithAuth",
+                            {"requestId": request_id, "authChallengeResponse": response},
+                        )
+        except Exception as error:
+            if not self._stop.is_set():
+                self._error = error
+        finally:
+            self._ready.set()
 
 
 def devtools_json(port: int, path: str, timeout: float) -> Any:

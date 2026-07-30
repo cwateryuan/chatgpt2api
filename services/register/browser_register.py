@@ -499,6 +499,8 @@ class BrowserRegistrar:
         self._auth_responses: list[str] = []
         self._clearance_bundle: ClearanceBundle | None = None
         self.registration_proxy_url = ""
+        self.registration_proxy_username = ""
+        self.registration_proxy_password = ""
 
     def _load_clearance(self, index: int, *, force: bool = True) -> ClearanceBundle | None:
         proxy = str(config.get("proxy") or "")
@@ -837,15 +839,21 @@ class BrowserRegistrar:
     def _launch_devtools_browser(self, profile_dir: Path, index: int) -> tuple[subprocess.Popen[Any], int]:
         executable = browser_devtools.find_browser_executable()
         port = browser_devtools.free_local_port()
-        profile = proxy_settings.get_profile(proxy=str(config.get("proxy") or ""), upstream=True)
+        profile = proxy_settings.get_profile(proxy=str(config.get("proxy") or ""), upstream=False)
         proxy_url = str(profile.proxy_url or "").strip()
         if not proxy_url:
             raise BrowserRegistrationError("browser_registration_proxy_missing")
+        try:
+            proxy_server, proxy_username, proxy_password = browser_devtools.browser_proxy_config(proxy_url)
+        except RuntimeError as error:
+            raise BrowserRegistrationError(str(error)) from error
         self.registration_proxy_url = proxy_url
+        self.registration_proxy_username = proxy_username
+        self.registration_proxy_password = proxy_password
         step(
             index,
             f"浏览器网络 proxy={profile.proxy_source} proxy_server=yes "
-            f"engine=chrome-devtools clearance=disabled",
+            f"proxy_auth={'yes' if proxy_username else 'no'} engine=chrome-devtools clearance=disabled",
         )
         command = [
             executable,
@@ -863,9 +871,8 @@ class BrowserRegistrar:
         ]
         if _playwright_headless():
             command.extend(["--headless=new", "--disable-gpu"])
-        if proxy_url:
-            command.append(f"--proxy-server={browser_devtools.browser_proxy_arg(proxy_url)}")
-        command.append(CHATGPT_LOGIN_URL)
+        command.append(f"--proxy-server={proxy_server}")
+        command.append("about:blank")
         process_options: dict[str, Any] = {
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
@@ -873,7 +880,11 @@ class BrowserRegistrar:
         if os.name == "nt":
             process_options["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(command, **process_options)
-        browser_devtools.wait_for_devtools(port, self._devtools_timeout(30))
+        try:
+            browser_devtools.wait_for_devtools(port, self._devtools_timeout(30))
+        except Exception:
+            browser_devtools.close_browser(port, process)
+            raise
         return process, port
 
     def _devtools_access_token(self, port: int) -> str:
@@ -1015,9 +1026,19 @@ class BrowserRegistrar:
     ) -> dict[str, str]:
         process: subprocess.Popen[Any] | None = None
         port = 0
+        proxy_auth: browser_devtools.ProxyAuthHandler | None = None
         with tempfile.TemporaryDirectory(prefix="chatgpt2api-browser-") as profile_dir:
             try:
                 process, port = self._launch_devtools_browser(Path(profile_dir), index)
+                if self.registration_proxy_username:
+                    proxy_auth = browser_devtools.ProxyAuthHandler(
+                        port,
+                        self.registration_proxy_username,
+                        self.registration_proxy_password,
+                    )
+                    proxy_auth.start(timeout=min(5.0, self._devtools_timeout(5)))
+                    step(index, "浏览器注册代理认证已启用")
+                browser_devtools.navigate_to(port, CHATGPT_LOGIN_URL, self._devtools_timeout())
                 state_reader = lambda: self._devtools_state(port)
                 step(index, "浏览器等待 ChatGPT 登录页")
                 browser_devtools.wait_for(
@@ -1100,6 +1121,8 @@ class BrowserRegistrar:
                 access_token = self._devtools_access_token(port)
                 return {"access_token": access_token, "refresh_token": "", "id_token": ""}
             finally:
+                if proxy_auth is not None:
+                    proxy_auth.close()
                 if port:
                     browser_devtools.close_browser(port, process)
 
@@ -1557,7 +1580,6 @@ class BrowserRegistrar:
             **tokens,
             "source_type": "microsoft" if not password else "web",
             "registration_engine": "browser",
-            "proxy": self.registration_proxy_url,
             "fp": dict(self.fingerprint),
             "status": "正常",
             "quota": 0,

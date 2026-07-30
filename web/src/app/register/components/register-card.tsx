@@ -128,8 +128,8 @@ export function RegisterCard() {
               <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
             </div>
             <div className="space-y-2">
-              <label className="text-sm text-stone-700">注册代理</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder="http://127.0.0.1:7890" className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
+              <label className="text-sm text-stone-700">{config.engine === "browser" ? "注册代理（仅注册）" : "注册代理"}</label>
+              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder={config.engine === "browser" ? "host:port:username:password" : "http://127.0.0.1:7890"} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">目标剩余额度</label>

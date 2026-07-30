@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import socket
 import tempfile
 import threading
 import time
@@ -15,7 +17,7 @@ from fastapi.testclient import TestClient
 from api import register as register_api
 from services.account_service import AccountService
 from services.openai_backend_api import OpenAIBackendAPI
-from services.proxy_service import ClearanceBundle
+from services.proxy_service import ClearanceBundle, normalize_proxy_url
 from services.register import browser_register, openai_register
 from services.register_service import RegisterService, _normalize
 from services.storage.json_storage import JSONStorageBackend
@@ -381,6 +383,8 @@ class RegistrationHardeningTests(unittest.TestCase):
     def test_browser_devtools_registration_follows_reference_retry_flow(self):
         registrar = browser_register.BrowserRegistrar()
         registrar._deadline = time.monotonic() + 120
+        registrar.registration_proxy_username = "clip-user"
+        registrar.registration_proxy_password = "clip-password"
         process = mock.Mock()
         code_state = {
             "url": "https://auth.openai.com/email-verification",
@@ -397,6 +401,8 @@ class RegistrationHardeningTests(unittest.TestCase):
 
         with (
             mock.patch.object(registrar, "_launch_devtools_browser", return_value=(process, 12345)),
+            mock.patch.object(browser_register.browser_devtools, "ProxyAuthHandler") as proxy_auth,
+            mock.patch.object(browser_register.browser_devtools, "navigate_to") as navigate_to,
             mock.patch.object(registrar, "_wait_for_otp", return_value="246810") as wait_for_otp,
             mock.patch.object(browser_register.browser_devtools, "wait_for", return_value={"url": "https://chatgpt.com/auth/login"}),
             mock.patch.object(
@@ -445,6 +451,10 @@ class RegistrationHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(tokens["access_token"], "session-token")
+        proxy_auth.assert_called_once_with(12345, "clip-user", "clip-password")
+        proxy_auth.return_value.start.assert_called_once()
+        proxy_auth.return_value.close.assert_called_once()
+        navigate_to.assert_called_once_with(12345, browser_register.CHATGPT_LOGIN_URL, mock.ANY)
         self.assertEqual(submit_until.call_count, 3)
         wait_for_otp.assert_called_once()
         close_browser.assert_called_once_with(12345, process)
@@ -469,13 +479,16 @@ class RegistrationHardeningTests(unittest.TestCase):
         registrar = browser_register.BrowserRegistrar()
         registrar._deadline = time.monotonic() + 30
         process = mock.Mock()
-        proxy_profile = SimpleNamespace(proxy_url="http://privoxy:8118", proxy_source="runtime")
+        proxy_profile = SimpleNamespace(
+            proxy_url="http://clip-user:clip-password@us.cliproxy.io:3010",
+            proxy_source="explicit",
+        )
 
         with (
             mock.patch.object(browser_register.browser_devtools, "find_browser_executable", return_value="chromium"),
             mock.patch.object(browser_register.browser_devtools, "free_local_port", return_value=12345),
             mock.patch.object(browser_register.browser_devtools, "wait_for_devtools"),
-            mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=proxy_profile),
+            mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=proxy_profile) as get_profile,
             mock.patch.object(browser_register.subprocess, "Popen", return_value=process) as popen,
             mock.patch.object(browser_register, "step"),
         ):
@@ -483,8 +496,13 @@ class RegistrationHardeningTests(unittest.TestCase):
 
         self.assertIs(launched_process, process)
         self.assertEqual(port, 12345)
-        self.assertIn("--proxy-server=http://privoxy:8118", popen.call_args.args[0])
-        self.assertEqual(registrar.registration_proxy_url, "http://privoxy:8118")
+        command = popen.call_args.args[0]
+        self.assertIn("--proxy-server=http://us.cliproxy.io:3010", command)
+        self.assertNotIn("clip-password", " ".join(command))
+        self.assertEqual(command[-1], "about:blank")
+        self.assertEqual(registrar.registration_proxy_username, "clip-user")
+        self.assertEqual(registrar.registration_proxy_password, "clip-password")
+        get_profile.assert_called_once_with(proxy=mock.ANY, upstream=False)
 
         missing_profile = SimpleNamespace(proxy_url="", proxy_source="none")
         with (
@@ -494,6 +512,118 @@ class RegistrationHardeningTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(browser_register.BrowserRegistrationError, "browser_registration_proxy_missing"):
                 registrar._launch_devtools_browser(Path("profile"), 1)
+
+    def test_browser_proxy_formats_and_proxy_auth_challenge(self):
+        url = normalize_proxy_url("us.cliproxy.io:3010:clip-user:clip-password")
+        self.assertEqual(
+            browser_register.browser_devtools.browser_proxy_config(url),
+            ("http://us.cliproxy.io:3010", "clip-user", "clip-password"),
+        )
+        self.assertEqual(
+            browser_register.browser_devtools.browser_proxy_config(
+                "http://clip-user:clip-password@us.cliproxy.io:3010"
+            ),
+            ("http://us.cliproxy.io:3010", "clip-user", "clip-password"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "browser_authenticated_socks5_unsupported"):
+            browser_register.browser_devtools.browser_proxy_config(
+                "socks5h://clip-user:clip-password@us.cliproxy.io:3010"
+            )
+        with self.assertRaisesRegex(RuntimeError, "browser_proxy_url_invalid"):
+            browser_register.browser_devtools.browser_proxy_config("http://proxy.example:not-a-port")
+
+        handler = browser_register.browser_devtools.ProxyAuthHandler(12345, "clip-user", "clip-password")
+        devtools = mock.Mock()
+        messages = iter([
+            {
+                "method": "Fetch.authRequired",
+                "params": {
+                    "requestId": "proxy-request",
+                    "authChallenge": {"source": "Proxy"},
+                },
+            },
+            {
+                "method": "Fetch.authRequired",
+                "params": {
+                    "requestId": "server-request",
+                    "authChallenge": {"source": "Server"},
+                },
+            },
+        ])
+
+        def receive_event():
+            try:
+                return json.dumps(next(messages))
+            except StopIteration:
+                handler._stop.set()
+                raise socket.timeout
+
+        devtools._recv_frame.side_effect = receive_event
+        context = mock.MagicMock()
+        context.__enter__.return_value = devtools
+        with (
+            mock.patch.object(browser_register.browser_devtools, "page_websocket", return_value="ws://browser"),
+            mock.patch.object(browser_register.browser_devtools, "DevToolsSocket", return_value=context),
+        ):
+            handler._run()
+
+        proxy_response = devtools.send.call_args_list[0].args
+        server_response = devtools.send.call_args_list[1].args
+        self.assertEqual(proxy_response[0], "Fetch.continueWithAuth")
+        self.assertEqual(proxy_response[1]["authChallengeResponse"]["username"], "clip-user")
+        self.assertEqual(proxy_response[1]["authChallengeResponse"]["password"], "clip-password")
+        self.assertEqual(server_response[1]["authChallengeResponse"], {"response": "Default"})
+
+    def test_browser_registration_result_does_not_bind_registration_proxy(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar.registration_proxy_url = "http://clip-user:clip-password@us.cliproxy.io:3010"
+        with (
+            mock.patch.object(
+                browser_register,
+                "browser_runtime_status",
+                return_value={"browser_available": True},
+            ),
+            mock.patch.object(
+                browser_register.mail_provider,
+                "create_mailbox",
+                return_value={"provider": "outlook_token", "address": "new@example.com"},
+            ),
+            mock.patch.object(browser_register.mail_provider, "mark_mailbox_result"),
+            mock.patch.object(
+                registrar,
+                "_run_devtools_registration",
+                return_value={"access_token": "token", "refresh_token": "", "id_token": ""},
+            ),
+            mock.patch.object(browser_register, "step"),
+        ):
+            result = registrar.register(1)
+
+        self.assertNotIn("proxy", result)
+        self.assertEqual(result["registration_engine"], "browser")
+
+    def test_browser_launch_closes_process_when_devtools_start_fails(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 30
+        process = mock.Mock()
+        process.poll.return_value = None
+        profile = SimpleNamespace(proxy_url="http://proxy.example:8080", proxy_source="explicit")
+        with (
+            mock.patch.object(browser_register.browser_devtools, "find_browser_executable", return_value="chromium"),
+            mock.patch.object(browser_register.browser_devtools, "free_local_port", return_value=12345),
+            mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=profile),
+            mock.patch.object(browser_register.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                browser_register.browser_devtools,
+                "wait_for_devtools",
+                side_effect=RuntimeError("browser_devtools_timeout"),
+            ),
+            mock.patch.object(browser_register.browser_devtools, "close_browser") as close_browser,
+            mock.patch.object(browser_register, "step"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "browser_devtools_timeout"):
+                registrar._launch_devtools_browser(Path("profile"), 1)
+
+        close_browser.assert_called_once_with(12345, process)
 
     def test_browser_start_fails_when_runtime_is_unavailable(self):
         with (
