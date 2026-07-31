@@ -24,6 +24,7 @@ export function RegisterCard() {
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
+  const setMailAutoDisable = useSettingsStore((state) => state.setRegisterMailAutoDisable);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
   const updateProvider = useSettingsStore((state) => state.updateRegisterProvider);
   const deleteProvider = useSettingsStore((state) => state.deleteRegisterProvider);
@@ -31,6 +32,7 @@ export function RegisterCard() {
   const toggle = useSettingsStore((state) => state.toggleRegister);
   const reset = useSettingsStore((state) => state.resetRegister);
   const resetOutlookPool = useSettingsStore((state) => state.resetOutlookPool);
+  const resetMailHealth = useSettingsStore((state) => state.resetRegisterMailHealth);
 
   if (isLoading) {
     return (
@@ -42,7 +44,7 @@ export function RegisterCard() {
 
   if (!config) return null;
 
-  const mail = config.mail || { request_timeout: 30, wait_timeout: 120, wait_interval: 3, providers: [] };
+  const mail = config.mail || { request_timeout: 30, wait_timeout: 120, wait_interval: 3, auto_disable: true, failure_threshold: 10, providers: [] };
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
   const providers = mail.providers || [];
   const logs = config.logs || [];
@@ -52,6 +54,8 @@ export function RegisterCard() {
   const browserUnavailable = config.engine === "browser" && !config.browser_available;
   const updateProviderType = (index: number, type: string) => {
     updateProvider(index, {
+      id: "",
+      health: {},
       type,
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
@@ -64,7 +68,7 @@ export function RegisterCard() {
       ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
-      ...(type === "mailpit" ? { api_url: "", domain: "" } : {}),
+      ...(type === "mailpit" ? { api_url: "", domain: [], domain_mode: "round_robin" } : {}),
     });
   };
 
@@ -149,7 +153,7 @@ export function RegisterCard() {
             <div className="flex items-center justify-between gap-3">
               <div>
                 <h3 className="text-sm font-semibold text-stone-800">邮箱配置</h3>
-                <p className="mt-1 text-xs text-stone-500">可配置多个 provider，按启用顺序轮换。</p>
+                <p className="mt-1 text-xs text-stone-500">数字越小优先级越高，仅使用当前最高优先级的可用渠道。</p>
               </div>
               <Button type="button" variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={addProvider} disabled={isRuntimeBusy}>
                 <Plus className="size-4" />
@@ -170,6 +174,18 @@ export function RegisterCard() {
                 <label className="text-sm text-stone-700">轮询间隔</label>
                 <Input value={String(mail.wait_interval || "")} onChange={(event) => setMailField("wait_interval", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
               </div>
+              <label className="flex h-10 items-center gap-3 self-end text-sm text-stone-700">
+                <Checkbox checked={Boolean(mail.auto_disable)} onCheckedChange={(checked) => setMailAutoDisable(Boolean(checked))} disabled={isRuntimeBusy} />
+                连续失败自动禁用
+              </label>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">连续失败阈值</label>
+                <Input type="number" min={1} value={String(mail.failure_threshold || 10)} onChange={(event) => setMailField("failure_threshold", event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy || !mail.auto_disable} />
+              </div>
+              <Button type="button" variant="outline" className="h-10 self-end rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={() => void resetMailHealth()} disabled={isSaving}>
+                <RotateCcw className="size-4" />
+                恢复全部渠道
+              </Button>
             </div>
 
             <div className="space-y-3">
@@ -177,6 +193,11 @@ export function RegisterCard() {
                 const type = String(provider.type || "tempmail_lol");
                 const domains = Array.isArray(provider.domain) ? provider.domain.map(String).join("\n") : "";
                 const subdomains = Array.isArray(provider.subdomain) ? provider.subdomain.map(String).join("\n") : "";
+                const health = (provider.health || {}) as Record<string, unknown>;
+                const healthDomains = Array.isArray(health.domains) ? health.domains as Array<Record<string, unknown>> : [];
+                const providerId = String(provider.id || "");
+                const disabledByHealth = Boolean(health.disabled);
+                const latchedDisabled = Boolean(health.latched_disabled);
                 return (
                   <div key={index} className="space-y-3 border-t border-stone-200 pt-3 first:border-t-0 first:pt-0">
                     <div className="flex items-center justify-between gap-3">
@@ -184,6 +205,7 @@ export function RegisterCard() {
                         <Checkbox checked={Boolean(provider.enable)} onCheckedChange={(checked) => updateProvider(index, { enable: Boolean(checked) })} disabled={isRuntimeBusy} />
                         启用
                       </label>
+                      {!provider.enable ? <Badge variant="secondary" className="rounded-md">手动停用</Badge> : type === "outlook_token" && Boolean(health.exhausted) ? <Badge variant="warning" className="rounded-md">邮箱池已耗尽</Badge> : disabledByHealth ? <Badge variant="danger" className="rounded-md">已自动禁用</Badge> : latchedDisabled ? <Badge variant="warning" className="rounded-md">禁用状态已暂停</Badge> : Number(health.consecutive_failures || 0) > 0 ? <Badge variant="warning" className="rounded-md">连续失败 {Number(health.consecutive_failures)}</Badge> : <Badge variant="success" className="rounded-md">可用</Badge>}
                       <button type="button" className="rounded-lg p-2 text-stone-400 transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-50" onClick={() => deleteProvider(index)} disabled={isRuntimeBusy || providers.length <= 1} title="删除 provider">
                         <Trash2 className="size-4" />
                       </button>
@@ -210,6 +232,10 @@ export function RegisterCard() {
                             <SelectItem value="mailpit">mailpit (本地 Mailpit)</SelectItem>
                           </SelectContent>
                         </Select>
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-sm text-stone-700">优先级</label>
+                        <Input type="number" min={1} value={String(provider.priority || index + 1)} onChange={(event) => updateProvider(index, { priority: Math.max(1, Number(event.target.value) || 1) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
                       </div>
                       {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" ? (
                         <>
@@ -244,8 +270,15 @@ export function RegisterCard() {
                             <Input value={String(provider.api_url || "")} onChange={(event) => updateProvider(index, { api_url: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} placeholder="http://mailpit:8025" />
                           </div>
                           <div className="space-y-2">
-                            <label className="text-sm text-stone-700">邮箱后缀</label>
-                            <Input value={String(provider.domain || "")} onChange={(event) => updateProvider(index, { domain: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} placeholder="your-domain.com" />
+                            <label className="text-sm text-stone-700">邮箱域名</label>
+                            <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[,\n]/).map((item) => item.trim()).filter(Boolean) })} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={isRuntimeBusy} placeholder={"a.example.com, b.example.com\n或每行一个域名"} />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-sm text-stone-700">域名使用方式</label>
+                            <div className="grid h-10 grid-cols-2 border border-stone-200 bg-stone-50 p-1">
+                              <button type="button" className={`text-sm ${String(provider.domain_mode || "round_robin") === "round_robin" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => updateProvider(index, { domain_mode: "round_robin" })} disabled={isRuntimeBusy}>轮询</button>
+                              <button type="button" className={`text-sm ${String(provider.domain_mode || "round_robin") === "sequential" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => updateProvider(index, { domain_mode: "sequential" })} disabled={isRuntimeBusy}>顺序</button>
+                            </div>
                           </div>
                         </>
                       ) : null}
@@ -324,6 +357,31 @@ export function RegisterCard() {
                         </>
                       ) : null}
                     </div>
+
+                    {type !== "outlook_token" && (latchedDisabled || Number(health.consecutive_failures || 0) > 0 || healthDomains.length > 0) ? (
+                      <div className="space-y-2 border-t border-stone-100 pt-3 text-xs">
+                        {healthDomains.length ? healthDomains.map((item) => (
+                          <div key={String(item.domain)} className="flex flex-wrap items-center justify-between gap-2">
+                            <span className={Boolean(item.latched_disabled) ? "text-rose-600" : "text-stone-600"}>
+                              {String(item.domain)} · {Boolean(item.latched_disabled) ? "已禁用" : `连续失败 ${Number(item.consecutive_failures || 0)}`}
+                            </span>
+                            {(Boolean(item.latched_disabled) || Number(item.consecutive_failures || 0) > 0) ? (
+                              <Button type="button" variant="outline" className="h-7 rounded-md border-stone-200 bg-white px-2 text-xs" onClick={() => void resetMailHealth(providerId, String(item.domain))} disabled={isSaving}>
+                                <RotateCcw className="size-3" />恢复域名
+                              </Button>
+                            ) : null}
+                          </div>
+                        )) : null}
+                        {(latchedDisabled || Number(health.consecutive_failures || 0) > 0) ? (
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-stone-500">{String(health.last_error || "自动健康状态已记录")}</span>
+                            <Button type="button" variant="outline" className="h-7 rounded-md border-stone-200 bg-white px-2 text-xs" onClick={() => void resetMailHealth(providerId)} disabled={isSaving}>
+                              <RotateCcw className="size-3" />恢复渠道
+                            </Button>
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
 
                     {type === "outlook_token" ? (() => {
                       const stats = (provider.mailboxes_stats || {}) as Record<string, number>;

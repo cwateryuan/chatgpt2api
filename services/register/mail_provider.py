@@ -19,6 +19,7 @@ from curl_cffi import requests
 
 
 from services.config import DATA_DIR
+from services.register.mail_health import mail_health_store
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -209,8 +210,17 @@ domain_lock = Lock()
 provider_lock = Lock()
 domain_index = 0
 provider_index = 0
+mailpit_domain_indexes: dict[str, int] = {}
 cloudmail_token_lock = Lock()
 cloudmail_token_cache: dict[str, tuple[str, float]] = {}
+
+
+class AllMailProvidersUnavailableError(RuntimeError):
+    stop_reason = "all_mail_providers_unavailable"
+
+
+class OutlookPoolUnavailableError(RuntimeError):
+    pass
 
 
 def _config(mail_config: dict) -> dict:
@@ -249,6 +259,19 @@ def _normalize_string_list(value: Any) -> list[str]:
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value or "").strip()
     return [text] if text else []
+
+
+def normalize_mailpit_domains(value: Any) -> list[str]:
+    values = value if isinstance(value, list) else re.split(r"[,\r\n]+", str(value or ""))
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        for part in re.split(r"[,\r\n]+", str(item or "")):
+            domain = part.strip().lstrip("@").strip().lower()
+            if domain and domain not in seen:
+                seen.add(domain)
+                result.append(domain)
+    return result
 
 
 def _create_session(conf: dict):
@@ -1036,14 +1059,10 @@ class MailpitProvider(BaseMailProvider):
         else:
             self.messages_url = f"{api_url}/api/v1/messages"
             self.message_url = f"{api_url}/api/v1/message"
-        self.domain = (
-            str(entry.get("domain") or entry.get("suffix") or "")
-            .strip()
-            .lstrip("@")
-            .strip()
-        )
+        domains = normalize_mailpit_domains(entry.get("domain") or entry.get("suffix"))
+        self.domain = str(entry.get("_selected_domain") or (domains[0] if domains else "")).strip().lower()
         if not self.domain or "@" in self.domain:
-            raise RuntimeError("Mailpit 邮箱后缀格式不正确，请填写 @example.com 或 example.com")
+            raise RuntimeError("Mailpit 邮箱后缀格式不正确，请填写一个或多个域名")
         self.session = _create_session({**conf, "proxy": ""})
         self.session.headers.update({
             "User-Agent": conf["user_agent"],
@@ -1318,12 +1337,12 @@ class OutlookTokenProvider(BaseMailProvider):
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         if not self.pool:
-            raise RuntimeError("OutlookToken 邮箱池为空，请在邮箱配置中导入 email----password----client_id----refresh_token")
+            raise OutlookPoolUnavailableError("OutlookToken 邮箱池为空，请在邮箱配置中导入 email----password----client_id----refresh_token")
         with _outlook_token_state_lock:
             store = _load_outlook_token_state()
             credential = next((item for item in self.pool if _outlook_entry_available(store.get(item["email"].strip().lower()))), None)
             if credential is None:
-                raise RuntimeError(f"[{self.label}] OutlookToken 邮箱池暂无可用邮箱（共 {len(self.pool)} 个，已用尽或全部占用/失效），请导入新邮箱或重置池状态")
+                raise OutlookPoolUnavailableError(f"[{self.label}] OutlookToken 邮箱池暂无可用邮箱（共 {len(self.pool)} 个，已用尽或全部占用/失效），请导入新邮箱或重置池状态")
             store[credential["email"].strip().lower()] = {"state": "in_use", "reason": "", "updated_at": datetime.now(timezone.utc).isoformat()}
             _save_outlook_token_state(store)
         return {
@@ -1514,38 +1533,95 @@ class OutlookTokenProvider(BaseMailProvider):
 def _entries(mail_config: dict) -> list[dict]:
     result: list[dict] = []
     counters: dict[str, int] = {}
-    for item in mail_config["providers"]:
+    providers = mail_config.get("providers") if isinstance(mail_config.get("providers"), list) else []
+    for source in providers:
+        if not isinstance(source, dict):
+            continue
+        item = dict(source)
         idx = len(result) + 1
-        t = item.get("type", "")
+        t = str(item.get("type") or "").strip()
         cnt = counters.get(t, 0) + 1
         counters[t] = cnt
-        label = f"DDG-{cnt}" if t == "ddg_mail" else f"{t}#{idx}"
-        result.append({**item, "provider_ref": f"{item['type']}#{idx}", "label": label})
+        provider_id = str(item.get("id") or f"{t}#{idx}").strip()
+        label = str(item.get("label") or (f"DDG-{cnt}" if t == "ddg_mail" else f"{t}#{idx}"))
+        try:
+            priority = max(1, int(item.get("priority") or idx))
+        except (TypeError, ValueError):
+            priority = idx
+        result.append({**item, "id": provider_id, "provider_ref": provider_id, "label": label, "priority": priority, "_config_index": idx - 1})
     return result
 
 
 def _enabled_entries(mail_config: dict) -> list[dict]:
     items = [item for item in _entries(mail_config) if item.get("enable")]
     if not items:
-        raise RuntimeError("mail.providers 没有启用的 provider")
+        raise AllMailProvidersUnavailableError("没有启用的邮箱渠道")
     return items
 
 
 def _next_entry(mail_config: dict) -> dict:
-    global provider_index
-    items = _enabled_entries(mail_config)
-    if len(items) == 1:
-        return dict(items[0])
+    return dict(_available_entries(mail_config)[0])
+
+
+def _outlook_entry_has_mailbox(entry: dict) -> bool:
+    pool = _normalize_outlook_pool(entry.get("mailboxes") or entry.get("pool"))
+    if not pool:
+        return False
+    with _outlook_token_state_lock:
+        state = _load_outlook_token_state()
+        return any(_outlook_entry_available(state.get(item["email"].strip().lower())) for item in pool)
+
+
+def _active_mailpit_domains(entry: dict, *, auto_disable: bool, provider_state: dict[str, Any] | None = None) -> list[str]:
+    domains = normalize_mailpit_domains(entry.get("domain") or entry.get("suffix"))
+    if not auto_disable:
+        return domains
+    state = provider_state if isinstance(provider_state, dict) else mail_health_store.provider_state(str(entry.get("id") or ""))
+    domain_states = state.get("domains") if isinstance(state.get("domains"), dict) else {}
+    return [domain for domain in domains if not bool(domain_states.get(domain, {}).get("disabled"))]
+
+
+def _select_mailpit_domain(entry: dict, *, auto_disable: bool, provider_state: dict[str, Any] | None = None) -> str:
+    domains = _active_mailpit_domains(entry, auto_disable=auto_disable, provider_state=provider_state)
+    if not domains:
+        return ""
+    if str(entry.get("domain_mode") or "round_robin") == "sequential" or len(domains) == 1:
+        return domains[0]
+    provider_id = str(entry.get("id") or entry.get("provider_ref") or "")
     with provider_lock:
-        value = dict(items[provider_index % len(items)])
-        provider_index = (provider_index + 1) % len(items)
-        return value
+        index = mailpit_domain_indexes.get(provider_id, 0)
+        mailpit_domain_indexes[provider_id] = index + 1
+    return domains[index % len(domains)]
 
 
-def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "") -> BaseMailProvider:
-    entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
-    entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
-    conf = _config(mail_config)
+def _available_entries(mail_config: dict) -> list[dict]:
+    auto_disable = bool(mail_config.get("auto_disable", True))
+    health = mail_health_store.load() if auto_disable else {}
+    health_providers = health.get("providers") if isinstance(health.get("providers"), dict) else {}
+    available: list[dict] = []
+    for item in sorted(_enabled_entries(mail_config), key=lambda value: (int(value["priority"]), int(value["_config_index"]))):
+        provider_type = str(item.get("type") or "")
+        if provider_type == OutlookTokenProvider.name:
+            if _outlook_entry_has_mailbox(item):
+                available.append(dict(item))
+            continue
+        state = health_providers.get(str(item.get("id") or ""), {}) if auto_disable else {}
+        if auto_disable and bool(state.get("disabled")):
+            continue
+        prepared = dict(item)
+        if provider_type == MailpitProvider.name:
+            domain = _select_mailpit_domain(item, auto_disable=auto_disable, provider_state=state)
+            configured = normalize_mailpit_domains(item.get("domain") or item.get("suffix"))
+            if configured and not domain:
+                continue
+            prepared["_selected_domain"] = domain
+        available.append(prepared)
+    if not available:
+        raise AllMailProvidersUnavailableError("所有邮箱渠道均已自动禁用、手动停用或邮箱池已耗尽")
+    return available
+
+
+def _provider_from_entry(entry: dict, conf: dict) -> BaseMailProvider:
     if entry["type"] == "cloudmail_gen":
         return CloudMailGenProvider(entry, conf)
     if entry["type"] == "cloudflare_temp_email":
@@ -1571,26 +1647,56 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     raise RuntimeError(f"不支持的 mail.provider: {entry['type']}")
 
 
+def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = "") -> BaseMailProvider:
+    entry = next((dict(item) for item in _entries(mail_config) if provider_ref and item["provider_ref"] == provider_ref), None)
+    entry = entry or next((dict(item) for item in _enabled_entries(mail_config) if provider and item["type"] == provider), None) or _next_entry(mail_config)
+    return _provider_from_entry(entry, _config(mail_config))
+
+
+def _mailbox_health_metadata(mail_config: dict, entry: dict) -> dict[str, Any]:
+    return {
+        "_mail_provider_id": str(entry.get("id") or entry.get("provider_ref") or ""),
+        "_mail_provider_type": str(entry.get("type") or ""),
+        "_mail_provider_label": str(entry.get("label") or ""),
+        "_mail_domain": str(entry.get("_selected_domain") or ""),
+        "_mail_domains": normalize_mailpit_domains(entry.get("domain") or entry.get("suffix")),
+        "_mail_auto_disable": bool(mail_config.get("auto_disable", True)),
+        "_mail_failure_threshold": max(1, int(mail_config.get("failure_threshold") or 10)),
+    }
+
+
+def _record_health_metadata(metadata: dict[str, Any], *, success: bool, error: Exception | str | None = None) -> None:
+    if not metadata.get("_mail_auto_disable") or metadata.get("_mail_provider_type") == OutlookTokenProvider.name:
+        return
+    mail_health_store.record_result(
+        str(metadata.get("_mail_provider_id") or ""),
+        success=success,
+        threshold=int(metadata.get("_mail_failure_threshold") or 10),
+        error=str(error or ""),
+        domain=str(metadata.get("_mail_domain") or ""),
+        domains=[str(item) for item in (metadata.get("_mail_domains") or [])],
+    )
+
+
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
-    enabled = _enabled_entries(mail_config)
-    tried: set[str] = set()
-    last_error = ""
-    for _ in range(len(enabled)):
-        provider = _create_provider(mail_config)
-        provider_key = f"{provider.name}#{provider.provider_ref}"
+    entries = _available_entries(mail_config)
+    for entry in entries:
+        metadata = _mailbox_health_metadata(mail_config, entry)
+        provider: BaseMailProvider | None = None
         try:
-            if provider_key in tried:
-                continue
-            tried.add(provider_key)
+            provider = _provider_from_entry(entry, _config(mail_config))
             mailbox = provider.create_mailbox(username)
+            mailbox.update(metadata)
             return mailbox
-        except RuntimeError as error:
-            last_error = str(error)
-            if "DDG日上限已达" not in last_error:
-                raise
+        except OutlookPoolUnavailableError:
+            continue
+        except Exception as error:
+            _record_health_metadata(metadata, success=False, error=error)
+            raise
         finally:
-            provider.close()
-    raise RuntimeError(last_error or "所有启用的邮箱提供商均无法创建邮箱")
+            if provider is not None:
+                provider.close()
+    raise AllMailProvidersUnavailableError("所有 Outlook 邮箱池均已耗尽，且没有其他可用邮箱渠道")
 
 
 def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
@@ -1604,10 +1710,10 @@ def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态。
 
-    仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
-    其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
+    Outlook 更新单邮箱状态，其他渠道更新自动禁用健康状态。Mailpit 的失败按域名统计。
     """
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
+        _record_health_metadata(mailbox, success=success, error=error)
         return
     address = str(mailbox.get("address") or "").strip()
     if not address:
@@ -1620,6 +1726,50 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
         _set_outlook_token_state(address, "token_invalid", reason[:300])
     else:
         _set_outlook_token_state(address, "failed", reason[:300])
+
+
+def mail_config_with_health(mail_config: dict) -> dict:
+    result = json.loads(json.dumps(mail_config, ensure_ascii=False))
+    auto_disable = bool(result.get("auto_disable", True))
+    health_state = mail_health_store.load()
+    health_providers = health_state.get("providers") if isinstance(health_state.get("providers"), dict) else {}
+    providers = result.get("providers") if isinstance(result.get("providers"), list) else []
+    entries = _entries(result)
+    for provider, entry in zip(providers, entries):
+        provider_id = str(entry.get("id") or "")
+        provider_type = str(entry.get("type") or "")
+        state = health_providers.get(provider_id, {})
+        health: dict[str, Any] = {
+            "disabled": bool(state.get("disabled")) if auto_disable else False,
+            "latched_disabled": bool(state.get("disabled")),
+            "consecutive_failures": int(state.get("consecutive_failures") or 0),
+            "last_error": str(state.get("last_error") or ""),
+            "disabled_at": str(state.get("disabled_at") or ""),
+        }
+        if provider_type == MailpitProvider.name:
+            domain_states = state.get("domains") if isinstance(state.get("domains"), dict) else {}
+            domains = normalize_mailpit_domains(entry.get("domain") or entry.get("suffix"))
+            health["domains"] = [
+                {
+                    "domain": domain,
+                    "disabled": bool(domain_states.get(domain, {}).get("disabled")) if auto_disable else False,
+                    "latched_disabled": bool(domain_states.get(domain, {}).get("disabled")),
+                    "consecutive_failures": int(domain_states.get(domain, {}).get("consecutive_failures") or 0),
+                    "last_error": str(domain_states.get(domain, {}).get("last_error") or ""),
+                }
+                for domain in domains
+            ]
+            health["disabled"] = bool(domains) and all(item["disabled"] for item in health["domains"])
+        elif provider_type == OutlookTokenProvider.name:
+            credentials = _normalize_outlook_pool(entry.get("mailboxes") or entry.get("pool"))
+            health = {
+                "disabled": False,
+                "latched_disabled": False,
+                "exhausted": not _outlook_entry_has_mailbox(entry),
+                "mailboxes_stats": outlook_token_pool_stats(credentials),
+            }
+        provider["health"] = health
+    return result
 
 
 def release_mailbox(mailbox: dict) -> None:

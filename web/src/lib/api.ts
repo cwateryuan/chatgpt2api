@@ -375,6 +375,8 @@ export type RegisterConfig = {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
+    auto_disable: boolean;
+    failure_threshold: number;
     providers: Array<Record<string, unknown>>;
   };
   proxy: string;
@@ -841,6 +843,13 @@ export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all
   return httpRequest<{ register: RegisterConfig }>("/api/register/outlook-pool/reset", {
     method: "POST",
     body: { scope },
+  });
+}
+
+export async function resetRegisterMailHealth(providerId = "", domain = "") {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/mail-health/reset", {
+    method: "POST",
+    body: { provider_id: providerId || undefined, domain: domain || undefined },
   });
 }
 

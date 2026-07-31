@@ -65,6 +65,42 @@ def _default_config() -> dict:
     return {**openai_register.config, "engine": "http", "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
+def _normalize_mail_config(value: object) -> dict:
+    source = value if isinstance(value, dict) else {}
+    result = {
+        **source,
+        "request_timeout": max(1, float(source.get("request_timeout") or 30)),
+        "wait_timeout": max(1, float(source.get("wait_timeout") or 30)),
+        "wait_interval": max(0.2, float(source.get("wait_interval") or 2)),
+        "auto_disable": bool(source.get("auto_disable", True)),
+        "failure_threshold": max(1, int(source.get("failure_threshold") or 10)),
+        "providers": [],
+    }
+    result.pop("proxy", None)
+    providers = source.get("providers") if isinstance(source.get("providers"), list) else []
+    seen_ids: set[str] = set()
+    for index, raw_provider in enumerate(providers):
+        if not isinstance(raw_provider, dict):
+            continue
+        provider = dict(raw_provider)
+        provider.pop("health", None)
+        provider_type = str(provider.get("type") or "").strip()
+        provider_id = str(provider.get("id") or f"{provider_type}#{index + 1}").strip()
+        if provider_id in seen_ids:
+            provider_id = f"{provider_id}-{index + 1}"
+        seen_ids.add(provider_id)
+        provider["id"] = provider_id
+        try:
+            provider["priority"] = max(1, int(provider.get("priority") or index + 1))
+        except (TypeError, ValueError):
+            provider["priority"] = index + 1
+        if provider_type == "mailpit":
+            provider["domain"] = mail_provider.normalize_mailpit_domains(provider.get("domain") or provider.get("suffix"))
+            provider["domain_mode"] = "sequential" if str(provider.get("domain_mode")) == "sequential" else "round_robin"
+        result["providers"].append(provider)
+    return result
+
+
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
     cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
@@ -78,8 +114,7 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
-    if isinstance(cfg.get("mail"), dict):
-        cfg["mail"].pop("proxy", None)
+    cfg["mail"] = _normalize_mail_config(cfg.get("mail"))
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {
         **_default_config()["stats"],
@@ -212,6 +247,8 @@ class RegisterService:
             }
         snapshot = json.loads(json.dumps(self._config, ensure_ascii=False))
         snapshot.update(browser_status)
+        if isinstance(snapshot.get("mail"), dict):
+            snapshot["mail"] = mail_provider.mail_config_with_health(snapshot["mail"])
         if redact:
             self._redact_outlook_pools(snapshot)
         return snapshot
@@ -442,6 +479,21 @@ class RegisterService:
             for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
                 provider.pop(key, None)
 
+    def _drop_changed_provider_ids(self, updates: dict) -> None:
+        mail = updates.get("mail")
+        if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
+            return
+        old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
+        old_providers = old_mail.get("providers") if isinstance(old_mail.get("providers"), list) else []
+        for index, provider in enumerate(mail["providers"]):
+            if not isinstance(provider, dict) or index >= len(old_providers) or not isinstance(old_providers[index], dict):
+                continue
+            old_type = str(old_providers[index].get("type") or "")
+            new_type = str(provider.get("type") or "")
+            if old_type and new_type and old_type != new_type:
+                provider.pop("id", None)
+                provider.pop("health", None)
+
     def _prune_unused_outlook_pools(self) -> int:
         mail = self._config.get("mail")
         if not isinstance(mail, dict):
@@ -467,6 +519,7 @@ class RegisterService:
             loaded = self._load()
             if loaded:
                 self._config = loaded
+            self._drop_changed_provider_ids(updates)
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
@@ -554,6 +607,19 @@ class RegisterService:
                 f"已重置 Outlook 邮箱池状态（范围={'仅失败/占用' if scope == 'failed' else '全部'}），清除 {cleared} 条记录",
                 "yellow",
             )
+        return self.get()
+
+    def reset_mail_health(self, provider_id: str = "", domain: str = "") -> dict:
+        from services.register.mail_health import mail_health_store
+
+        reset_count = mail_health_store.reset(provider_id, domain)
+        target = f"渠道 {provider_id}"
+        if provider_id and domain:
+            target = f"Mailpit 域名 {domain}（渠道 {provider_id}）"
+        elif not provider_id:
+            target = "全部邮箱渠道"
+        with self._lock:
+            self._append_log(f"已手动恢复{target}的自动健康状态，清除 {reset_count} 条记录", "yellow")
         return self.get()
 
     def _append_log(self, text: str, color: str = "", *, force: bool = False) -> None:
@@ -664,6 +730,7 @@ class RegisterService:
             fail = max(0, int(stats.get("fail") or 0))
         submitted = max(done, success + fail)
         lock_lost_exit = False
+        mail_unavailable_exit = False
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
@@ -692,6 +759,14 @@ class RegisterService:
                         result = future.result()
                         success += 1 if result.get("ok") else 0
                         fail += 0 if result.get("ok") else 1
+                        if result.get("stop_reason") == "all_mail_providers_unavailable":
+                            if not mail_unavailable_exit:
+                                mail_unavailable_exit = True
+                                with self._lock:
+                                    self._config["enabled"] = False
+                                    self._config["stats"]["stop_reason"] = "all_mail_providers_unavailable"
+                                    self._save_runtime(force=True)
+                                self._append_log("所有邮箱渠道均已自动禁用、手动停用或耗尽，停止提交新任务并等待运行中的任务结束", "red", force=True)
                     except Exception:
                         fail += 1
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
@@ -709,7 +784,7 @@ class RegisterService:
             if not keep_enabled_for_recovery:
                 self._clear_stop_requested()
             self._lock_lost = False
-        suffix = "，等待其他 worker 恢复" if keep_enabled_for_recovery else ""
+        suffix = "，邮箱渠道不可用" if mail_unavailable_exit else ("，等待其他 worker 恢复" if keep_enabled_for_recovery else "")
         self._append_log(f"注册任务结束，成功{success}，失败{fail}{suffix}", "yellow", force=True)
         trim_memory("register_run_finished", force=True)
 

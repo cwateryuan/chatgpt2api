@@ -27,6 +27,11 @@ class OutlookPoolResetRequest(BaseModel):
     scope: str | None = None
 
 
+class MailHealthResetRequest(BaseModel):
+    provider_id: str | None = None
+    domain: str | None = None
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -67,6 +72,11 @@ def create_router() -> APIRouter:
     async def reset_outlook_pool(body: OutlookPoolResetRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.reset_outlook_pool(body.scope or "all")}
+
+    @router.post("/api/register/mail-health/reset")
+    async def reset_mail_health(body: MailHealthResetRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"register": register_service.reset_mail_health(body.provider_id or "", body.domain or "")}
 
     @router.get("/api/register/events")
     async def register_events(token: str = ""):

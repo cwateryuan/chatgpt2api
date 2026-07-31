@@ -1607,6 +1607,10 @@ def worker(index: int) -> dict[str, Any]:
                 step(index, f"账号已保存，额度初始化暂未成功: {_sanitized_error(error)}", "yellow")
         log(f'{result["email"]} 浏览器注册成功，本次耗时{time.time() - started:.1f}s', "green")
         return {"ok": True, "index": index, "result": result}
+    except mail_provider.AllMailProvidersUnavailableError as error:
+        sanitized = _sanitized_error(error)
+        log(f"任务{index} 浏览器注册停止，本次耗时{time.time() - started:.1f}s，原因: {sanitized}", "red")
+        return {"ok": False, "index": index, "error": sanitized, "stop_reason": error.stop_reason}
     except Exception as error:
         log(f"任务{index} 浏览器注册失败，本次耗时{time.time() - started:.1f}s，原因: {_sanitized_error(error)}", "red")
         return {"ok": False, "index": index, "error": _sanitized_error(error)}

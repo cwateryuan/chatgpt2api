@@ -936,7 +936,6 @@ class PlatformRegistrar:
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
-        mail_provider.mark_mailbox_result(mailbox, success=True)
         result = {
             "email": email,
             "password": password,
@@ -949,7 +948,10 @@ class PlatformRegistrar:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         if not result["access_token"]:
-            raise RuntimeError("token换取成功但 access_token 为空")
+            error = RuntimeError("token换取成功但 access_token 为空")
+            mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
+            raise error
+        mail_provider.mark_mailbox_result(mailbox, success=True)
         return result
 
 
@@ -979,6 +981,13 @@ def worker(index: int) -> dict:
             avg = (time.time() - stats["start_time"]) / stats["success"]
         log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
         return {"ok": True, "index": index, "result": result}
+    except mail_provider.AllMailProvidersUnavailableError as e:
+        cost = time.time() - start
+        with stats_lock:
+            stats["done"] += 1
+            stats["fail"] += 1
+        log(f"任务{index} 停止，本次耗时{cost:.1f}s，原因: {e}", "red")
+        return {"ok": False, "index": index, "error": str(e), "stop_reason": e.stop_reason}
     except Exception as e:
         cost = time.time() - start
         with stats_lock:

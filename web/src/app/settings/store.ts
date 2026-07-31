@@ -11,6 +11,7 @@ import {
   fetchCPAPools,
   fetchBackups,
   fetchRegisterConfig,
+  resetRegisterMailHealth as resetRegisterMailHealthApi,
   resetRegister as resetRegisterApi,
   resetOutlookPool as resetOutlookPoolApi,
   fetchSettingsConfig,
@@ -255,6 +256,8 @@ const DEFAULT_REGISTER_MAIL: RegisterConfig["mail"] = {
   request_timeout: 30,
   wait_timeout: 120,
   wait_interval: 3,
+  auto_disable: true,
+  failure_threshold: 10,
   providers: [],
 };
 
@@ -397,7 +400,8 @@ type SettingsStore = {
   setRegisterTargetQuota: (value: string) => void;
   setRegisterTargetAvailable: (value: string) => void;
   setRegisterCheckInterval: (value: string) => void;
-  setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
+  setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval" | "failure_threshold", value: string) => void;
+  setRegisterMailAutoDisable: (value: boolean) => void;
   addRegisterProvider: () => void;
   updateRegisterProvider: (index: number, updates: Record<string, unknown>) => void;
   deleteRegisterProvider: (index: number) => void;
@@ -405,6 +409,7 @@ type SettingsStore = {
   toggleRegister: () => Promise<void>;
   resetRegister: () => Promise<void>;
   resetOutlookPool: (scope: "all" | "failed" | "unused") => Promise<void>;
+  resetRegisterMailHealth: (providerId?: string, domain?: string) => Promise<void>;
 
   loadPools: (silent?: boolean) => Promise<void>;
   openAddDialog: () => void;
@@ -1003,6 +1008,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     } : {});
   },
 
+  setRegisterMailAutoDisable: (value) => {
+    set((state) => state.registerConfig ? {
+      registerConfig: {
+        ...state.registerConfig,
+        mail: { ...state.registerConfig.mail, auto_disable: value },
+      },
+    } : {});
+  },
+
   addRegisterProvider: () => {
     set((state) => state.registerConfig ? {
       registerConfig: {
@@ -1011,7 +1025,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           ...state.registerConfig.mail,
           providers: [
             ...(state.registerConfig.mail.providers || []),
-            { enable: true, type: "cloudmail_gen", api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" },
+            { enable: true, priority: (state.registerConfig.mail.providers || []).length + 1, type: "cloudmail_gen", api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" },
           ],
         },
       },
@@ -1113,6 +1127,19 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.success(scope === "unused" ? "已清空未使用邮箱" : scope === "failed" ? "已清除失败/占用的邮箱状态" : "Outlook 邮箱池状态已全部重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置邮箱池状态失败");
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  resetRegisterMailHealth: async (providerId = "", domain = "") => {
+    set({ isSavingRegister: true });
+    try {
+      const data = await resetRegisterMailHealthApi(providerId, domain);
+      set({ registerConfig: normalizeRegisterConfig(data.register, get().registerConfig) });
+      toast.success(domain ? `已恢复域名 ${domain}` : providerId ? "已恢复邮箱渠道" : "已恢复全部邮箱渠道");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "恢复邮箱渠道失败");
     } finally {
       set({ isSavingRegister: false });
     }
