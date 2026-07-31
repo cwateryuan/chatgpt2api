@@ -166,6 +166,47 @@ class MailProviderHealthTests(unittest.TestCase):
         with mock.patch.object(mail_provider, "_load_outlook_token_state", return_value={}):
             self.assertTrue(mail_provider._outlook_entry_has_mailbox({"mailboxes": credentials}))
 
+    def test_outlook_alias_inventory_controls_exhaustion(self) -> None:
+        entry = {
+            "mailboxes": "user@outlook.com----p----client----token",
+            "alias_enabled": True,
+            "alias_per_email": 2,
+            "alias_prefix": "reg",
+            "alias_include_original": True,
+        }
+        with mock.patch.object(mail_provider, "_load_outlook_token_state", return_value={"user@outlook.com": {"state": "used"}}):
+            self.assertTrue(mail_provider._outlook_entry_has_mailbox(entry))
+        with mock.patch.object(mail_provider, "_load_outlook_token_state", return_value={"user@outlook.com": {"state": "token_invalid"}}):
+            self.assertFalse(mail_provider._outlook_entry_has_mailbox(entry))
+
+    def test_register_service_redacts_outlook_alias_inventory(self) -> None:
+        snapshot = {
+            "mail": {
+                "providers": [
+                    {
+                        "type": "outlook_token",
+                        "mailboxes": "user@outlook.com----secret-password----client----secret-refresh-token",
+                        "alias_enabled": True,
+                        "alias_per_email": 2,
+                        "alias_prefix": "reg",
+                        "alias_include_original": True,
+                    }
+                ]
+            }
+        }
+        service = object.__new__(RegisterService)
+        with mock.patch.object(mail_provider, "_load_outlook_token_state", return_value={}):
+            service._redact_outlook_pools(snapshot)
+        provider = snapshot["mail"]["providers"][0]
+        self.assertEqual(provider["mailboxes"], "")
+        self.assertEqual(provider["mailboxes_base_count"], 1)
+        self.assertEqual(provider["mailboxes_alias_count"], 2)
+        self.assertEqual(provider["mailboxes_count"], 3)
+        self.assertEqual(len(provider["alias_preview"]), 2)
+        serialized = str(provider)
+        self.assertNotIn("secret-password", serialized)
+        self.assertNotIn("secret-refresh-token", serialized)
+
     def test_concurrent_updates_are_not_lost_and_persist(self) -> None:
         with ThreadPoolExecutor(max_workers=8) as executor:
             list(executor.map(lambda _: self.store.record_result("parallel", success=False, threshold=100), range(25)))
@@ -210,6 +251,14 @@ class MailProviderHealthTests(unittest.TestCase):
         self.assertEqual(mail["providers"][0]["id"], "mailpit#1")
         self.assertEqual(mail["providers"][0]["priority"], 1)
         self.assertEqual(mail["providers"][0]["domain"], ["a.test", "b.test"])
+
+    def test_outlook_alias_config_defaults_and_bounds_are_normalized(self) -> None:
+        config = _normalize({"mail": {"providers": [{"type": "outlook_token", "enable": True, "alias_per_email": 999}]}})
+        provider = config["mail"]["providers"][0]
+        self.assertFalse(provider["alias_enabled"])
+        self.assertEqual(provider["alias_per_email"], 200)
+        self.assertEqual(provider["alias_prefix"], "c2api")
+        self.assertTrue(provider["alias_include_original"])
 
     def test_all_unavailable_raises_terminal_error(self) -> None:
         config = self.mail({"id": "off", "type": "mailpit", "enable": False, "priority": 1, "domain": ["a.test"]})

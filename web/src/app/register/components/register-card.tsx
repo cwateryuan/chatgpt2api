@@ -67,7 +67,7 @@ export function RegisterCard() {
       ...(type === "gptmail" ? { api_key: "", default_domain: "" } : {}),
       ...(type === "yyds_mail" ? { api_base: "https://maliapi.215.im/v1", api_key: "", domain: [], subdomain: "", wildcard: false } : {}),
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
-      ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10 } : {}),
+      ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10, alias_enabled: false, alias_per_email: 5, alias_prefix: "c2api", alias_include_original: true } : {}),
       ...(type === "mailpit" ? { api_url: "", domain: [], domain_mode: "round_robin" } : {}),
     });
   };
@@ -354,6 +354,26 @@ export function RegisterCard() {
                               <Input value={String(provider.imap_host || "outlook.office365.com")} onChange={(event) => updateProvider(index, { imap_host: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
                             </div>
                           ) : null}
+                          <label className="flex items-center gap-3 pt-8 text-sm text-stone-700">
+                            <Checkbox checked={Boolean(provider.alias_enabled)} onCheckedChange={(checked) => updateProvider(index, { alias_enabled: Boolean(checked) })} disabled={isRuntimeBusy} />
+                            启用 Outlook/Hotmail Plus Alias
+                          </label>
+                          {Boolean(provider.alias_enabled) ? (
+                            <>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">每个邮箱生成别名数</label>
+                                <Input type="number" min={0} max={200} value={Number(provider.alias_per_email ?? 5)} onChange={(event) => updateProvider(index, { alias_per_email: Math.max(0, Math.min(200, Number(event.target.value) || 0)) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
+                              </div>
+                              <div className="space-y-2">
+                                <label className="text-sm text-stone-700">别名前缀</label>
+                                <Input value={String(provider.alias_prefix || "c2api")} onChange={(event) => updateProvider(index, { alias_prefix: event.target.value })} placeholder="c2api" className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
+                              </div>
+                              <label className="flex items-center gap-3 pt-8 text-sm text-stone-700">
+                                <Checkbox checked={Boolean(provider.alias_include_original ?? true)} onCheckedChange={(checked) => updateProvider(index, { alias_include_original: Boolean(checked) })} disabled={isRuntimeBusy} />
+                                同时使用原始邮箱
+                              </label>
+                            </>
+                          ) : null}
                         </>
                       ) : null}
                     </div>
@@ -386,13 +406,26 @@ export function RegisterCard() {
                     {type === "outlook_token" ? (() => {
                       const stats = (provider.mailboxes_stats || {}) as Record<string, number>;
                       const savedCount = Number(provider.mailboxes_count || 0);
+                      const savedBaseCount = Number(provider.mailboxes_base_count || savedCount);
+                      const savedAliasCount = Number(provider.mailboxes_alias_count || 0);
                       const preview = Array.isArray(provider.mailboxes_preview) ? (provider.mailboxes_preview as string[]) : [];
-                      const pendingCount = String(provider.mailboxes || "").split(/\r?\n/).filter((line) => line.includes("----") && line.split("----").length >= 4).length;
+                      const aliasPreview = Array.isArray(provider.alias_preview) ? (provider.alias_preview as string[]) : [];
+                      const pendingLines = String(provider.mailboxes || "").split(/\r?\n/).filter((line) => line.includes("----") && line.split("----").length >= 4);
+                      const pendingCount = pendingLines.length;
+                      const aliasEnabled = Boolean(provider.alias_enabled);
+                      const aliasesPerEmail = Math.max(0, Math.min(200, Number(provider.alias_per_email ?? 5) || 0));
+                      const includeOriginal = Boolean(provider.alias_include_original ?? true);
+                      const supportedPending = pendingLines.filter((line) => {
+                        const email = line.split("----", 1)[0]?.trim().toLowerCase() || "";
+                        const domain = email.split("@")[1] || "";
+                        return domain === "outlook.com" || domain === "hotmail.com" || domain === "live.com" || domain === "msn.com" || domain.startsWith("hotmail.") || domain.startsWith("outlook.");
+                      }).length;
+                      const pendingExpanded = aliasEnabled && aliasesPerEmail > 0 ? supportedPending * aliasesPerEmail + (includeOriginal ? pendingCount : 0) : pendingCount;
                       return (
                         <div className="space-y-2">
                           <label className="flex items-center justify-between text-sm text-stone-700">
                             <span>邮箱池导入 <span className="text-red-400">*</span></span>
-                            <span className="text-xs text-stone-400">已保存 {savedCount} 个{pendingCount ? ` · 待导入 ${pendingCount} 个` : ""}</span>
+                            <span className="text-xs text-stone-400">基础邮箱 {savedBaseCount} 个 · 可用地址 {savedCount} 个{savedAliasCount ? `（别名 ${savedAliasCount}）` : ""}{pendingCount ? ` · 待导入 ${pendingCount} 个，预计展开 ${pendingExpanded} 个` : ""}</span>
                           </label>
                           <Textarea value={String(provider.mailboxes || "")} onChange={(event) => updateProvider(index, { mailboxes: event.target.value })} placeholder={"每行一个邮箱，格式：\n邮箱----密码----client_id----refresh_token\n（出于安全，已保存的密码/refresh_token 不会回显；此处仅用于新增或覆盖）"} className="min-h-32 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={isRuntimeBusy} />
                           <div className="flex flex-wrap items-center gap-1.5 text-xs">
@@ -405,6 +438,9 @@ export function RegisterCard() {
                           {preview.length ? (
                             <p className="text-xs text-stone-400">已保存邮箱（脱敏）：{preview.slice(0, 8).join("、")}{preview.length > 8 ? ` 等 ${preview.length} 个` : ""}</p>
                           ) : null}
+                          {aliasPreview.length ? (
+                            <p className="text-xs text-stone-400">别名示例（脱敏）：{aliasPreview.join("、")}</p>
+                          ) : null}
                           <div className="flex flex-wrap items-center gap-2">
                             <Button type="button" variant="outline" className="h-8 rounded-lg border-stone-200 bg-white px-3 text-xs text-stone-700" onClick={() => void resetOutlookPool("failed")} disabled={isRuntimeBusy}>
                               清除失败/占用状态
@@ -416,7 +452,7 @@ export function RegisterCard() {
                               重置全部状态
                             </Button>
                           </div>
-                          <p className="text-xs text-stone-500">每个邮箱仅成功注册一次（状态记录在 data/outlook_token_used.json）。失败的邮箱会被标记原因，可用上方按钮释放后重试。</p>
+                          <p className="text-xs text-stone-500">每个原始邮箱或别名仅成功注册一次（状态记录在 data/outlook_token_used.json）。别名共用原邮箱的 refresh token，验证码会按实际收件地址隔离。</p>
                         </div>
                       );
                     })() : null}

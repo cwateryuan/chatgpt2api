@@ -97,6 +97,13 @@ def _normalize_mail_config(value: object) -> dict:
         if provider_type == "mailpit":
             provider["domain"] = mail_provider.normalize_mailpit_domains(provider.get("domain") or provider.get("suffix"))
             provider["domain_mode"] = "sequential" if str(provider.get("domain_mode")) == "sequential" else "round_robin"
+        elif provider_type == "outlook_token":
+            provider["alias_enabled"] = mail_provider._normalize_bool(provider.get("alias_enabled"), False)
+            provider["alias_per_email"] = mail_provider._normalize_int(provider.get("alias_per_email"), 5, 0, 200)
+            provider["alias_prefix"] = str(provider.get("alias_prefix") or "c2api").strip() or "c2api"
+            provider["alias_include_original"] = mail_provider._normalize_bool(provider.get("alias_include_original"), True)
+            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "alias_preview"):
+                provider.pop(key, None)
         result["providers"].append(provider)
     return result
 
@@ -448,11 +455,16 @@ class RegisterService:
         for provider in providers:
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
-            credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
+            pool_text = str(provider.get("mailboxes") or "")
+            base_credentials = mail_provider.parse_outlook_credentials(pool_text)
+            credentials = mail_provider.expand_outlook_aliases(base_credentials, provider)
             provider["mailboxes"] = ""
             provider["mailboxes_count"] = len(credentials)
+            provider["mailboxes_base_count"] = len(base_credentials)
+            provider["mailboxes_alias_count"] = sum(1 for credential in credentials if credential.get("alias_of"))
             provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
             provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
+            provider["alias_preview"] = [self._mask_email(email) for email in mail_provider.outlook_alias_preview({**provider, "mailboxes": pool_text})]
 
     def _drop_mail_proxy(self) -> None:
         if isinstance(self._config.get("mail"), dict):
@@ -476,7 +488,7 @@ class RegisterService:
             old_text = str(old.get("mailboxes") or "") if old.get("type") == "outlook_token" else ""
             new_text = str(provider.get("mailboxes") or "")
             provider["mailboxes"] = _merge_outlook_pool(old_text, new_text) if (old_text or new_text) else ""
-            for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
+            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "alias_preview"):
                 provider.pop(key, None)
 
     def _drop_changed_provider_ids(self, updates: dict) -> None:
@@ -506,11 +518,11 @@ class RegisterService:
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
             credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
-            kept, removed = mail_provider.prune_outlook_unused_credentials(credentials)
+            kept, removed = mail_provider.prune_outlook_unused_credentials(credentials, provider)
             if removed:
                 provider["mailboxes"] = _serialize_outlook_pool(kept)
                 total_removed += removed
-            for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
+            for key in ("mailboxes_count", "mailboxes_base_count", "mailboxes_alias_count", "mailboxes_preview", "mailboxes_stats", "alias_preview"):
                 provider.pop(key, None)
         return total_removed
 
