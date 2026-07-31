@@ -2,6 +2,7 @@ import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type RegistrationTokenMode = "oauth" | "session" | "session_fallback";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
@@ -20,6 +21,7 @@ export type Account = {
   access_token: string;
   type: AccountType;
   source_type?: string | null;
+  registration_token_mode?: RegistrationTokenMode | null;
   status: AccountStatus;
   quota: number;
   image_quota_unknown?: boolean;

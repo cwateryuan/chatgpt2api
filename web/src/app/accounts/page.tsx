@@ -175,6 +175,17 @@ function displayAccountType(account: Account) {
 }
 
 function displayAccountSource(account: Account) {
+  const tokenMode = String(account.registration_token_mode || "").trim().toLowerCase();
+  if (tokenMode === "oauth") {
+    return "OAuth";
+  }
+  if (tokenMode === "session") {
+    return "Session";
+  }
+  if (tokenMode === "session_fallback") {
+    return "Session（兜底）";
+  }
+
   const source = String(account.source_type || "").trim().toLowerCase();
   if (!source) {
     return "web";
