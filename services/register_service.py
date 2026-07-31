@@ -62,7 +62,7 @@ def _now() -> str:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "engine": "http", "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {**openai_register.config, "engine": "http", "browser_token_mode": "session", "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
 def _normalize_mail_config(value: object) -> dict:
@@ -116,6 +116,9 @@ def _normalize(raw: dict) -> dict:
     cfg["engine"] = str(cfg.get("engine") or "http").strip().lower()
     if cfg["engine"] not in {"http", "browser"}:
         cfg["engine"] = "http"
+    cfg["browser_token_mode"] = str(cfg.get("browser_token_mode") or "session").strip().lower()
+    if cfg["browser_token_mode"] not in {"session", "oauth"}:
+        cfg["browser_token_mode"] = "session"
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
@@ -243,6 +246,7 @@ class RegisterService:
                 "enabled": bool(self._config.get("enabled")),
                 "mode": self._config.get("mode"),
                 "engine": self._config.get("engine"),
+                "browser_token_mode": self._config.get("browser_token_mode"),
                 "total": self._config.get("total"),
                 "threads": self._config.get("threads"),
                 "target_quota": self._config.get("target_quota"),
@@ -320,7 +324,7 @@ class RegisterService:
             }
             self._config["stats"].setdefault("job_id", uuid.uuid4().hex)
             self._config["stats"].setdefault("started_at", _now())
-        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine")})
+        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine", "browser_token_mode")})
         self._sync_register_stats_locked()
         if reset_runtime:
             self._save()
@@ -535,7 +539,7 @@ class RegisterService:
             self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine")})
+            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine", "browser_token_mode")})
             self._save()
             return self.get()
 
@@ -568,7 +572,8 @@ class RegisterService:
             self._clear_stop_requested()
             self._start_runner_locked(reset_runtime=True, recovered=False)
             self._append_log(
-                f"注册任务启动，引擎={self._config['engine']}，模式={self._config['mode']}，线程数={self._config['threads']}",
+                f"注册任务启动，引擎={self._config['engine']}，凭据={self._config['browser_token_mode']}，"
+                f"模式={self._config['mode']}，线程数={self._config['threads']}",
                 "yellow",
             )
             return self.get()
@@ -608,7 +613,7 @@ class RegisterService:
                 if loaded:
                     self._config = loaded
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine")})
+                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine", "browser_token_mode")})
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()

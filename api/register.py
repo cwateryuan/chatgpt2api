@@ -13,6 +13,7 @@ from services.register_service import register_service
 
 class RegisterConfigRequest(BaseModel):
     engine: str | None = None
+    browser_token_mode: str | None = None
     mail: dict | None = None
     proxy: str | None = None
     total: int | None = None

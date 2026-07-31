@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -149,6 +150,11 @@ class RegistrationHardeningTests(unittest.TestCase):
         config = _normalize({"engine": "browser", "threads": 9, "stats": {"threads": 9}})
         self.assertEqual(config["threads"], 9)
         self.assertEqual(config["stats"]["threads"], 9)
+
+    def test_browser_token_mode_defaults_to_session_and_accepts_oauth(self):
+        self.assertEqual(_normalize({"engine": "browser"})["browser_token_mode"], "session")
+        self.assertEqual(_normalize({"engine": "browser", "browser_token_mode": "oauth"})["browser_token_mode"], "oauth")
+        self.assertEqual(_normalize({"engine": "browser", "browser_token_mode": "invalid"})["browser_token_mode"], "session")
 
     def test_browser_runner_uses_configured_thread_pool_size(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -451,6 +457,7 @@ class RegistrationHardeningTests(unittest.TestCase):
             )
 
         self.assertEqual(tokens["access_token"], "session-token")
+        self.assertEqual(tokens["registration_token_mode"], "session")
         proxy_auth.assert_called_once_with(12345, "clip-user", "clip-password")
         proxy_auth.return_value.start.assert_called_once()
         proxy_auth.return_value.close.assert_called_once()
@@ -462,6 +469,115 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertEqual(registrar.fingerprint["device_id"], "browser-device-id")
         self.assertEqual(registrar.fingerprint["timezone"], "UTC")
         self.assertEqual(registrar.fingerprint["screen_width"], "1365")
+
+    def test_browser_oauth_authorize_reuses_login_state_and_exchanges_callback(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 30
+        callback = "https://platform.openai.com/auth/callback?code=callback-code&state=expected-state"
+        tokens = {"access_token": "oauth-access", "refresh_token": "oauth-refresh", "id_token": "oauth-id"}
+
+        with (
+            mock.patch.object(browser_register, "generate_pkce", return_value=("verifier", "challenge")),
+            mock.patch.object(browser_register.secrets, "token_urlsafe", side_effect=["expected-state", "nonce"]),
+            mock.patch.object(browser_register.browser_devtools, "navigate_to") as navigate,
+            mock.patch.object(registrar, "_devtools_state", return_value={"url": callback, "inputs": [], "buttons": []}),
+            mock.patch.object(registrar, "_exchange_browser_oauth_code", return_value=tokens) as exchange,
+            mock.patch.object(browser_register, "step"),
+        ):
+            result = registrar._devtools_platform_oauth_tokens(
+                12345,
+                {"provider": "outlook_token"},
+                "same@example.com",
+                1,
+            )
+
+        authorize_url = navigate.call_args.args[1]
+        params = parse_qs(urlparse(authorize_url).query)
+        self.assertNotIn("max_age", params)
+        self.assertIn("offline_access", params["scope"][0])
+        self.assertEqual(params["state"], ["expected-state"])
+        exchange.assert_called_once_with("callback-code", "verifier")
+        self.assertEqual(result, tokens)
+
+    def test_browser_oauth_callback_state_mismatch_is_rejected(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar._deadline = time.monotonic() + 30
+        callback = "https://platform.openai.com/auth/callback?code=callback-code&state=wrong-state"
+        with (
+            mock.patch.object(browser_register, "generate_pkce", return_value=("verifier", "challenge")),
+            mock.patch.object(browser_register.secrets, "token_urlsafe", side_effect=["expected-state", "nonce"]),
+            mock.patch.object(browser_register.browser_devtools, "navigate_to"),
+            mock.patch.object(registrar, "_devtools_state", return_value={"url": callback, "inputs": [], "buttons": []}),
+            mock.patch.object(browser_register, "step"),
+        ):
+            with self.assertRaisesRegex(browser_register.BrowserRegistrationError, "browser_oauth_state_mismatch"):
+                registrar._devtools_platform_oauth_tokens(12345, {}, "same@example.com", 1)
+
+    def test_browser_oauth_exchange_uses_registration_proxy(self):
+        registrar = browser_register.BrowserRegistrar()
+        registrar.registration_proxy_url = "http://user:password@proxy.example:8080"
+        registrar.fingerprint["impersonate"] = "chrome136"
+        session = mock.Mock()
+        tokens = {"access_token": "oauth-access", "refresh_token": "oauth-refresh", "id_token": "oauth-id"}
+        with (
+            mock.patch.object(browser_register.proxy_settings, "build_session_kwargs", return_value={"proxy": registrar.registration_proxy_url}) as build,
+            mock.patch.object(browser_register.requests, "Session", return_value=session),
+            mock.patch.object(browser_register, "request_platform_oauth_token", return_value=tokens),
+        ):
+            result = registrar._exchange_browser_oauth_code("callback-code", "verifier")
+
+        self.assertEqual(result, tokens)
+        self.assertEqual(build.call_args.kwargs["proxy"], registrar.registration_proxy_url)
+        self.assertFalse(build.call_args.kwargs["upstream"])
+        self.assertEqual(build.call_args.kwargs["impersonate"], "chrome136")
+        session.close.assert_called_once()
+
+    def test_browser_oauth_mode_marks_success_and_session_fallback(self):
+        registrar = browser_register.BrowserRegistrar()
+        oauth_tokens = {"access_token": "oauth-access", "refresh_token": "oauth-refresh", "id_token": "oauth-id"}
+        with (
+            mock.patch.dict(browser_register.config, {"browser_token_mode": "oauth"}),
+            mock.patch.object(registrar, "_devtools_access_token", return_value="session-access"),
+            mock.patch.object(registrar, "_devtools_platform_oauth_tokens", return_value=oauth_tokens),
+            mock.patch.object(browser_register, "step"),
+        ):
+            result = registrar._devtools_registration_tokens(12345, {}, "same@example.com", 1)
+        self.assertEqual(result["registration_token_mode"], "oauth")
+        self.assertEqual(result["refresh_token"], "oauth-refresh")
+
+        with (
+            mock.patch.dict(browser_register.config, {"browser_token_mode": "oauth"}),
+            mock.patch.object(registrar, "_devtools_access_token", return_value="session-access"),
+            mock.patch.object(
+                registrar,
+                "_devtools_platform_oauth_tokens",
+                side_effect=browser_register.BrowserRegistrationError("oauth blocked"),
+            ),
+            mock.patch.object(browser_register, "step") as log_step,
+        ):
+            result = registrar._devtools_registration_tokens(12345, {}, "same@example.com", 1)
+        self.assertEqual(result["registration_token_mode"], "session_fallback")
+        self.assertEqual(result["access_token"], "session-access")
+        self.assertIn("使用 session token", " ".join(str(call) for call in log_step.call_args_list))
+
+    def test_browser_oauth_and_session_failure_rejects_account(self):
+        registrar = browser_register.BrowserRegistrar()
+        with (
+            mock.patch.dict(browser_register.config, {"browser_token_mode": "oauth"}),
+            mock.patch.object(registrar, "_devtools_access_token", side_effect=RuntimeError("session unavailable")),
+            mock.patch.object(registrar, "_devtools_platform_oauth_tokens", side_effect=RuntimeError("oauth unavailable")),
+            mock.patch.object(browser_register, "step"),
+        ):
+            with self.assertRaisesRegex(browser_register.BrowserRegistrationError, "browser_oauth_and_session_failed"):
+                registrar._devtools_registration_tokens(12345, {}, "same@example.com", 1)
+
+    def test_browser_oauth_failure_log_redacts_proxy_credentials(self):
+        message = browser_register._sanitized_error(
+            RuntimeError("connect failed via http://proxy-user:proxy-password@proxy.example:8080")
+        )
+        self.assertNotIn("proxy-user", message)
+        self.assertNotIn("proxy-password", message)
+        self.assertIn("http://***:***@proxy.example:8080", message)
 
     def test_browser_devtools_actions_use_native_input_events(self):
         email_script = browser_register._devtools_submit_email_js("same@example.com")

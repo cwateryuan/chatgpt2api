@@ -19,6 +19,7 @@ export function RegisterCard() {
   const setTotal = useSettingsStore((state) => state.setRegisterTotal);
   const setThreads = useSettingsStore((state) => state.setRegisterThreads);
   const setEngine = useSettingsStore((state) => state.setRegisterEngine);
+  const setBrowserTokenMode = useSettingsStore((state) => state.setRegisterBrowserTokenMode);
   const setMode = useSettingsStore((state) => state.setRegisterMode);
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
@@ -74,7 +75,7 @@ export function RegisterCard() {
 
   return (
     <div className="grid h-[calc(100vh-132px)] min-h-[640px] items-stretch gap-0 overflow-hidden rounded-xl border border-stone-200 bg-white/70 xl:grid-cols-2">
-      <section className="space-y-4 overflow-y-auto border-b border-stone-200 p-4 xl:border-r xl:border-b-0">
+      <section className="min-w-0 space-y-4 overflow-y-auto border-b border-stone-200 p-4 xl:border-r xl:border-b-0">
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-3">
               <div className="flex size-9 items-center justify-center rounded-md bg-stone-100">
@@ -108,6 +109,20 @@ export function RegisterCard() {
             {config.engine === "browser" && config.browser_available ? <p className="text-xs text-stone-500">Chromium {config.browser_version || "available"}，每个并发任务使用独立浏览器实例。</p> : null}
             {browserUnavailable ? <p className="text-xs text-rose-600">浏览器运行环境不可用：{config.browser_error || "Chromium 未安装"}</p> : null}
           </div>
+
+          {config.engine === "browser" ? (
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">入池凭据</label>
+              <div className="grid h-10 grid-cols-2 border border-stone-200 bg-stone-50 p-1">
+                <button type="button" className={`text-sm transition ${config.browser_token_mode === "session" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => setBrowserTokenMode("session")} disabled={isRuntimeBusy}>
+                  Session Token
+                </button>
+                <button type="button" className={`text-sm transition ${config.browser_token_mode === "oauth" ? "bg-white font-medium text-stone-900 shadow-sm" : "text-stone-500"}`} onClick={() => setBrowserTokenMode("oauth")} disabled={isRuntimeBusy}>
+                  OAuth Token
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           <div className="grid gap-4 md:grid-cols-3">
             <div className="space-y-2">
@@ -477,7 +492,7 @@ export function RegisterCard() {
 
       </section>
 
-      <section className="flex min-h-0 flex-col p-4">
+      <section className="flex min-h-0 min-w-0 flex-col p-4">
         <div className="space-y-3">
             <div className="flex items-start justify-between gap-3">
               <div>

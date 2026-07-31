@@ -368,6 +368,7 @@ export type OutlookPoolStats = {
 export type RegisterConfig = {
   enabled: boolean;
   engine: "http" | "browser";
+  browser_token_mode: "session" | "oauth";
   browser_available: boolean;
   browser_version: string;
   browser_error: string;

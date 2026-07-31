@@ -4,6 +4,7 @@ import importlib.metadata
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -11,7 +12,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
+
+from curl_cffi import requests
 
 from services.browser_fingerprint import make_fingerprint
 from services.proxy_service import ClearanceBundle, proxy_settings
@@ -23,8 +26,14 @@ from services.register.openai_register import (
     _random_password,
     auth_base,
     config,
+    platform_auth0_client,
+    platform_oauth_audience,
+    platform_oauth_client_id,
+    platform_oauth_redirect_uri,
+    request_platform_oauth_token,
     step,
 )
+from utils.pkce import generate_pkce
 
 
 BROWSER_NAVIGATION_TIMEOUT_MS = 45_000
@@ -151,6 +160,23 @@ DEVTOOLS_FINGERPRINT_JS = r"""
     stored_device_id: storedUuid(/device|oai.did/i),
     stored_session_id: storedUuid(/session/i)
   });
+})()
+"""
+
+
+DEVTOOLS_CLICK_CONSENT_JS = r"""
+(async () => {
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (element) => !!element && !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+  const controls = [...document.querySelectorAll("button,a,[role=button],input[type=submit]")].filter(visible);
+  const text = (element) => (element.innerText || element.textContent || element.value || "").trim();
+  const target = controls.find((element) => /^(allow|agree|authorize|confirm|accept|同意|授权|确认)$/i.test(text(element)))
+    || controls.find((element) => /allow|agree|authorize|confirm|accept|同意|授权|确认/i.test(text(element)))
+    || controls.find((element) => /^(continue|next|继续|下一步)$/i.test(text(element)));
+  if (!target) throw new Error("oauth_consent_button_missing");
+  target.click();
+  await sleep(1000);
+  return JSON.stringify({url: location.href, title: document.title});
 })()
 """
 
@@ -379,6 +405,12 @@ class BrowserRegistrationError(RuntimeError):
 def _sanitized_error(error: BaseException) -> str:
     text = str(error or error.__class__.__name__)
     text = re.sub(r"([?&](?:login_hint|username|email)=)[^&\s]+", r"\1***", text, flags=re.I)
+    text = re.sub(
+        r"((?:https?|socks5h?|socks)://)([^\s/@:]+):([^\s/@]+)@",
+        r"\1***:***@",
+        text,
+        flags=re.I,
+    )
     return text[:500]
 
 
@@ -795,7 +827,7 @@ class BrowserRegistrar:
             port,
             DEVTOOLS_STATE_JS,
             timeout=self._devtools_timeout(20),
-            hosts=("chatgpt.com", "auth.openai.com"),
+            hosts=("chatgpt.com", "auth.openai.com", "platform.openai.com"),
         )
         title = str(state.get("title") or "")
         body = str(state.get("body") or "")
@@ -906,6 +938,179 @@ class BrowserRegistrar:
                 return access_token
             time.sleep(1)
         raise BrowserRegistrationError(f"browser_session_token_missing:{last_status}")
+
+    def _platform_authorize_url(self, email: str, state: str, code_challenge: str) -> str:
+        params = {
+            "issuer": auth_base,
+            "client_id": platform_oauth_client_id,
+            "audience": platform_oauth_audience,
+            "redirect_uri": platform_oauth_redirect_uri,
+            "device_id": str(self.fingerprint.get("device_id") or ""),
+            "screen_hint": "login_or_signup",
+            "login_hint": email,
+            "scope": "openid profile email offline_access",
+            "response_type": "code",
+            "response_mode": "query",
+            "state": state,
+            "nonce": secrets.token_urlsafe(32),
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "auth0Client": platform_auth0_client,
+        }
+        return f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+
+    @staticmethod
+    def _oauth_consent_visible(state: dict[str, Any]) -> bool:
+        path = urlparse(str(state.get("url") or "")).path.lower()
+        buttons = state.get("buttons") if isinstance(state.get("buttons"), list) else []
+        labels = " ".join(str(item.get("text") or "") for item in buttons if isinstance(item, dict)).lower()
+        if any(word in labels for word in ("allow", "agree", "authorize", "confirm", "accept", "同意", "授权", "确认")):
+            return True
+        return any(marker in path for marker in ("/consent", "/authorize/resume", "/oauth/authorize")) and any(
+            word in labels for word in ("continue", "next", "继续", "下一步")
+        )
+
+    def _exchange_browser_oauth_code(self, code: str, code_verifier: str) -> dict[str, str]:
+        proxy = self.registration_proxy_url or str(config.get("proxy") or "")
+        session = requests.Session(**proxy_settings.build_session_kwargs(
+            proxy=proxy,
+            upstream=False,
+            impersonate=str(self.fingerprint.get("impersonate") or "chrome"),
+            verify=False,
+        ))
+        try:
+            tokens = request_platform_oauth_token(session, code, code_verifier, self.fingerprint) or {}
+        finally:
+            session.close()
+        access_token = str(tokens.get("access_token") or "").strip()
+        refresh_token = str(tokens.get("refresh_token") or "").strip()
+        if not access_token or not refresh_token:
+            raise BrowserRegistrationError("browser_oauth_token_incomplete")
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": str(tokens.get("id_token") or "").strip(),
+        }
+
+    def _devtools_platform_oauth_tokens(
+        self,
+        port: int,
+        mailbox: dict,
+        email: str,
+        index: int,
+    ) -> dict[str, str]:
+        code_verifier, code_challenge = generate_pkce()
+        expected_state = secrets.token_urlsafe(32)
+        authorize_url = self._platform_authorize_url(email, expected_state, code_challenge)
+        step(index, "浏览器注册完成，开始 Platform OAuth 授权")
+        browser_devtools.navigate_to(port, authorize_url, self._devtools_timeout())
+
+        email_submitted = False
+        otp_entry_clicked = False
+        otp_submitted = False
+        consent_clicks = 0
+        last_summary = ""
+        while time.monotonic() < self._deadline:
+            state = self._devtools_state(port)
+            current_url = str(state.get("url") or "")
+            parsed = urlparse(current_url)
+            if parsed.hostname == "platform.openai.com" and parsed.path.rstrip("/") == "/auth/callback":
+                query = parse_qs(parsed.query)
+                callback_state = str((query.get("state") or [""])[0]).strip()
+                code = str((query.get("code") or [""])[0]).strip()
+                if callback_state != expected_state:
+                    raise BrowserRegistrationError("browser_oauth_state_mismatch")
+                if not code:
+                    error = str((query.get("error") or [""])[0]).strip()
+                    raise BrowserRegistrationError(f"browser_oauth_callback_missing_code:{error or 'unknown'}")
+                tokens = self._exchange_browser_oauth_code(code, code_verifier)
+                step(index, "Platform OAuth token 获取完成")
+                return tokens
+
+            summary = self._devtools_state_summary(state)
+            if summary != last_summary:
+                step(index, f"Platform OAuth 状态 {summary}")
+                last_summary = summary
+
+            if _devtools_is_code_page(state) and not otp_submitted:
+                code = self._wait_for_otp(mailbox, index, login=True)
+                browser_devtools.evaluate_json(
+                    port,
+                    _devtools_submit_code_js(code),
+                    timeout=self._devtools_timeout(20),
+                    hosts=("auth.openai.com",),
+                )
+                otp_submitted = True
+            elif _devtools_is_password_page(state) and not otp_entry_clicked:
+                mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+                browser_devtools.evaluate_json(
+                    port,
+                    DEVTOOLS_CLICK_ONE_TIME_CODE_JS,
+                    timeout=self._devtools_timeout(20),
+                    hosts=("auth.openai.com",),
+                )
+                otp_entry_clicked = True
+            elif any(str(item.get("type") or "").lower() == "email" for item in _devtools_visible_inputs(state)) and not email_submitted:
+                browser_devtools.evaluate_json(
+                    port,
+                    _devtools_submit_email_js(email),
+                    timeout=self._devtools_timeout(20),
+                    hosts=("auth.openai.com",),
+                )
+                email_submitted = True
+            elif self._oauth_consent_visible(state):
+                if consent_clicks >= 3:
+                    raise BrowserRegistrationError("browser_oauth_consent_stalled")
+                browser_devtools.evaluate_json(
+                    port,
+                    DEVTOOLS_CLICK_CONSENT_JS,
+                    timeout=self._devtools_timeout(20),
+                    hosts=("auth.openai.com", "platform.openai.com"),
+                )
+                consent_clicks += 1
+            else:
+                time.sleep(0.5)
+        raise BrowserRegistrationError("browser_oauth_callback_timeout")
+
+    def _devtools_registration_tokens(
+        self,
+        port: int,
+        mailbox: dict,
+        email: str,
+        index: int,
+    ) -> dict[str, str]:
+        token_mode = str(config.get("browser_token_mode") or "session").strip().lower()
+        if token_mode != "oauth":
+            step(index, "ChatGPT 注册完成，读取浏览器 session token")
+            access_token = self._devtools_access_token(port)
+            return {
+                "access_token": access_token,
+                "refresh_token": "",
+                "id_token": "",
+                "registration_token_mode": "session",
+            }
+
+        session_access_token = ""
+        try:
+            step(index, "ChatGPT 注册完成，缓存 session token 作为 OAuth 失败兜底")
+            session_access_token = self._devtools_access_token(port)
+        except Exception as error:
+            step(index, f"session token 兜底缓存失败: {_sanitized_error(error)}", "yellow")
+
+        try:
+            oauth_tokens = self._devtools_platform_oauth_tokens(port, mailbox, email, index)
+            return {**oauth_tokens, "registration_token_mode": "oauth"}
+        except Exception as error:
+            reason = _sanitized_error(error)
+            if not session_access_token:
+                raise BrowserRegistrationError(f"browser_oauth_and_session_failed:{reason}") from error
+            step(index, f"Platform OAuth 获取失败，使用 session token 入池: {reason}", "yellow")
+            return {
+                "access_token": session_access_token,
+                "refresh_token": "",
+                "id_token": "",
+                "registration_token_mode": "session_fallback",
+            }
 
     @staticmethod
     def _client_hint_brands(items: object) -> str:
@@ -1117,9 +1322,7 @@ class BrowserRegistrar:
                 if not _devtools_is_logged_in(state):
                     raise BrowserRegistrationError(f"browser_login_incomplete:{self._devtools_state_summary(state)}")
                 self._capture_devtools_fingerprint(port, index)
-                step(index, "ChatGPT 注册完成，读取浏览器 session token")
-                access_token = self._devtools_access_token(port)
-                return {"access_token": access_token, "refresh_token": "", "id_token": ""}
+                return self._devtools_registration_tokens(port, mailbox, email, index)
             finally:
                 if proxy_auth is not None:
                     proxy_auth.close()
