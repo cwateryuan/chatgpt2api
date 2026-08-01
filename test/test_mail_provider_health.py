@@ -46,6 +46,14 @@ class MailProviderHealthTests(unittest.TestCase):
             ["a.example.com", "b.example.com"],
         )
 
+    def test_mail_proxy_colon_format_is_normalized_for_curl(self) -> None:
+        raw = "us.cliproxy.io:3010:wjmb1120177-region-DE-st-Hamburg:x9e5r6jr"
+        conf = mail_provider._config({"proxy": raw})
+        self.assertEqual(
+            conf["proxy"],
+            "http://wjmb1120177-region-DE-st-Hamburg:x9e5r6jr@us.cliproxy.io:3010",
+        )
+
     def test_mailpit_round_robin_and_sequential_selection(self) -> None:
         entry = {"id": "mailpit-main", "domain": ["a.test", "b.test"], "domain_mode": "round_robin"}
         selected = [mail_provider._select_mailpit_domain(entry, auto_disable=True) for _ in range(3)]
@@ -281,6 +289,7 @@ class MailProviderHealthTests(unittest.TestCase):
 
     def test_http_registration_marks_empty_access_token_as_failure(self) -> None:
         registrar = object.__new__(openai_register.PlatformRegistrar)
+        registrar.proxy = ""
         registrar.fingerprint = {}
         registrar._platform_authorize = mock.Mock(return_value="signup")
         registrar._register_user = mock.Mock()

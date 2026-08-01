@@ -19,6 +19,7 @@ from curl_cffi import requests
 
 
 from services.config import DATA_DIR
+from services.proxy_service import normalize_proxy_url
 from services.register.mail_health import mail_health_store
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
@@ -252,7 +253,7 @@ def _config(mail_config: dict) -> dict:
         "wait_timeout": float(mail_config.get("wait_timeout") or 30),
         "wait_interval": float(mail_config.get("wait_interval") or 2),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
-        "proxy": str(mail_config.get("proxy") or "").strip(),
+        "proxy": normalize_proxy_url(str(mail_config.get("proxy") or "")),
     }
 
 
