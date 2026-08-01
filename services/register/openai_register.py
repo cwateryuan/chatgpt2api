@@ -44,6 +44,29 @@ try:
 except Exception:
     pass
 
+
+def registration_proxy_pool(value: object) -> list[str]:
+    proxies: list[str] = []
+    seen: set[str] = set()
+    for line in str(value or "").splitlines():
+        proxy = line.strip()
+        if proxy and proxy not in seen:
+            proxies.append(proxy)
+            seen.add(proxy)
+    return proxies
+
+
+def normalize_registration_proxy_text(value: object) -> str:
+    return "\n".join(registration_proxy_pool(value))
+
+
+def select_registration_proxy(value: object, index: int) -> str:
+    proxies = registration_proxy_pool(value)
+    if not proxies:
+        return ""
+    task_index = max(1, int(index or 1))
+    return proxies[(task_index - 1) % len(proxies)]
+
 auth_base = "https://auth.openai.com"
 platform_base = "https://platform.openai.com"
 platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
@@ -330,8 +353,8 @@ def _is_cloudflare_challenge(resp) -> bool:
     )
 
 
-def _mail_config() -> dict:
-    return {**config["mail"], "proxy": config["proxy"]}
+def _mail_config(proxy: str | None = None) -> dict:
+    return {**config["mail"], "proxy": config["proxy"] if proxy is None else proxy}
 
 
 def _authorize_landed_page(resp) -> str:
@@ -378,12 +401,12 @@ def _url_path(url: str) -> str:
         return ""
 
 
-def create_mailbox(username: str | None = None) -> dict:
-    return mail_provider.create_mailbox(_mail_config(), username)
+def create_mailbox(username: str | None = None, *, proxy: str | None = None) -> dict:
+    return mail_provider.create_mailbox(_mail_config(proxy), username)
 
 
-def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(_mail_config(), mailbox)
+def wait_for_code(mailbox: dict, *, proxy: str | None = None) -> str | None:
+    return mail_provider.wait_for_code(_mail_config(proxy), mailbox)
 
 
 from utils.sentinel import (
@@ -866,7 +889,7 @@ class PlatformRegistrar:
             mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
             self._send_passwordless_otp(index)
             step(index, "开始等待 Microsoft 登录验证码")
-            code = wait_for_code(mailbox)
+            code = wait_for_code(mailbox, proxy=self.proxy)
             if not code:
                 raise RuntimeError("等待 Microsoft 登录验证码超时")
             step(index, f"收到 Microsoft 登录验证码: {code}")
@@ -905,7 +928,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox()
+        mailbox = create_mailbox(proxy=self.proxy)
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
@@ -926,7 +949,7 @@ class PlatformRegistrar:
                 mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
                 self._send_otp(index)
                 step(index, "开始等待注册验证码")
-                code = wait_for_code(mailbox)
+                code = wait_for_code(mailbox, proxy=self.proxy)
                 if not code:
                     raise RuntimeError("等待注册验证码超时")
                 step(index, f"收到注册验证码: {code}")
@@ -958,9 +981,12 @@ class PlatformRegistrar:
 
 def worker(index: int) -> dict:
     start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
+    proxies = registration_proxy_pool(config.get("proxy"))
+    proxy = select_registration_proxy(config.get("proxy"), index)
+    registrar = PlatformRegistrar(proxy)
     try:
-        step(index, "任务启动")
+        proxy_position = (max(1, int(index)) - 1) % len(proxies) + 1 if proxies else 0
+        step(index, f"任务启动 proxy={proxy_position}/{len(proxies)}" if proxies else "任务启动 proxy=none")
         result = registrar.register(index)
         cost = time.time() - start
         access_token = str(result["access_token"])

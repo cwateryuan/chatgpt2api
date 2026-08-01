@@ -123,7 +123,7 @@ def _normalize(raw: dict) -> dict:
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
-    cfg["proxy"] = str(cfg.get("proxy") or "").strip()
+    cfg["proxy"] = openai_register.normalize_registration_proxy_text(cfg.get("proxy"))
     cfg["mail"] = _normalize_mail_config(cfg.get("mail"))
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {

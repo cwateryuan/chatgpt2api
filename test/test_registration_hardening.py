@@ -74,7 +74,13 @@ class RegistrationHardeningTests(unittest.TestCase):
             service = AccountService(JSONStorageBackend(path))
             service.add_account_items([{
                 "access_token": "token",
-                "fp": {"user_agent": "Custom UA", "custom_marker": "keep"},
+                "fp": {
+                    "user_agent": "Custom UA",
+                    "custom_marker": "keep",
+                    "timezone": "Europe/Berlin",
+                    "latitude": "50.11",
+                    "longitude": "8.68",
+                },
             }])
 
             first = service.get_or_create_fingerprint("token")
@@ -84,6 +90,8 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["user_agent"], "Custom UA")
         self.assertEqual(first["custom_marker"], "keep")
+        self.assertEqual(reloaded["fp"]["timezone"], "Europe/Berlin")
+        self.assertEqual(reloaded["fp"]["latitude"], "50.11")
         self.assertEqual(reloaded["fp"]["device_id"], first["device_id"])
         self.assertEqual(reloaded["fp"]["session_id"], first["session_id"])
 
@@ -150,6 +158,18 @@ class RegistrationHardeningTests(unittest.TestCase):
         config = _normalize({"engine": "browser", "threads": 9, "stats": {"threads": 9}})
         self.assertEqual(config["threads"], 9)
         self.assertEqual(config["stats"]["threads"], 9)
+
+    def test_registration_proxy_pool_is_normalized_and_round_robined(self):
+        raw = "  http://proxy-a:8080\r\n\nhttp://proxy-b:8080\nhttp://proxy-a:8080  "
+        config = _normalize({"proxy": raw})
+        self.assertEqual(config["proxy"], "http://proxy-a:8080\nhttp://proxy-b:8080")
+        self.assertEqual(openai_register.registration_proxy_pool(config["proxy"]), [
+            "http://proxy-a:8080",
+            "http://proxy-b:8080",
+        ])
+        self.assertEqual(openai_register.select_registration_proxy(config["proxy"], 1), "http://proxy-a:8080")
+        self.assertEqual(openai_register.select_registration_proxy(config["proxy"], 2), "http://proxy-b:8080")
+        self.assertEqual(openai_register.select_registration_proxy(config["proxy"], 3), "http://proxy-a:8080")
 
     def test_browser_token_mode_defaults_to_session_and_accepts_oauth(self):
         self.assertEqual(_normalize({"engine": "browser"})["browser_token_mode"], "session")
@@ -391,6 +411,13 @@ class RegistrationHardeningTests(unittest.TestCase):
         registrar._deadline = time.monotonic() + 120
         registrar.registration_proxy_username = "clip-user"
         registrar.registration_proxy_password = "clip-password"
+        registrar.geo_environment = {
+            "timezone": "Europe/Berlin",
+            "language": "de-DE",
+            "accept_language": "de-DE,de;q=0.9,en;q=0.8",
+            "latitude": 50.11,
+            "longitude": 8.68,
+        }
         process = mock.Mock()
         code_state = {
             "url": "https://auth.openai.com/email-verification",
@@ -408,6 +435,11 @@ class RegistrationHardeningTests(unittest.TestCase):
         with (
             mock.patch.object(registrar, "_launch_devtools_browser", return_value=(process, 12345)),
             mock.patch.object(browser_register.browser_devtools, "ProxyAuthHandler") as proxy_auth,
+            mock.patch.object(
+                browser_register.browser_devtools,
+                "apply_environment_overrides",
+                return_value={"timezone": True, "locale": True, "geolocation": True},
+            ) as apply_environment,
             mock.patch.object(browser_register.browser_devtools, "navigate_to") as navigate_to,
             mock.patch.object(registrar, "_wait_for_otp", return_value="246810") as wait_for_otp,
             mock.patch.object(browser_register.browser_devtools, "wait_for", return_value={"url": "https://chatgpt.com/auth/login"}),
@@ -461,6 +493,15 @@ class RegistrationHardeningTests(unittest.TestCase):
         proxy_auth.assert_called_once_with(12345, "clip-user", "clip-password")
         proxy_auth.return_value.start.assert_called_once()
         proxy_auth.return_value.close.assert_called_once()
+        apply_environment.assert_called_once_with(
+            12345,
+            timezone_id="Europe/Berlin",
+            locale="de-DE",
+            accept_language="de-DE,de;q=0.9,en;q=0.8",
+            latitude=50.11,
+            longitude=8.68,
+            timeout=mock.ANY,
+        )
         navigate_to.assert_called_once_with(12345, browser_register.CHATGPT_LOGIN_URL, mock.ANY)
         self.assertEqual(submit_until.call_count, 3)
         wait_for_otp.assert_called_once()
@@ -591,6 +632,73 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertIn("setValue(ageInput, age)", profile_script)
         self.assertIn("finish creating account", profile_script)
 
+    def test_proxy_geography_normalizes_locale_and_uses_cache(self):
+        geo = browser_register._normalize_geo_payload({
+            "ip": "198.51.100.10",
+            "country_code": "DE",
+            "city": "Frankfurt",
+            "timezone": "Europe/Berlin",
+            "latitude": 50.11,
+            "longitude": 8.68,
+            "languages": "de-DE,de,en",
+        })
+        self.assertEqual(geo["language"], "de-DE")
+        self.assertEqual(geo["languages"], ["de-DE", "de", "en"])
+        self.assertEqual(geo["accept_language"], "de-DE,de;q=0.9,en;q=0.8")
+
+        browser_register._geo_cache.clear()
+        browser_register._geo_inflight.clear()
+        with mock.patch.object(browser_register, "_query_proxy_geography", return_value=geo) as query:
+            first = browser_register._proxy_geography("http://proxy.example:8080", {"impersonate": "chrome"})
+            second = browser_register._proxy_geography("http://proxy.example:8080", {"impersonate": "chrome"})
+        self.assertEqual(first, geo)
+        self.assertEqual(second, geo)
+        query.assert_called_once()
+
+    def test_proxy_geography_failure_does_not_abort_registration(self):
+        registrar = browser_register.BrowserRegistrar()
+        with (
+            mock.patch.object(
+                browser_register,
+                "_proxy_geography",
+                side_effect=RuntimeError("failed via http://proxy-user:proxy-password@proxy.example:8080"),
+            ),
+            mock.patch.object(browser_register, "step") as log_step,
+        ):
+            registrar._load_geo_environment("http://proxy.example:8080", 1)
+        self.assertEqual(registrar.geo_environment, {})
+        message = " ".join(str(call) for call in log_step.call_args_list)
+        self.assertNotIn("proxy-user", message)
+        self.assertNotIn("proxy-password", message)
+
+    def test_devtools_environment_overrides_apply_all_supported_values(self):
+        devtools = mock.Mock()
+        context = mock.MagicMock()
+        context.__enter__.return_value = devtools
+        with (
+            mock.patch.object(browser_register.browser_devtools, "page_websocket", return_value="ws://browser"),
+            mock.patch.object(browser_register.browser_devtools, "DevToolsSocket", return_value=context),
+        ):
+            applied = browser_register.browser_devtools.apply_environment_overrides(
+                12345,
+                timezone_id="Europe/Berlin",
+                locale="de-DE",
+                accept_language="de-DE,de;q=0.9,en;q=0.8",
+                latitude=50.11,
+                longitude=8.68,
+                timeout=5,
+            )
+
+        self.assertEqual(applied, {"timezone": True, "locale": True, "geolocation": True})
+        methods = [call.args[0] for call in devtools.call.call_args_list]
+        self.assertEqual(methods, [
+            "Emulation.setTimezoneOverride",
+            "Emulation.setLocaleOverride",
+            "Network.enable",
+            "Network.setExtraHTTPHeaders",
+            "Emulation.setGeolocationOverride",
+        ])
+
     def test_browser_devtools_launch_requires_and_applies_registration_proxy(self):
         registrar = browser_register.BrowserRegistrar()
         registrar._deadline = time.monotonic() + 30
@@ -599,12 +707,24 @@ class RegistrationHardeningTests(unittest.TestCase):
             proxy_url="http://clip-user:clip-password@us.cliproxy.io:3010",
             proxy_source="explicit",
         )
+        geo = {
+            "ip": "198.51.100.10",
+            "country": "DE",
+            "city": "Frankfurt",
+            "timezone": "Europe/Berlin",
+            "latitude": 50.11,
+            "longitude": 8.68,
+            "language": "de-DE",
+            "languages": ["de-DE", "de", "en"],
+            "accept_language": "de-DE,de;q=0.9,en;q=0.8",
+        }
 
         with (
             mock.patch.object(browser_register.browser_devtools, "find_browser_executable", return_value="chromium"),
             mock.patch.object(browser_register.browser_devtools, "free_local_port", return_value=12345),
             mock.patch.object(browser_register.browser_devtools, "wait_for_devtools"),
             mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=proxy_profile) as get_profile,
+            mock.patch.object(browser_register, "_proxy_geography", return_value=geo),
             mock.patch.object(browser_register.subprocess, "Popen", return_value=process) as popen,
             mock.patch.object(browser_register, "step"),
         ):
@@ -614,10 +734,13 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertEqual(port, 12345)
         command = popen.call_args.args[0]
         self.assertIn("--proxy-server=http://us.cliproxy.io:3010", command)
+        self.assertIn("--lang=de-DE", command)
         self.assertNotIn("clip-password", " ".join(command))
         self.assertEqual(command[-1], "about:blank")
         self.assertEqual(registrar.registration_proxy_username, "clip-user")
         self.assertEqual(registrar.registration_proxy_password, "clip-password")
+        self.assertEqual(registrar.fingerprint["timezone"], "Europe/Berlin")
+        self.assertEqual(registrar.fingerprint["latitude"], "50.11")
         get_profile.assert_called_once_with(proxy=mock.ANY, upstream=False)
 
         missing_profile = SimpleNamespace(proxy_url="", proxy_source="none")
@@ -727,6 +850,7 @@ class RegistrationHardeningTests(unittest.TestCase):
             mock.patch.object(browser_register.browser_devtools, "find_browser_executable", return_value="chromium"),
             mock.patch.object(browser_register.browser_devtools, "free_local_port", return_value=12345),
             mock.patch.object(browser_register.proxy_settings, "get_profile", return_value=profile),
+            mock.patch.object(browser_register, "_proxy_geography", return_value={}),
             mock.patch.object(browser_register.subprocess, "Popen", return_value=process),
             mock.patch.object(
                 browser_register.browser_devtools,
@@ -781,22 +905,53 @@ class RegistrationHardeningTests(unittest.TestCase):
         registrar = mock.Mock()
         registrar.register.return_value = dict(result)
         old_mode = openai_register.config.get("mode")
+        old_proxy = openai_register.config.get("proxy")
         openai_register.config["mode"] = "total"
+        openai_register.config["proxy"] = "http://proxy-a:8080\nhttp://proxy-b:8080"
         try:
             with (
-                mock.patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+                mock.patch.object(openai_register, "PlatformRegistrar", return_value=registrar) as registrar_factory,
                 mock.patch.object(openai_register.account_service, "add_account_items") as add,
                 mock.patch.object(openai_register.account_service, "refresh_accounts") as refresh,
             ):
-                outcome = openai_register.worker(1)
+                outcome = openai_register.worker(2)
         finally:
             openai_register.config["mode"] = old_mode
+            openai_register.config["proxy"] = old_proxy
 
         self.assertTrue(outcome["ok"])
+        registrar_factory.assert_called_once_with("http://proxy-b:8080")
         saved = add.call_args.args[0][0]
         self.assertTrue(saved["image_quota_unknown"])
         self.assertEqual(saved["status"], "正常")
         refresh.assert_not_called()
+
+    def test_browser_worker_uses_round_robin_registration_proxy(self):
+        registrar = mock.Mock()
+        registrar.register.return_value = {
+            "email": "user@example.com",
+            "access_token": "token",
+            "refresh_token": "",
+            "fp": {"device_id": "device", "session_id": "session"},
+        }
+        old_mode = browser_register.config.get("mode")
+        old_proxy = browser_register.config.get("proxy")
+        browser_register.config["mode"] = "total"
+        browser_register.config["proxy"] = "http://proxy-a:8080\nhttp://proxy-b:8080"
+        try:
+            with (
+                mock.patch.object(browser_register, "BrowserRegistrar", return_value=registrar) as registrar_factory,
+                mock.patch("services.account_service.account_service.add_account_items") as add,
+                mock.patch.object(browser_register, "step"),
+            ):
+                outcome = browser_register.worker(3)
+        finally:
+            browser_register.config["mode"] = old_mode
+            browser_register.config["proxy"] = old_proxy
+
+        self.assertTrue(outcome["ok"])
+        registrar_factory.assert_called_once_with("http://proxy-a:8080")
+        add.assert_called_once()
 
 
 if __name__ == "__main__":

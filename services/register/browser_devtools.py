@@ -331,6 +331,54 @@ def get_all_cookies(port: int, *, timeout: float, hosts: tuple[str, ...] = ()) -
     return [item for item in cookies if isinstance(item, dict)] if isinstance(cookies, list) else []
 
 
+def apply_environment_overrides(
+    port: int,
+    *,
+    timezone_id: str = "",
+    locale: str = "",
+    accept_language: str = "",
+    latitude: float | None = None,
+    longitude: float | None = None,
+    timeout: float,
+) -> dict[str, bool]:
+    """Apply proxy-derived renderer settings before the first real navigation."""
+    applied = {"timezone": False, "locale": False, "geolocation": False}
+    with DevToolsSocket(page_websocket(port), timeout) as devtools:
+        if timezone_id:
+            try:
+                devtools.call("Emulation.setTimezoneOverride", {"timezoneId": timezone_id}, timeout=timeout)
+                applied["timezone"] = True
+            except Exception:
+                pass
+        if locale:
+            try:
+                devtools.call("Emulation.setLocaleOverride", {"locale": locale}, timeout=timeout)
+                applied["locale"] = True
+            except Exception:
+                pass
+        if accept_language:
+            try:
+                devtools.call("Network.enable", timeout=timeout)
+                devtools.call(
+                    "Network.setExtraHTTPHeaders",
+                    {"headers": {"Accept-Language": accept_language}},
+                    timeout=timeout,
+                )
+            except Exception:
+                pass
+        if latitude is not None and longitude is not None:
+            try:
+                devtools.call(
+                    "Emulation.setGeolocationOverride",
+                    {"latitude": latitude, "longitude": longitude, "accuracy": 50},
+                    timeout=timeout,
+                )
+                applied["geolocation"] = True
+            except Exception:
+                pass
+    return applied
+
+
 def navigate_to(port: int, url: str, timeout: float) -> None:
     with DevToolsSocket(page_websocket(port), timeout) as devtools:
         devtools.call("Page.enable")

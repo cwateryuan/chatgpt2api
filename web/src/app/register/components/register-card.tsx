@@ -146,9 +146,15 @@ export function RegisterCard() {
               <label className="text-sm text-stone-700">{config.engine === "browser" ? "浏览器并发数" : "线程数"}</label>
               <Input value={String(config.threads)} onChange={(event) => setThreads(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
             </div>
-            <div className="space-y-2">
-              <label className="text-sm text-stone-700">{config.engine === "browser" ? "注册代理（仅注册）" : "注册代理"}</label>
-              <Input value={config.proxy} onChange={(event) => setProxy(event.target.value)} placeholder={config.engine === "browser" ? "host:port:username:password" : "http://127.0.0.1:7890"} className="h-10 rounded-xl border-stone-200 bg-white" disabled={isRuntimeBusy} />
+            <div className="space-y-2 md:col-span-3">
+              <label className="text-sm text-stone-700">{config.engine === "browser" ? "注册代理（每行一个，仅注册）" : "注册代理（每行一个）"}</label>
+              <Textarea
+                value={config.proxy}
+                onChange={(event) => setProxy(event.target.value)}
+                placeholder={config.engine === "browser" ? "host:port:username:password\nhost:port:username:password" : "http://127.0.0.1:7890\nhttp://127.0.0.1:7891"}
+                className="min-h-24 resize-y rounded-xl border-stone-200 bg-white font-mono text-xs"
+                disabled={isRuntimeBusy}
+              />
             </div>
             <div className="space-y-2">
               <label className="text-sm text-stone-700">目标剩余额度</label>

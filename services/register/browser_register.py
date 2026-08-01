@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -31,6 +32,8 @@ from services.register.openai_register import (
     platform_oauth_client_id,
     platform_oauth_redirect_uri,
     request_platform_oauth_token,
+    registration_proxy_pool,
+    select_registration_proxy,
     step,
 )
 from utils.pkce import generate_pkce
@@ -77,6 +80,22 @@ BROWSER_CHALLENGE_MARKERS = (
 )
 _runtime_lock = threading.Lock()
 _runtime_cache: dict[str, Any] | None = None
+_geo_lock = threading.Lock()
+_geo_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_geo_inflight: dict[str, threading.Event] = {}
+GEO_CACHE_TTL_SECONDS = 900
+GEO_LOOKUP_URLS = ("https://ipapi.co/json/", "https://ipwho.is/")
+
+COUNTRY_LOCALES = {
+    "AU": "en-AU", "AT": "de-AT", "BE": "nl-BE", "BR": "pt-BR", "CA": "en-CA",
+    "CH": "de-CH", "CN": "zh-CN", "CZ": "cs-CZ", "DE": "de-DE", "DK": "da-DK",
+    "ES": "es-ES", "FI": "fi-FI", "FR": "fr-FR", "GB": "en-GB", "GR": "el-GR",
+    "HK": "zh-HK", "HU": "hu-HU", "ID": "id-ID", "IE": "en-IE", "IN": "en-IN",
+    "IT": "it-IT", "JP": "ja-JP", "KR": "ko-KR", "MX": "es-MX", "MY": "ms-MY",
+    "NL": "nl-NL", "NO": "nb-NO", "NZ": "en-NZ", "PL": "pl-PL", "PT": "pt-PT",
+    "RO": "ro-RO", "RU": "ru-RU", "SE": "sv-SE", "SG": "en-SG", "TH": "th-TH",
+    "TR": "tr-TR", "TW": "zh-TW", "UA": "uk-UA", "US": "en-US", "VN": "vi-VN",
+}
 
 
 DEVTOOLS_STATE_JS = r"""
@@ -217,6 +236,9 @@ def _devtools_submit_email_js(email: str) -> str:
     .find((element) => {{
       const text = (element.innerText || element.textContent || element.value || element.getAttribute("aria-label") || "").trim().toLowerCase();
       return text.includes("one-time code") || text.includes("one time code") || text.includes("verification code")
+        || text.includes("einmalcode") || text.includes("einmal-code") || text.includes("code à usage unique")
+        || text.includes("código de un solo uso") || text.includes("código de uso único")
+        || text.includes("codice monouso") || text.includes("eenmalige code")
         || text.includes("一次性") || text.includes("验证码") || text.includes("驗證碼");
     }});
   if (codeLogin) {{
@@ -244,6 +266,9 @@ DEVTOOLS_CLICK_ONE_TIME_CODE_JS = r"""
     .find((element) => {
       const text = textOf(element);
       return text.includes("one-time code") || text.includes("one time code") || text.includes("verification code")
+        || text.includes("einmalcode") || text.includes("einmal-code") || text.includes("code à usage unique")
+        || text.includes("código de un solo uso") || text.includes("código de uso único")
+        || text.includes("codice monouso") || text.includes("eenmalige code")
         || text.includes("一次性") || text.includes("验证码") || text.includes("驗證碼");
     });
   if (!target) throw new Error("one_time_code_button_missing");
@@ -414,6 +439,126 @@ def _sanitized_error(error: BaseException) -> str:
     return text[:500]
 
 
+def _language_profile(country_code: str, raw_languages: Any) -> tuple[str, list[str], str]:
+    if isinstance(raw_languages, list):
+        candidates = [str(item or "").strip() for item in raw_languages]
+    else:
+        candidates = [item.strip() for item in str(raw_languages or "").split(",")]
+    languages: list[str] = []
+    for candidate in candidates:
+        language = candidate.replace("_", "-")
+        if language and re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", language):
+            parts = language.split("-")
+            normalized = parts[0].lower() + "".join(f"-{part.upper() if len(part) == 2 else part}" for part in parts[1:])
+            if normalized not in languages:
+                languages.append(normalized)
+    country_code = country_code.upper()
+    regional_default = COUNTRY_LOCALES.get(country_code, "en-US")
+    if not languages:
+        languages.append(regional_default)
+    elif "-" not in languages[0] and regional_default.split("-", 1)[0] == languages[0]:
+        languages.insert(0, regional_default)
+    primary = languages[0]
+    base = primary.split("-", 1)[0]
+    if base not in languages:
+        languages.append(base)
+    if not any(item.startswith("en") for item in languages):
+        languages.append("en")
+    languages = languages[:5]
+    accept_parts = [languages[0]]
+    for index, language in enumerate(languages[1:], start=1):
+        accept_parts.append(f"{language};q={max(0.5, 1.0 - index * 0.1):.1f}")
+    return primary, languages, ",".join(accept_parts)
+
+
+def _normalize_geo_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("success") is False or payload.get("error") is True:
+        return {}
+    timezone_value = payload.get("timezone")
+    timezone_id = str(
+        (timezone_value.get("id") or "")
+        if isinstance(timezone_value, dict)
+        else timezone_value or payload.get("timezone_id") or ""
+    ).strip()
+    country_code = str(payload.get("country_code") or payload.get("countryCode") or "").strip().upper()
+    try:
+        latitude = float(payload.get("latitude") if payload.get("latitude") is not None else payload.get("lat"))
+        longitude = float(payload.get("longitude") if payload.get("longitude") is not None else payload.get("lon"))
+    except (TypeError, ValueError):
+        return {}
+    if not timezone_id or not country_code or not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+        return {}
+    language, languages, accept_language = _language_profile(country_code, payload.get("languages"))
+    return {
+        "ip": str(payload.get("ip") or payload.get("query") or "").strip(),
+        "country": country_code,
+        "city": str(payload.get("city") or "").strip(),
+        "timezone": timezone_id,
+        "latitude": latitude,
+        "longitude": longitude,
+        "language": language,
+        "languages": languages,
+        "accept_language": accept_language,
+    }
+
+
+def _query_proxy_geography(proxy_url: str, fingerprint: dict[str, str]) -> dict[str, Any]:
+    session = requests.Session(**proxy_settings.build_session_kwargs(
+        proxy=proxy_url,
+        upstream=False,
+        impersonate=str(fingerprint.get("impersonate") or "chrome"),
+        verify=True,
+    ))
+    session.headers.update({
+        "User-Agent": str(fingerprint.get("user_agent") or "Mozilla/5.0"),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    try:
+        for url in GEO_LOOKUP_URLS:
+            try:
+                response = session.get(url, timeout=8)
+                response.raise_for_status()
+                geo = _normalize_geo_payload(response.json())
+                if geo:
+                    return geo
+            except Exception:
+                continue
+    finally:
+        session.close()
+    return {}
+
+
+def _proxy_geography(proxy_url: str, fingerprint: dict[str, str]) -> dict[str, Any]:
+    cache_key = hashlib.sha256(proxy_url.encode("utf-8", errors="ignore")).hexdigest()
+    now = time.monotonic()
+    with _geo_lock:
+        cached = _geo_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return dict(cached[1])
+        event = _geo_inflight.get(cache_key)
+        owner = event is None
+        if owner:
+            event = threading.Event()
+            _geo_inflight[cache_key] = event
+    if not owner:
+        event.wait(18)
+        with _geo_lock:
+            cached = _geo_cache.get(cache_key)
+            return dict(cached[1]) if cached and cached[0] > time.monotonic() else {}
+    try:
+        geo = _query_proxy_geography(proxy_url, fingerprint)
+        if geo:
+            with _geo_lock:
+                _geo_cache[cache_key] = (time.monotonic() + GEO_CACHE_TTL_SECONDS, dict(geo))
+        return geo
+    finally:
+        with _geo_lock:
+            pending = _geo_inflight.pop(cache_key, None)
+            if pending:
+                pending.set()
+
+
 def _probe_browser_runtime() -> dict[str, Any]:
     try:
         from playwright.sync_api import sync_playwright
@@ -470,12 +615,13 @@ def browser_runtime_status(*, refresh: bool = False) -> dict[str, Any]:
         return dict(_runtime_cache)
 
 
-def _mail_config() -> dict:
-    return {**config["mail"], "proxy": config["proxy"]}
+def _mail_config(proxy: str | None = None) -> dict:
+    return {**config["mail"], "proxy": config["proxy"] if proxy is None else proxy}
 
 
-def _playwright_proxy() -> dict[str, str] | None:
-    profile = proxy_settings.get_profile(proxy=str(config.get("proxy") or ""), upstream=True)
+def _playwright_proxy(proxy: str | None = None) -> dict[str, str] | None:
+    selected_proxy = select_registration_proxy(config.get("proxy"), 1) if proxy is None else str(proxy or "").strip()
+    profile = proxy_settings.get_profile(proxy=selected_proxy, upstream=True)
     value = str(profile.proxy_url or "").strip()
     if not value:
         return None
@@ -524,7 +670,12 @@ def _align_fingerprint_platform(fingerprint: dict[str, str]) -> dict[str, str]:
 
 
 class BrowserRegistrar:
-    def __init__(self) -> None:
+    def __init__(self, proxy: str | None = None) -> None:
+        self.proxy = (
+            select_registration_proxy(config.get("proxy"), 1)
+            if proxy is None
+            else str(proxy or "").strip()
+        )
         self.fingerprint = make_fingerprint()
         self.callback_code = ""
         self._deadline = 0.0
@@ -533,9 +684,34 @@ class BrowserRegistrar:
         self.registration_proxy_url = ""
         self.registration_proxy_username = ""
         self.registration_proxy_password = ""
+        self.geo_environment: dict[str, Any] = {}
+
+    def _load_geo_environment(self, proxy_url: str, index: int) -> None:
+        try:
+            geo = _proxy_geography(proxy_url, self.fingerprint)
+        except Exception as error:
+            step(index, f"浏览器出口地理位置查询失败，沿用运行环境: {_sanitized_error(error)}", "yellow")
+            self.geo_environment = {}
+            return
+        self.geo_environment = geo
+        if not geo:
+            step(index, "浏览器出口地理位置查询失败，沿用运行环境的时区和语言", "yellow")
+            return
+        self.fingerprint.update({
+            "timezone": str(geo["timezone"]),
+            "language": str(geo["language"]),
+            "languages": ",".join(geo["languages"]),
+            "accept_language": str(geo["accept_language"]),
+            "latitude": str(geo["latitude"]),
+            "longitude": str(geo["longitude"]),
+            "geo_country": str(geo["country"]),
+            "geo_city": str(geo["city"]),
+        })
+        location = "/".join(filter(None, (str(geo["country"]), str(geo["city"]))))
+        step(index, f"浏览器出口位置={location or 'unknown'} timezone={geo['timezone']} language={geo['language']}")
 
     def _load_clearance(self, index: int, *, force: bool = True) -> ClearanceBundle | None:
-        proxy = str(config.get("proxy") or "")
+        proxy = self.proxy
         profile = proxy_settings.get_profile(proxy=proxy, upstream=True)
         clearance_mode = profile.clearance_mode if profile.clearance_enabled else "disabled"
         step(index, f"浏览器网络 proxy={profile.proxy_source} clearance={clearance_mode}")
@@ -871,7 +1047,7 @@ class BrowserRegistrar:
     def _launch_devtools_browser(self, profile_dir: Path, index: int) -> tuple[subprocess.Popen[Any], int]:
         executable = browser_devtools.find_browser_executable()
         port = browser_devtools.free_local_port()
-        profile = proxy_settings.get_profile(proxy=str(config.get("proxy") or ""), upstream=False)
+        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=False)
         proxy_url = str(profile.proxy_url or "").strip()
         if not proxy_url:
             raise BrowserRegistrationError("browser_registration_proxy_missing")
@@ -882,6 +1058,7 @@ class BrowserRegistrar:
         self.registration_proxy_url = proxy_url
         self.registration_proxy_username = proxy_username
         self.registration_proxy_password = proxy_password
+        self._load_geo_environment(proxy_url, index)
         step(
             index,
             f"浏览器网络 proxy={profile.proxy_source} proxy_server=yes "
@@ -901,6 +1078,9 @@ class BrowserRegistrar:
             "--window-size=1365,768",
             "--new-window",
         ]
+        browser_language = str(self.geo_environment.get("language") or "").strip()
+        if browser_language:
+            command.append(f"--lang={browser_language}")
         if _playwright_headless():
             command.extend(["--headless=new", "--disable-gpu"])
         command.append(f"--proxy-server={proxy_server}")
@@ -971,7 +1151,7 @@ class BrowserRegistrar:
         )
 
     def _exchange_browser_oauth_code(self, code: str, code_verifier: str) -> dict[str, str]:
-        proxy = self.registration_proxy_url or str(config.get("proxy") or "")
+        proxy = self.registration_proxy_url or self.proxy
         session = requests.Session(**proxy_settings.build_session_kwargs(
             proxy=proxy,
             upstream=False,
@@ -1161,6 +1341,11 @@ class BrowserRegistrar:
         language = str(snapshot.get("language") or "").strip()
         if language:
             updates["language"] = language
+        raw_languages = snapshot.get("languages")
+        if isinstance(raw_languages, list):
+            languages = [str(item or "").strip() for item in raw_languages if str(item or "").strip()]
+            if languages:
+                updates["languages"] = ",".join(languages)
         timezone_name = str(snapshot.get("timezone") or "").strip()
         if timezone_name:
             updates["timezone"] = timezone_name
@@ -1243,6 +1428,28 @@ class BrowserRegistrar:
                     )
                     proxy_auth.start(timeout=min(5.0, self._devtools_timeout(5)))
                     step(index, "浏览器注册代理认证已启用")
+                if self.geo_environment:
+                    try:
+                        applied = browser_devtools.apply_environment_overrides(
+                            port,
+                            timezone_id=str(self.geo_environment.get("timezone") or ""),
+                            locale=str(self.geo_environment.get("language") or ""),
+                            accept_language=str(self.geo_environment.get("accept_language") or ""),
+                            latitude=float(self.geo_environment["latitude"]),
+                            longitude=float(self.geo_environment["longitude"]),
+                            timeout=self._devtools_timeout(10),
+                        )
+                    except Exception as error:
+                        applied = {"timezone": False, "locale": False, "geolocation": False}
+                        step(index, f"浏览器地理环境应用失败，继续注册: {_sanitized_error(error)}", "yellow")
+                    step(
+                        index,
+                        "浏览器地理环境已应用 "
+                        f"timezone={'yes' if applied['timezone'] else 'no'} "
+                        f"locale={'yes' if applied['locale'] else 'no'} "
+                        f"coordinates={'yes' if applied['geolocation'] else 'no'}",
+                        "green" if all(applied.values()) else "yellow",
+                    )
                 browser_devtools.navigate_to(port, CHATGPT_LOGIN_URL, self._devtools_timeout())
                 state_reader = lambda: self._devtools_state(port)
                 step(index, "浏览器等待 ChatGPT 登录页")
@@ -1332,7 +1539,7 @@ class BrowserRegistrar:
     def _wait_for_otp(self, mailbox: dict, index: int, *, login: bool = False) -> str:
         mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
         step(index, "等待浏览器登录验证码" if login else "等待浏览器注册验证码")
-        mail_config = _mail_config()
+        mail_config = _mail_config(self.proxy)
         mail_config["wait_timeout"] = max(1, min(
             int(mail_config.get("wait_timeout") or 120),
             int(max(1, self._deadline - time.monotonic())),
@@ -1754,7 +1961,7 @@ class BrowserRegistrar:
         if not status["browser_available"]:
             raise BrowserRegistrationError("browser_runtime_unavailable")
 
-        mailbox = mail_provider.create_mailbox(_mail_config())
+        mailbox = mail_provider.create_mailbox(_mail_config(self.proxy))
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
@@ -1796,7 +2003,11 @@ def worker(index: int) -> dict[str, Any]:
 
     started = time.time()
     try:
-        result = BrowserRegistrar().register(index)
+        proxies = registration_proxy_pool(config.get("proxy"))
+        proxy = select_registration_proxy(config.get("proxy"), index)
+        proxy_position = (max(1, int(index)) - 1) % len(proxies) + 1 if proxies else 0
+        step(index, f"浏览器注册代理={proxy_position}/{len(proxies)}" if proxies else "浏览器注册代理=none")
+        result = BrowserRegistrar(proxy).register(index)
         account_service = __import__("services.account_service", fromlist=["account_service"]).account_service
         account_service.add_account_items([result])
         if str(config.get("mode") or "total") == "quota":
