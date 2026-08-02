@@ -895,7 +895,7 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["detail"]["code"], "browser_runtime_unavailable")
 
-    def test_http_worker_saves_unknown_quota_without_full_refresh(self):
+    def test_http_worker_validates_saved_account_in_total_mode(self):
         result = {
             "email": "user@example.com",
             "access_token": "token",
@@ -912,7 +912,7 @@ class RegistrationHardeningTests(unittest.TestCase):
             with (
                 mock.patch.object(openai_register, "PlatformRegistrar", return_value=registrar) as registrar_factory,
                 mock.patch.object(openai_register.account_service, "add_account_items") as add,
-                mock.patch.object(openai_register.account_service, "refresh_accounts") as refresh,
+                mock.patch.object(openai_register, "validate_registered_account") as validate,
             ):
                 outcome = openai_register.worker(2)
         finally:
@@ -924,7 +924,7 @@ class RegistrationHardeningTests(unittest.TestCase):
         saved = add.call_args.args[0][0]
         self.assertTrue(saved["image_quota_unknown"])
         self.assertEqual(saved["status"], "正常")
-        refresh.assert_not_called()
+        validate.assert_called_once_with("token", 2)
 
     def test_browser_worker_uses_round_robin_registration_proxy(self):
         registrar = mock.Mock()
@@ -942,6 +942,7 @@ class RegistrationHardeningTests(unittest.TestCase):
             with (
                 mock.patch.object(browser_register, "BrowserRegistrar", return_value=registrar) as registrar_factory,
                 mock.patch("services.account_service.account_service.add_account_items") as add,
+                mock.patch.object(browser_register, "validate_registered_account") as validate,
                 mock.patch.object(browser_register, "step"),
             ):
                 outcome = browser_register.worker(3)
@@ -952,6 +953,68 @@ class RegistrationHardeningTests(unittest.TestCase):
         self.assertTrue(outcome["ok"])
         registrar_factory.assert_called_once_with("http://proxy-a:8080")
         add.assert_called_once()
+        validate.assert_called_once_with("token", 3)
+
+    def test_registered_account_validation_stops_after_first_success(self):
+        successful = {"refreshed": 1, "errors": [], "relogined": 0}
+        with (
+            mock.patch.object(openai_register.account_service, "refresh_accounts", return_value=successful) as refresh,
+            mock.patch.object(openai_register.time, "sleep") as sleep,
+        ):
+            result = openai_register.validate_registered_account("token", 1)
+
+        self.assertIs(result, successful)
+        refresh.assert_called_once_with(
+            ["token"],
+            defer_invalid_removal=True,
+            include_items=False,
+        )
+        sleep.assert_not_called()
+
+    def test_registered_account_validation_retries_with_invalid_removal_enabled(self):
+        first = {"refreshed": 0, "errors": [{"error": "unauthorized"}], "relogined": 0}
+        second = {"refreshed": 0, "errors": [{"error": "unauthorized"}], "relogined": 0}
+        with (
+            mock.patch.object(
+                openai_register.account_service,
+                "refresh_accounts",
+                side_effect=[first, second],
+            ) as refresh,
+            mock.patch.object(openai_register.time, "sleep") as sleep,
+            mock.patch.object(openai_register, "step"),
+        ):
+            result = openai_register.validate_registered_account("token", 4)
+
+        self.assertIs(result, second)
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(refresh.call_args_list[0].kwargs["defer_invalid_removal"], True)
+        self.assertEqual(refresh.call_args_list[1].kwargs["defer_invalid_removal"], False)
+        self.assertTrue(all(call.kwargs["include_items"] is False for call in refresh.call_args_list))
+        sleep.assert_called_once_with(openai_register.REGISTER_ACCOUNT_VALIDATION_RETRY_SECONDS)
+
+    def test_registered_account_validation_exception_does_not_fail_worker(self):
+        result = {
+            "email": "user@example.com",
+            "access_token": "token",
+            "refresh_token": "refresh",
+        }
+        registrar = mock.Mock()
+        registrar.register.return_value = result
+        with (
+            mock.patch.object(openai_register, "PlatformRegistrar", return_value=registrar),
+            mock.patch.object(openai_register.account_service, "add_account_items"),
+            mock.patch.object(
+                openai_register.account_service,
+                "refresh_accounts",
+                side_effect=RuntimeError("temporary refresh failure for token"),
+            ),
+            mock.patch.object(openai_register, "step") as log_step,
+        ):
+            outcome = openai_register.worker(1)
+
+        self.assertTrue(outcome["ok"])
+        self.assertNotIn("token", str(log_step.call_args))
+        self.assertIn("***", str(log_step.call_args))
 
 
 if __name__ == "__main__":

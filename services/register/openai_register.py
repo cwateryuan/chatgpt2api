@@ -141,6 +141,7 @@ user_agent = DEFAULT_BROWSER_FINGERPRINT["user_agent"]
 sec_ch_ua = DEFAULT_BROWSER_FINGERPRINT["sec_ch_ua"]
 sec_ch_ua_full_version_list = DEFAULT_BROWSER_FINGERPRINT["sec_ch_ua_full_version_list"]
 default_timeout = 30
+REGISTER_ACCOUNT_VALIDATION_RETRY_SECONDS = 3
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
@@ -979,6 +980,36 @@ class PlatformRegistrar:
         return result
 
 
+def validate_registered_account(access_token: str, index: int) -> dict[str, Any]:
+    """Refresh a newly registered account, retrying once before enforcing invalid-token handling."""
+    try:
+        first = account_service.refresh_accounts(
+            [access_token],
+            defer_invalid_removal=True,
+            include_items=False,
+        )
+        if int(first.get("refreshed") or 0) > 0 and not first.get("errors"):
+            return first
+
+        step(
+            index,
+            f"注册后账号首次校验未通过，{REGISTER_ACCOUNT_VALIDATION_RETRY_SECONDS}秒后二次确认",
+            "yellow",
+        )
+        time.sleep(REGISTER_ACCOUNT_VALIDATION_RETRY_SECONDS)
+        return account_service.refresh_accounts(
+            [access_token],
+            defer_invalid_removal=False,
+            include_items=False,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as error:
+        error_text = str(error).replace(access_token, "***")
+        step(index, f"账号已保存，注册后校验暂未完成: {error_text}", "yellow")
+        return {"refreshed": 0, "errors": [{"error": error_text}], "relogined": 0}
+
+
 def worker(index: int) -> dict:
     start = time.time()
     proxies = registration_proxy_pool(config.get("proxy"))
@@ -994,14 +1025,7 @@ def worker(index: int) -> dict:
         result.setdefault("quota", 0)
         result.setdefault("image_quota_unknown", True)
         account_service.add_account_items([result])
-        if str(config.get("mode") or "total") == "quota":
-            try:
-                from services.openai_backend_api import OpenAIBackendAPI
-                with OpenAIBackendAPI(access_token) as backend:
-                    quota_info = backend.get_image_quota_info()
-                account_service.update_account(access_token, quota_info, quiet=True)
-            except Exception as error:
-                step(index, f"账号已保存，额度初始化暂未成功: {error}", "yellow")
+        validate_registered_account(access_token, index)
         with stats_lock:
             stats["done"] += 1
             stats["success"] += 1

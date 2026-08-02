@@ -35,6 +35,7 @@ from services.register.openai_register import (
     registration_proxy_pool,
     select_registration_proxy,
     step,
+    validate_registered_account,
 )
 from utils.pkce import generate_pkce
 
@@ -2010,15 +2011,7 @@ def worker(index: int) -> dict[str, Any]:
         result = BrowserRegistrar(proxy).register(index)
         account_service = __import__("services.account_service", fromlist=["account_service"]).account_service
         account_service.add_account_items([result])
-        if str(config.get("mode") or "total") == "quota":
-            try:
-                from services.openai_backend_api import OpenAIBackendAPI
-
-                with OpenAIBackendAPI(result["access_token"]) as backend:
-                    quota_info = backend.get_image_quota_info()
-                account_service.update_account(result["access_token"], quota_info, quiet=True)
-            except Exception as error:
-                step(index, f"账号已保存，额度初始化暂未成功: {_sanitized_error(error)}", "yellow")
+        validate_registered_account(result["access_token"], index)
         log(f'{result["email"]} 浏览器注册成功，本次耗时{time.time() - started:.1f}s', "green")
         return {"ok": True, "index": index, "result": result}
     except mail_provider.AllMailProvidersUnavailableError as error:
