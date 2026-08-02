@@ -92,6 +92,23 @@ class ConfigStoreTests(unittest.TestCase):
         with tmp_dir, mock.patch.dict(os.environ, {"CHATGPT2API_BASE_URL": "https://fallback.example.com/"}):
             self.assertEqual(store.base_url, "https://fallback.example.com")
 
+    def test_full_account_refresh_defaults_enabled_and_updates_partially(self) -> None:
+        tmp_dir, store = self._make_store({"base_url": "https://api.example"})
+        with tmp_dir:
+            self.assertTrue(store.full_account_refresh_enabled)
+            self.assertTrue(store.get()["full_account_refresh_enabled"])
+
+            updated = store.update({"full_account_refresh_enabled": False})
+
+            self.assertFalse(store.full_account_refresh_enabled)
+            self.assertFalse(updated["full_account_refresh_enabled"])
+            self.assertEqual(updated["base_url"], "https://api.example")
+
+    def test_full_account_refresh_parses_string_booleans(self) -> None:
+        tmp_dir, store = self._make_store({"full_account_refresh_enabled": "off"})
+        with tmp_dir:
+            self.assertFalse(store.full_account_refresh_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -207,6 +207,7 @@ export type SettingsConfig = {
     prompt?: string;
   };
   refresh_account_interval_minute?: number | string;
+  full_account_refresh_enabled?: boolean;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;
@@ -426,6 +427,22 @@ export async function login(authKey: string) {
 
 export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
+}
+
+export type AccountAutoRefreshSettings = {
+  enabled: boolean;
+  interval_seconds: number;
+};
+
+export async function fetchAccountAutoRefresh() {
+  return httpRequest<AccountAutoRefreshSettings>("/api/accounts/auto-refresh");
+}
+
+export async function updateAccountAutoRefresh(enabled: boolean) {
+  return httpRequest<AccountAutoRefreshSettings>("/api/accounts/auto-refresh", {
+    method: "POST",
+    body: { enabled },
+  });
 }
 
 export async function fetchModels() {

@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_tasks, register, system
 from api.errors import install_exception_handlers
-from api.support import resolve_web_asset, start_limited_account_watcher
+from api.support import resolve_web_asset, start_full_account_refresh_worker, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.debug_memory import start_memory_diagnostic_scheduler
@@ -30,6 +30,7 @@ def create_app() -> FastAPI:
         configure_threadpool_tokens()
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
+        full_refresh_thread = start_full_account_refresh_worker(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         memory_trim_thread = start_memory_trim_scheduler(stop_event)
         memory_diag_thread = start_memory_diagnostic_scheduler(stop_event)
@@ -42,6 +43,7 @@ def create_app() -> FastAPI:
         finally:
             stop_event.set()
             thread.join(timeout=1)
+            full_refresh_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             memory_trim_thread.join(timeout=1)
             memory_diag_thread.join(timeout=1)

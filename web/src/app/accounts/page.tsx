@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
+  fetchAccountAutoRefresh,
   fetchAccounts,
   fetchModels,
   fetchRefreshProgress,
@@ -52,6 +53,7 @@ import {
   refreshAccounts,
   testProxy,
   updateAccount,
+  updateAccountAutoRefresh,
   type Account,
   type AccountRefreshResponse,
   type AccountStatus,
@@ -212,6 +214,9 @@ function AccountsPageContent() {
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
+  const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
+  const [isLoadingAutoRefresh, setIsLoadingAutoRefresh] = useState(true);
+  const [isSavingAutoRefresh, setIsSavingAutoRefresh] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
@@ -264,6 +269,40 @@ function AccountsPageContent() {
     }
   };
 
+  const loadAutoRefresh = async () => {
+    setIsLoadingAutoRefresh(true);
+    try {
+      const data = await fetchAccountAutoRefresh();
+      setAutoRefreshEnabled(data.enabled);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "加载自动刷新设置失败";
+      toast.error(message);
+    } finally {
+      setIsLoadingAutoRefresh(false);
+    }
+  };
+
+  const handleAutoRefreshChange = async () => {
+    if (isLoadingAutoRefresh || isSavingAutoRefresh) {
+      return;
+    }
+    const previous = autoRefreshEnabled;
+    const next = !previous;
+    setAutoRefreshEnabled(next);
+    setIsSavingAutoRefresh(true);
+    try {
+      const data = await updateAccountAutoRefresh(next);
+      setAutoRefreshEnabled(data.enabled);
+      toast.success(data.enabled ? "已开启每分钟自动刷新" : "已关闭每分钟自动刷新");
+    } catch (error) {
+      setAutoRefreshEnabled(previous);
+      const message = error instanceof Error ? error.message : "保存自动刷新设置失败";
+      toast.error(message);
+    } finally {
+      setIsSavingAutoRefresh(false);
+    }
+  };
+
   useEffect(() => {
     if (didLoadRef.current) {
       return;
@@ -271,6 +310,7 @@ function AccountsPageContent() {
     didLoadRef.current = true;
     void loadAccounts();
     void loadModels();
+    void loadAutoRefresh();
 
     // 清理进度条定时器
     return () => {
@@ -757,6 +797,28 @@ function AccountsPageContent() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <div className="flex h-10 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3">
+            <span className="text-sm text-stone-700">每分钟自动刷新</span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoRefreshEnabled}
+              aria-label="每分钟自动刷新"
+              disabled={isLoadingAutoRefresh || isSavingAutoRefresh}
+              onClick={() => void handleAutoRefreshChange()}
+              className={cn(
+                "relative h-5 w-9 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-400 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
+                autoRefreshEnabled ? "bg-emerald-600" : "bg-stone-300",
+              )}
+            >
+              <span
+                className={cn(
+                  "absolute top-0.5 left-0.5 size-4 rounded-full bg-white shadow-sm transition-transform",
+                  autoRefreshEnabled && "translate-x-4",
+                )}
+              />
+            </button>
+          </div>
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"

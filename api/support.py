@@ -15,6 +15,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
 ACCOUNT_WATCHER_LOCK = "lock:account:watcher"
 ACCOUNT_WATCHER_LOCK_TTL_SECONDS = 120
+FULL_ACCOUNT_REFRESH_LOCK = "lock:account:full-refresh"
+FULL_ACCOUNT_REFRESH_LOCK_TTL_SECONDS = 120
+FULL_ACCOUNT_REFRESH_INTERVAL_SECONDS = 60
 
 
 def extract_bearer_token(authorization: str | None) -> str:
@@ -168,6 +171,73 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 stop_event.wait(min(10.0, interval_seconds))
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
+def _run_full_account_refresh_cycle(stop_event: Event) -> bool:
+    if not config.full_account_refresh_enabled or stop_event.is_set():
+        return False
+
+    lock_owner = runtime_state.acquire_lock(
+        FULL_ACCOUNT_REFRESH_LOCK,
+        ttl_seconds=FULL_ACCOUNT_REFRESH_LOCK_TTL_SECONDS,
+        allow_memory_fallback=not is_multi_worker_runtime(),
+    )
+    if not lock_owner:
+        return False
+
+    lease_stop = Event()
+    lease_lost = Event()
+
+    def renew_lease() -> None:
+        interval = FULL_ACCOUNT_REFRESH_LOCK_TTL_SECONDS / 3
+        while not lease_stop.wait(interval):
+            if runtime_state.extend_lock(
+                FULL_ACCOUNT_REFRESH_LOCK,
+                lock_owner,
+                ttl_seconds=FULL_ACCOUNT_REFRESH_LOCK_TTL_SECONDS,
+            ):
+                continue
+            lease_lost.set()
+            logger.warning({"event": "full_account_refresh_lock_lost"})
+            return
+
+    renew_thread = Thread(target=renew_lease, name="full-account-refresh-lock", daemon=True)
+    renew_thread.start()
+    try:
+        access_tokens = account_service.list_tokens()
+        if not access_tokens or lease_lost.is_set() or stop_event.is_set():
+            return True
+        logger.info({"event": "full_account_refresh_started", "accounts": len(access_tokens)})
+        result = account_service.refresh_accounts(
+            access_tokens,
+            defer_invalid_removal=False,
+            include_items=False,
+        )
+        logger.info({
+            "event": "full_account_refresh_completed",
+            "accounts": len(access_tokens),
+            "refreshed": int(result.get("refreshed") or 0),
+            "errors": len(result.get("errors") or []),
+        })
+        return True
+    finally:
+        lease_stop.set()
+        renew_thread.join(timeout=1)
+        runtime_state.release_lock(FULL_ACCOUNT_REFRESH_LOCK, lock_owner)
+
+
+def start_full_account_refresh_worker(stop_event: Event) -> Thread:
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                _run_full_account_refresh_cycle(stop_event)
+            except Exception as exc:
+                logger.warning({"event": "full_account_refresh_failed", "error": str(exc)})
+            stop_event.wait(FULL_ACCOUNT_REFRESH_INTERVAL_SECONDS)
+
+    thread = Thread(target=worker, name="full-account-refresh", daemon=True)
     thread.start()
     return thread
 

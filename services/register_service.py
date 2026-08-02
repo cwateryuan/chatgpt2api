@@ -5,7 +5,7 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,7 +27,6 @@ REGISTER_SAVE_INTERVAL_SECONDS = 5.0
 REGISTER_LOCK_REFRESH_INTERVAL_SECONDS = 30.0
 REGISTER_SUPERVISOR_INTERVAL_SECONDS = 10.0
 REGISTER_SUPERVISOR_WAIT_LOG_INTERVAL_SECONDS = 30.0
-REGISTER_FULL_REFRESH_BATCH_SIZE = 50
 REGISTER_RUNTIME_KEYS = {"enabled", "stats", "logs"}
 REGISTER_RUNTIME_CONFIG_KEY = "register_runtime"
 
@@ -63,29 +62,7 @@ def _now() -> str:
 
 
 def _default_config() -> dict:
-    return {
-        **openai_register.config,
-        "engine": "http",
-        "browser_token_mode": "session",
-        "mode": "total",
-        "target_quota": 100,
-        "target_available": 10,
-        "check_interval": 5,
-        "enabled": False,
-        "stats": {
-            "success": 0,
-            "fail": 0,
-            "done": 0,
-            "running": 0,
-            "threads": openai_register.config["threads"],
-            "elapsed_seconds": 0,
-            "avg_seconds": 0,
-            "success_rate": 0,
-            "current_quota": 0,
-            "current_available": 0,
-            "full_refresh_batches": 0,
-        },
-    }
+    return {**openai_register.config, "engine": "http", "browser_token_mode": "session", "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
 def _normalize_mail_config(value: object) -> dict:
@@ -149,14 +126,11 @@ def _normalize(raw: dict) -> dict:
     cfg["proxy"] = openai_register.normalize_registration_proxy_text(cfg.get("proxy"))
     cfg["mail"] = _normalize_mail_config(cfg.get("mail"))
     cfg["enabled"] = bool(cfg.get("enabled"))
-    raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
     stats = {
         **_default_config()["stats"],
-        **raw_stats,
+        **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
         "threads": cfg["threads"],
     }
-    if "full_refresh_batches" not in raw_stats:
-        stats["full_refresh_batches"] = max(0, int(stats.get("success") or 0)) // REGISTER_FULL_REFRESH_BATCH_SIZE
     cfg["stats"] = stats
     logs = raw.get("logs") if isinstance(raw.get("logs"), list) else []
     cfg["logs"] = [
@@ -336,21 +310,16 @@ class RegisterService:
                 "done": 0,
                 "running": 0,
                 "threads": self._config["threads"],
-                "full_refresh_batches": 0,
                 **metrics,
                 "started_at": _now(),
                 "updated_at": _now(),
             }
         else:
             existing_stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
-            completed_batches = existing_stats.get("full_refresh_batches")
-            if completed_batches is None:
-                completed_batches = max(0, int(existing_stats.get("success") or 0)) // REGISTER_FULL_REFRESH_BATCH_SIZE
             self._config["stats"] = {
                 **_default_config()["stats"],
                 **existing_stats,
                 "threads": self._config["threads"],
-                "full_refresh_batches": max(0, int(completed_batches or 0)),
                 "updated_at": _now(),
             }
             self._config["stats"].setdefault("job_id", uuid.uuid4().hex)
@@ -630,19 +599,7 @@ class RegisterService:
             if loaded:
                 self._config = loaded
             self._config["logs"] = []
-            self._config["stats"] = {
-                "success": 0,
-                "fail": 0,
-                "done": 0,
-                "running": 0,
-                "threads": self._config["threads"],
-                "elapsed_seconds": 0,
-                "avg_seconds": 0,
-                "success_rate": 0,
-                "full_refresh_batches": 0,
-                **self._pool_metrics(),
-                "updated_at": _now(),
-            }
+            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
@@ -691,54 +648,6 @@ class RegisterService:
 
     def _pool_metrics(self) -> dict:
         return account_service.get_image_pool_metrics()
-
-    def _refresh_accounts_after_registration_batch(self, batch_number: int, success: int) -> None:
-        access_tokens = account_service.list_tokens()
-        self._append_log(
-            f"注册成功累计{success}个，开始第{batch_number}次全量刷新，账号数={len(access_tokens)}",
-            "yellow",
-            force=True,
-        )
-        try:
-            with ThreadPoolExecutor(max_workers=1) as refresh_executor:
-                refresh_future = refresh_executor.submit(
-                    account_service.refresh_accounts,
-                    access_tokens,
-                    defer_invalid_removal=False,
-                    include_items=False,
-                )
-                while True:
-                    try:
-                        result = refresh_future.result(timeout=REGISTER_LOCK_REFRESH_INTERVAL_SECONDS / 2)
-                        break
-                    except FutureTimeoutError:
-                        self._bump()
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as error:
-            self._append_log(
-                f"第{batch_number}次全量刷新未完成: {error.__class__.__name__}",
-                "red",
-                force=True,
-            )
-        else:
-            self._append_log(
-                f"第{batch_number}次全量刷新完成，成功={int(result.get('refreshed') or 0)}，"
-                f"错误={len(result.get('errors') or [])}",
-                "yellow",
-                force=True,
-            )
-        finally:
-            try:
-                metrics = self._pool_metrics()
-            except Exception as error:
-                self._append_log(
-                    f"第{batch_number}次全量刷新后号池统计失败: {error.__class__.__name__}",
-                    "red",
-                    force=True,
-                )
-            else:
-                self._bump(**metrics)
 
     def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
@@ -836,7 +745,6 @@ class RegisterService:
             done = max(0, int(stats.get("done") or 0))
             success = max(0, int(stats.get("success") or 0))
             fail = max(0, int(stats.get("fail") or 0))
-            full_refresh_batches = max(0, int(stats.get("full_refresh_batches") or 0))
         submitted = max(done, success + fail)
         lock_lost_exit = False
         mail_unavailable_exit = False
@@ -846,23 +754,7 @@ class RegisterService:
                 cfg = self._refresh_runtime_cfg_for_runner()
                 if self._lock_lost:
                     lock_lost_exit = True
-                next_full_refresh_at = (full_refresh_batches + 1) * REGISTER_FULL_REFRESH_BATCH_SIZE
-                if bool(cfg.get("enabled")) and not futures and success >= next_full_refresh_at:
-                    self._bump(running=0, done=done, success=success, fail=fail)
-                    if self._lock_lost:
-                        lock_lost_exit = True
-                        continue
-                    full_refresh_batches += 1
-                    self._bump(full_refresh_batches=full_refresh_batches)
-                    self._refresh_accounts_after_registration_batch(full_refresh_batches, success)
-                    cfg = self._refresh_runtime_cfg_for_runner()
-                    next_full_refresh_at = (full_refresh_batches + 1) * REGISTER_FULL_REFRESH_BATCH_SIZE
-                while (
-                    bool(cfg.get("enabled"))
-                    and not self._target_reached(cfg, submitted)
-                    and len(futures) < threads
-                    and success + len(futures) < next_full_refresh_at
-                ):
+                while bool(cfg.get("enabled")) and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)

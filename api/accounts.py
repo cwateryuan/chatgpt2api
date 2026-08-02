@@ -15,8 +15,10 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
+from services.config import config
 
 from api.support import (
+    FULL_ACCOUNT_REFRESH_INTERVAL_SECONDS,
     require_admin,
     sanitize_cpa_pool,
     sanitize_cpa_pools,
@@ -58,6 +60,10 @@ class AccountDeleteRequest(BaseModel):
 
 class AccountRefreshRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
+
+
+class AccountAutoRefreshRequest(BaseModel):
+    enabled: bool
 
 
 class AccountExportRequest(BaseModel):
@@ -213,6 +219,26 @@ def create_router() -> APIRouter:
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"items": account_service.list_accounts()}
+
+    @router.get("/api/accounts/auto-refresh")
+    async def get_account_auto_refresh(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {
+            "enabled": config.full_account_refresh_enabled,
+            "interval_seconds": FULL_ACCOUNT_REFRESH_INTERVAL_SECONDS,
+        }
+
+    @router.post("/api/accounts/auto-refresh")
+    async def update_account_auto_refresh(
+            body: AccountAutoRefreshRequest,
+            authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        config.update({"full_account_refresh_enabled": body.enabled})
+        return {
+            "enabled": config.full_account_refresh_enabled,
+            "interval_seconds": FULL_ACCOUNT_REFRESH_INTERVAL_SECONDS,
+        }
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
