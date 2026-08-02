@@ -195,6 +195,137 @@ class RegistrationHardeningTests(unittest.TestCase):
 
         executor.assert_called_once_with(max_workers=4)
 
+    def test_runner_full_refreshes_at_each_50_success_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = RegisterService(Path(tmp) / "register.json")
+            service._config = _normalize({"engine": "http", "mode": "total", "total": 100, "threads": 64, "enabled": True})
+            refresh_worker_counts: list[int] = []
+
+            def refresh_accounts(*_args, **_kwargs):
+                refresh_worker_counts.append(worker.call_count)
+                return {"refreshed": 100, "errors": [], "relogined": 0}
+
+            with (
+                mock.patch.object(openai_register, "worker", return_value={"ok": True}) as worker,
+                mock.patch("services.register_service.account_service.list_tokens", return_value=["token"]),
+                mock.patch(
+                    "services.register_service.account_service.refresh_accounts",
+                    side_effect=refresh_accounts,
+                ) as refresh,
+                mock.patch(
+                    "services.register_service.account_service.get_image_pool_metrics",
+                    return_value={"current_quota": 100, "current_available": 100},
+                ),
+                mock.patch.object(service, "_append_log"),
+                mock.patch.object(service, "_save"),
+                mock.patch.object(service, "_save_runtime"),
+                mock.patch.object(service, "_stop_requested", return_value=False),
+                mock.patch.object(service, "_clear_stop_requested"),
+                mock.patch("services.register_service.trim_memory"),
+            ):
+                service._run()
+
+        self.assertEqual(worker.call_count, 100)
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(refresh_worker_counts, [50, 100])
+        self.assertEqual(service._config["stats"]["full_refresh_batches"], 2)
+        for call in refresh.call_args_list:
+            self.assertFalse(call.kwargs["defer_invalid_removal"])
+            self.assertFalse(call.kwargs["include_items"])
+
+    def test_runner_counts_only_successful_registrations_for_batch_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = RegisterService(Path(tmp) / "register.json")
+            service._config = _normalize({"engine": "http", "mode": "total", "total": 50, "threads": 8, "enabled": True})
+
+            def worker_result(index: int):
+                return {"ok": index != 50}
+
+            with (
+                mock.patch.object(openai_register, "worker", side_effect=worker_result),
+                mock.patch("services.register_service.account_service.refresh_accounts") as refresh,
+                mock.patch.object(service, "_save"),
+                mock.patch.object(service, "_save_runtime"),
+                mock.patch.object(service, "_stop_requested", return_value=False),
+                mock.patch.object(service, "_clear_stop_requested"),
+                mock.patch.object(service, "_append_log"),
+                mock.patch("services.register_service.trim_memory"),
+            ):
+                service._run()
+
+        refresh.assert_not_called()
+        self.assertEqual(service._config["stats"]["success"], 49)
+        self.assertEqual(service._config["stats"]["full_refresh_batches"], 0)
+
+    def test_batch_refresh_failure_is_nonfatal_and_does_not_log_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = RegisterService(Path(tmp) / "register.json")
+            with (
+                mock.patch("services.register_service.account_service.list_tokens", return_value=["secret-token"]),
+                mock.patch(
+                    "services.register_service.account_service.refresh_accounts",
+                    side_effect=RuntimeError("failure for secret-token"),
+                ),
+                mock.patch(
+                    "services.register_service.account_service.get_image_pool_metrics",
+                    return_value={"current_quota": 0, "current_available": 0},
+                ),
+                mock.patch.object(service, "_append_log") as log,
+                mock.patch.object(service, "_save_runtime"),
+            ):
+                service._refresh_accounts_after_registration_batch(1, 50)
+
+        log_text = " ".join(str(call) for call in log.call_args_list)
+        self.assertNotIn("secret-token", log_text)
+        self.assertIn("RuntimeError", log_text)
+
+    def test_old_runtime_stats_skip_refreshes_crossed_before_upgrade(self):
+        normalized = _normalize({
+            "threads": 1,
+            "stats": {"success": 125, "done": 125, "fail": 0},
+        })
+
+        self.assertEqual(normalized["stats"]["full_refresh_batches"], 2)
+
+    def test_continuous_modes_resume_existing_runner_after_50_successes(self):
+        for mode in ("available", "quota"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                service = RegisterService(Path(tmp) / "register.json")
+                service._config = _normalize({
+                    "engine": "http",
+                    "mode": mode,
+                    "threads": 16,
+                    "target_available": 1000,
+                    "target_quota": 1000,
+                    "enabled": True,
+                })
+
+                def finish_after_refresh(*_args):
+                    service._config["enabled"] = False
+
+                with (
+                    mock.patch.object(openai_register, "worker", return_value={"ok": True}) as worker,
+                    mock.patch.object(
+                        service,
+                        "_refresh_accounts_after_registration_batch",
+                        side_effect=finish_after_refresh,
+                    ) as refresh_batch,
+                    mock.patch(
+                        "services.register_service.account_service.get_image_pool_metrics",
+                        return_value={"current_quota": 0, "current_available": 0},
+                    ),
+                    mock.patch.object(service, "_save"),
+                    mock.patch.object(service, "_save_runtime"),
+                    mock.patch.object(service, "_stop_requested", return_value=False),
+                    mock.patch.object(service, "_clear_stop_requested"),
+                    mock.patch.object(service, "_append_log"),
+                    mock.patch("services.register_service.trim_memory"),
+                ):
+                    service._run()
+
+                self.assertEqual(worker.call_count, 50)
+                refresh_batch.assert_called_once_with(1, 50)
+
     def test_browser_runtime_probe_runs_off_asyncio_thread(self):
         event_loop_thread = threading.get_ident()
         probe_threads: list[int] = []
