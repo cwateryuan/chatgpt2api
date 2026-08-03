@@ -20,6 +20,14 @@ from curl_cffi import requests
 from services.browser_fingerprint import make_fingerprint
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import browser_devtools, mail_provider
+from services.register.browser_identity import (
+    BrowserIdentity,
+    build_browser_identity,
+    build_user_agent,
+    build_user_agent_metadata,
+    parse_chrome_version,
+    stealth_and_identity_script,
+)
 from services.register.openai_register import (
     _fingerprint_with_user_agent,
     _random_birthdate,
@@ -678,6 +686,7 @@ class BrowserRegistrar:
             else str(proxy or "").strip()
         )
         self.fingerprint = make_fingerprint()
+        self.identity: BrowserIdentity | None = None
         self.callback_code = ""
         self._deadline = 0.0
         self._auth_responses: list[str] = []
@@ -686,6 +695,25 @@ class BrowserRegistrar:
         self.registration_proxy_username = ""
         self.registration_proxy_password = ""
         self.geo_environment: dict[str, Any] = {}
+
+    def _bind_identity(self, email: str, index: int) -> BrowserIdentity:
+        identity = build_browser_identity(email)
+        self.identity = identity
+        self.fingerprint.update(identity.as_fingerprint_updates())
+        # Keep device/session ids stable for the same mailbox across retries.
+        import uuid as _uuid
+
+        namespace = _uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+        self.fingerprint["device_id"] = str(_uuid.uuid5(namespace, f"oai-did:{identity.email}:{identity.seed}"))
+        self.fingerprint["session_id"] = str(_uuid.uuid5(namespace, f"oai-sid:{identity.email}:{identity.seed}"))
+        step(
+            index,
+            f"浏览器身份已绑定 email_seed={identity.seed} "
+            f"screen={identity.screen_width}x{identity.screen_height} "
+            f"window={identity.window_width}x{identity.window_height} "
+            f"cores={identity.hardware_concurrency} mem={identity.device_memory}G",
+        )
+        return identity
 
     def _load_geo_environment(self, proxy_url: str, index: int) -> None:
         try:
@@ -1060,10 +1088,12 @@ class BrowserRegistrar:
         self.registration_proxy_username = proxy_username
         self.registration_proxy_password = proxy_password
         self._load_geo_environment(proxy_url, index)
+        identity = self.identity or build_browser_identity(str(self.fingerprint.get("device_id") or "default"))
         step(
             index,
             f"浏览器网络 proxy={profile.proxy_source} proxy_server=yes "
-            f"proxy_auth={'yes' if proxy_username else 'no'} engine=chrome-devtools clearance=disabled",
+            f"proxy_auth={'yes' if proxy_username else 'no'} engine=chrome-devtools clearance=disabled "
+            f"hardening=stealth+webrtc+identity",
         )
         command = [
             executable,
@@ -1074,11 +1104,16 @@ class BrowserRegistrar:
             "--no-default-browser-check",
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-quic",
-            "--disable-features=UseDnsHttpsSvcb,AsyncDns",
-            "--window-size=1365,768",
+            "--disable-infobars",
+            "--disable-blink-features=AutomationControlled",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--disable-features=UseDnsHttpsSvcb,AsyncDns,IsolateOrigins,site-per-process",
+            f"--window-size={identity.window_size_arg()}",
             "--new-window",
         ]
+        # Prefer HTTP/2 over QUIC for more stable proxy paths, but keep as optional.
+        if str(os.getenv("BROWSER_DISABLE_QUIC") or "1").strip().lower() not in {"0", "false", "no", "off"}:
+            command.append("--disable-quic")
         browser_language = str(self.geo_environment.get("language") or "").strip()
         if browser_language:
             command.append(f"--lang={browser_language}")
@@ -1099,6 +1134,67 @@ class BrowserRegistrar:
             browser_devtools.close_browser(port, process)
             raise
         return process, port
+
+    def _apply_browser_hardening(self, port: int, index: int) -> dict[str, bool]:
+        identity = self.identity or build_browser_identity(str(self.fingerprint.get("device_id") or "default"))
+        product = browser_devtools.browser_product_version(port, timeout=self._devtools_timeout(5))
+        major, full = parse_chrome_version(product)
+        accept_language = str(
+            self.geo_environment.get("accept_language")
+            or self.fingerprint.get("accept_language")
+            or "en-US,en;q=0.9"
+        )
+        user_agent = build_user_agent(major, full)
+        metadata = build_user_agent_metadata(major, full, identity.platform_version)
+        self.fingerprint = _align_fingerprint_platform(
+            _fingerprint_with_user_agent(self.fingerprint, user_agent)
+        )
+        self.fingerprint.update(identity.as_fingerprint_updates())
+        self.fingerprint["major"] = major
+        self.fingerprint["full_version"] = full
+        self.fingerprint["sec_ch_ua"] = (
+            f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not_A Brand";v="24"'
+        )
+        self.fingerprint["sec_ch_ua_full_version_list"] = (
+            f'"Chromium";v="{full}", "Google Chrome";v="{full}", "Not_A Brand";v="24.0.0.0"'
+        )
+        self.fingerprint["impersonate"] = (
+            f"chrome{major}" if major in {"131", "136", "142", "145", "146"} else "chrome"
+        )
+
+        geo_kwargs: dict[str, Any] = {
+            "timezone_id": str(self.geo_environment.get("timezone") or ""),
+            "locale": str(self.geo_environment.get("language") or ""),
+            "accept_language": accept_language,
+            "user_agent": user_agent,
+            "user_agent_metadata": metadata,
+            "init_script": stealth_and_identity_script(identity),
+            "screen_width": identity.screen_width,
+            "screen_height": identity.screen_height,
+            "window_width": identity.window_width,
+            "window_height": identity.window_height,
+            "timeout": self._devtools_timeout(10),
+        }
+        if self.geo_environment.get("latitude") not in (None, "") and self.geo_environment.get("longitude") not in (None, ""):
+            try:
+                geo_kwargs["latitude"] = float(self.geo_environment["latitude"])
+                geo_kwargs["longitude"] = float(self.geo_environment["longitude"])
+            except (TypeError, ValueError):
+                pass
+
+        applied = browser_devtools.apply_environment_overrides(port, **geo_kwargs)
+        step(
+            index,
+            "浏览器加固已应用 "
+            f"ua={'yes' if applied.get('user_agent') else 'no'} "
+            f"init={'yes' if applied.get('init_script') else 'no'} "
+            f"screen={'yes' if applied.get('screen') else 'no'} "
+            f"timezone={'yes' if applied.get('timezone') else 'no'} "
+            f"locale={'yes' if applied.get('locale') else 'no'} "
+            f"product={product or major}",
+            "green" if applied.get("user_agent") and applied.get("init_script") else "yellow",
+        )
+        return applied
 
     def _devtools_access_token(self, port: int) -> str:
         last_status = "empty"
@@ -1418,6 +1514,7 @@ class BrowserRegistrar:
         process: subprocess.Popen[Any] | None = None
         port = 0
         proxy_auth: browser_devtools.ProxyAuthHandler | None = None
+        self._bind_identity(email, index)
         with tempfile.TemporaryDirectory(prefix="chatgpt2api-browser-") as profile_dir:
             try:
                 process, port = self._launch_devtools_browser(Path(profile_dir), index)
@@ -1429,28 +1526,10 @@ class BrowserRegistrar:
                     )
                     proxy_auth.start(timeout=min(5.0, self._devtools_timeout(5)))
                     step(index, "浏览器注册代理认证已启用")
-                if self.geo_environment:
-                    try:
-                        applied = browser_devtools.apply_environment_overrides(
-                            port,
-                            timezone_id=str(self.geo_environment.get("timezone") or ""),
-                            locale=str(self.geo_environment.get("language") or ""),
-                            accept_language=str(self.geo_environment.get("accept_language") or ""),
-                            latitude=float(self.geo_environment["latitude"]),
-                            longitude=float(self.geo_environment["longitude"]),
-                            timeout=self._devtools_timeout(10),
-                        )
-                    except Exception as error:
-                        applied = {"timezone": False, "locale": False, "geolocation": False}
-                        step(index, f"浏览器地理环境应用失败，继续注册: {_sanitized_error(error)}", "yellow")
-                    step(
-                        index,
-                        "浏览器地理环境已应用 "
-                        f"timezone={'yes' if applied['timezone'] else 'no'} "
-                        f"locale={'yes' if applied['locale'] else 'no'} "
-                        f"coordinates={'yes' if applied['geolocation'] else 'no'}",
-                        "green" if all(applied.values()) else "yellow",
-                    )
+                try:
+                    self._apply_browser_hardening(port, index)
+                except Exception as error:
+                    step(index, f"浏览器加固部分失败，继续注册: {_sanitized_error(error)}", "yellow")
                 browser_devtools.navigate_to(port, CHATGPT_LOGIN_URL, self._devtools_timeout())
                 state_reader = lambda: self._devtools_state(port)
                 step(index, "浏览器等待 ChatGPT 登录页")
@@ -1985,7 +2064,7 @@ class BrowserRegistrar:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=wrapped)
             raise wrapped from error
         mail_provider.mark_mailbox_result(mailbox, success=True)
-        return {
+        result = {
             "email": email,
             "password": password,
             **tokens,
@@ -1997,6 +2076,9 @@ class BrowserRegistrar:
             "image_quota_unknown": True,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        if self.identity is not None:
+            result["browser_identity"] = self.identity.to_dict()
+        return result
 
 
 def worker(index: int) -> dict[str, Any]:

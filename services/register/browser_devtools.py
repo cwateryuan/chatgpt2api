@@ -331,6 +331,26 @@ def get_all_cookies(port: int, *, timeout: float, hosts: tuple[str, ...] = ()) -
     return [item for item in cookies if isinstance(item, dict)] if isinstance(cookies, list) else []
 
 
+def browser_product_version(port: int, timeout: float = 5.0) -> str:
+    """Return Browser.getVersion product string, e.g. HeadlessChrome/136.0.x."""
+    try:
+        version = devtools_json(port, "/json/version", timeout)
+        if isinstance(version, dict):
+            product = str(version.get("Browser") or version.get("Product") or "").strip()
+            if product:
+                return product
+    except Exception:
+        pass
+    try:
+        with DevToolsSocket(page_websocket(port), timeout) as devtools:
+            result = devtools.call("Browser.getVersion", timeout=timeout)
+            if isinstance(result, dict):
+                return str(result.get("product") or result.get("Product") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def apply_environment_overrides(
     port: int,
     *,
@@ -340,10 +360,85 @@ def apply_environment_overrides(
     latitude: float | None = None,
     longitude: float | None = None,
     timeout: float,
+    user_agent: str = "",
+    user_agent_metadata: dict[str, Any] | None = None,
+    init_script: str = "",
+    screen_width: int | None = None,
+    screen_height: int | None = None,
+    window_width: int | None = None,
+    window_height: int | None = None,
 ) -> dict[str, bool]:
-    """Apply proxy-derived renderer settings before the first real navigation."""
-    applied = {"timezone": False, "locale": False, "geolocation": False}
+    """Apply proxy-derived renderer settings and identity hardening before navigation."""
+    applied = {
+        "timezone": False,
+        "locale": False,
+        "geolocation": False,
+        "user_agent": False,
+        "init_script": False,
+        "screen": False,
+    }
     with DevToolsSocket(page_websocket(port), timeout) as devtools:
+        try:
+            devtools.call("Page.enable", timeout=timeout)
+            devtools.call("Network.enable", timeout=timeout)
+            devtools.call("Runtime.enable", timeout=timeout)
+        except Exception:
+            pass
+
+        if init_script:
+            try:
+                devtools.call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": init_script},
+                    timeout=timeout,
+                )
+                applied["init_script"] = True
+            except Exception:
+                pass
+
+        if user_agent:
+            payload: dict[str, Any] = {
+                "userAgent": user_agent,
+                "platform": "Win32",
+            }
+            if accept_language:
+                payload["acceptLanguage"] = accept_language
+            if user_agent_metadata:
+                payload["userAgentMetadata"] = user_agent_metadata
+            try:
+                devtools.call("Network.setUserAgentOverride", payload, timeout=timeout)
+                applied["user_agent"] = True
+            except Exception:
+                # Older Chromium may reject metadata; retry without it.
+                try:
+                    bare = {"userAgent": user_agent, "platform": "Win32"}
+                    if accept_language:
+                        bare["acceptLanguage"] = accept_language
+                    devtools.call("Network.setUserAgentOverride", bare, timeout=timeout)
+                    applied["user_agent"] = True
+                except Exception:
+                    pass
+
+        if screen_width and screen_height:
+            width = int(window_width or screen_width)
+            height = int(window_height or screen_height)
+            try:
+                devtools.call(
+                    "Emulation.setDeviceMetricsOverride",
+                    {
+                        "width": width,
+                        "height": height,
+                        "deviceScaleFactor": 1,
+                        "mobile": False,
+                        "screenWidth": int(screen_width),
+                        "screenHeight": int(screen_height),
+                    },
+                    timeout=timeout,
+                )
+                applied["screen"] = True
+            except Exception:
+                pass
+
         if timezone_id:
             try:
                 devtools.call("Emulation.setTimezoneOverride", {"timezoneId": timezone_id}, timeout=timeout)
@@ -358,7 +453,6 @@ def apply_environment_overrides(
                 pass
         if accept_language:
             try:
-                devtools.call("Network.enable", timeout=timeout)
                 devtools.call(
                     "Network.setExtraHTTPHeaders",
                     {"headers": {"Accept-Language": accept_language}},

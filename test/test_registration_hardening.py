@@ -436,10 +436,17 @@ class RegistrationHardeningTests(unittest.TestCase):
             mock.patch.object(registrar, "_launch_devtools_browser", return_value=(process, 12345)),
             mock.patch.object(browser_register.browser_devtools, "ProxyAuthHandler") as proxy_auth,
             mock.patch.object(
-                browser_register.browser_devtools,
-                "apply_environment_overrides",
-                return_value={"timezone": True, "locale": True, "geolocation": True},
-            ) as apply_environment,
+                registrar,
+                "_apply_browser_hardening",
+                return_value={
+                    "timezone": True,
+                    "locale": True,
+                    "geolocation": True,
+                    "user_agent": True,
+                    "init_script": True,
+                    "screen": True,
+                },
+            ) as apply_hardening,
             mock.patch.object(browser_register.browser_devtools, "navigate_to") as navigate_to,
             mock.patch.object(registrar, "_wait_for_otp", return_value="246810") as wait_for_otp,
             mock.patch.object(browser_register.browser_devtools, "wait_for", return_value={"url": "https://chatgpt.com/auth/login"}),
@@ -493,15 +500,9 @@ class RegistrationHardeningTests(unittest.TestCase):
         proxy_auth.assert_called_once_with(12345, "clip-user", "clip-password")
         proxy_auth.return_value.start.assert_called_once()
         proxy_auth.return_value.close.assert_called_once()
-        apply_environment.assert_called_once_with(
-            12345,
-            timezone_id="Europe/Berlin",
-            locale="de-DE",
-            accept_language="de-DE,de;q=0.9,en;q=0.8",
-            latitude=50.11,
-            longitude=8.68,
-            timeout=mock.ANY,
-        )
+        apply_hardening.assert_called_once_with(12345, 1)
+        self.assertIsNotNone(registrar.identity)
+        self.assertEqual(registrar.identity.email, "same@example.com")
         navigate_to.assert_called_once_with(12345, browser_register.CHATGPT_LOGIN_URL, mock.ANY)
         self.assertEqual(submit_until.call_count, 3)
         wait_for_otp.assert_called_once()
@@ -687,17 +688,44 @@ class RegistrationHardeningTests(unittest.TestCase):
                 latitude=50.11,
                 longitude=8.68,
                 timeout=5,
+                user_agent="Mozilla/5.0 Chrome/136.0.0.0",
+                user_agent_metadata={"platform": "Windows", "mobile": False},
+                init_script="(()=>{})();",
+                screen_width=1920,
+                screen_height=1080,
+                window_width=1800,
+                window_height=960,
             )
 
-        self.assertEqual(applied, {"timezone": True, "locale": True, "geolocation": True})
+        self.assertEqual(applied, {
+            "timezone": True,
+            "locale": True,
+            "geolocation": True,
+            "user_agent": True,
+            "init_script": True,
+            "screen": True,
+        })
         methods = [call.args[0] for call in devtools.call.call_args_list]
-        self.assertEqual(methods, [
-            "Emulation.setTimezoneOverride",
-            "Emulation.setLocaleOverride",
-            "Network.enable",
-            "Network.setExtraHTTPHeaders",
-            "Emulation.setGeolocationOverride",
-        ])
+        self.assertIn("Page.enable", methods)
+        self.assertIn("Network.enable", methods)
+        self.assertIn("Page.addScriptToEvaluateOnNewDocument", methods)
+        self.assertIn("Network.setUserAgentOverride", methods)
+        self.assertIn("Emulation.setDeviceMetricsOverride", methods)
+        self.assertIn("Emulation.setTimezoneOverride", methods)
+        self.assertIn("Emulation.setLocaleOverride", methods)
+        self.assertIn("Network.setExtraHTTPHeaders", methods)
+        self.assertIn("Emulation.setGeolocationOverride", methods)
+
+    def test_browser_identity_is_stable_per_email(self):
+        from services.register.browser_identity import build_browser_identity
+
+        first = build_browser_identity("Same@Example.com")
+        second = build_browser_identity("same@example.com")
+        other = build_browser_identity("other@example.com")
+        self.assertEqual(first, second)
+        self.assertNotEqual(first.seed, other.seed)
+        self.assertTrue(first.gpu_vendor)
+        self.assertGreaterEqual(first.window_width, 1000)
 
     def test_browser_devtools_launch_requires_and_applies_registration_proxy(self):
         registrar = browser_register.BrowserRegistrar()
