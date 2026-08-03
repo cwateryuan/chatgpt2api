@@ -118,10 +118,24 @@ def _chrome_sec_ch_ua_full_version_list(major: str, full_version: str) -> str:
     )
 
 
+_SCREEN_CHOICES = ((1920, 1080), (1536, 864), (1440, 900), (1366, 768), (2560, 1440))
+_CORE_CHOICES = (4, 8, 12, 16)
+_FIRST_NAMES = (
+    "James", "Robert", "John", "Michael", "David", "William", "Richard", "Joseph",
+    "Thomas", "Charles", "Mary", "Patricia", "Jennifer", "Linda", "Elizabeth",
+    "Barbara", "Susan", "Jessica", "Sarah", "Karen", "Emma", "Olivia", "Ava", "Sophia",
+)
+_LAST_NAMES = (
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis",
+    "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson",
+    "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White",
+)
+
+
 def _complete_browser_fingerprint(profile: dict[str, str]) -> dict[str, str]:
     major = str(profile.get("major") or "142").strip()
     full_version = str(profile.get("full_version") or f"{major}.0.0.0").strip()
-    return {
+    completed = {
         **profile,
         "major": major,
         "full_version": full_version,
@@ -133,7 +147,19 @@ def _complete_browser_fingerprint(profile: dict[str, str]) -> dict[str, str]:
         "accept_language": str(profile.get("accept_language") or "en-US,en;q=0.9"),
         "platform_version": str(profile.get("platform_version") or "10.0.0"),
         "impersonate": str(profile.get("impersonate") or "chrome"),
+        "sec_ch_ua_platform": str(profile.get("sec_ch_ua_platform") or '"Windows"'),
+        "sec_ch_ua_mobile": str(profile.get("sec_ch_ua_mobile") or "?0"),
     }
+    if not str(completed.get("screen_width") or "").strip() or not str(completed.get("screen_height") or "").strip():
+        width, height = random.choice(_SCREEN_CHOICES)
+        completed.setdefault("screen_width", str(width))
+        completed.setdefault("screen_height", str(height))
+    completed.setdefault("hardware_concurrency", str(random.choice(_CORE_CHOICES)))
+    language = str(completed.get("language") or completed["accept_language"].split(",", 1)[0]).strip()
+    if ";" in language:
+        language = language.split(";", 1)[0].strip()
+    completed.setdefault("language", language or "en-US")
+    return completed
 
 
 DEFAULT_BROWSER_FINGERPRINT = _complete_browser_fingerprint(REGISTER_BROWSER_PROFILES[0])
@@ -210,9 +236,33 @@ def _header_fingerprint(headers: dict[str, str], fingerprint: dict[str, str] | N
         next_headers["sec-ch-ua-full-version-list"] = fp["sec_ch_ua_full_version_list"]
     if "sec-ch-ua-platform-version" in next_headers:
         next_headers["sec-ch-ua-platform-version"] = f'"{fp["platform_version"]}"'
+    if "sec-ch-ua-platform" in next_headers:
+        next_headers["sec-ch-ua-platform"] = str(fp.get("sec_ch_ua_platform") or '"Windows"')
+    if "sec-ch-ua-mobile" in next_headers:
+        next_headers["sec-ch-ua-mobile"] = str(fp.get("sec_ch_ua_mobile") or "?0")
     if "accept-language" in next_headers:
         next_headers["accept-language"] = fp["accept_language"]
     return next_headers
+
+
+def _human_pause(min_seconds: float = 0.35, max_seconds: float = 1.4) -> None:
+    low = max(0.05, float(min_seconds))
+    high = max(low, float(max_seconds))
+    time.sleep(random.uniform(low, high))
+
+
+def _sentinel_env(fingerprint: dict[str, str] | None = None) -> dict[str, str]:
+    fp = _browser_fingerprint(fingerprint)
+    return {
+        "language": str(fp.get("language") or "en-US"),
+        "accept_language": str(fp.get("accept_language") or "en-US,en;q=0.9"),
+        "timezone": str(fp.get("timezone") or ""),
+        "screen_width": str(fp.get("screen_width") or "1920"),
+        "screen_height": str(fp.get("screen_height") or "1080"),
+        "hardware_concurrency": str(fp.get("hardware_concurrency") or "8"),
+        "sec_ch_ua_platform": str(fp.get("sec_ch_ua_platform") or '"Windows"'),
+        "sec_ch_ua_mobile": str(fp.get("sec_ch_ua_mobile") or "?0"),
+    }
 
 
 def _extract_chrome_version_from_user_agent(value: str) -> tuple[str, str]:
@@ -299,13 +349,19 @@ def _random_password(length: int = 16) -> str:
 
 
 def _random_name() -> tuple[str, str]:
-    return random.choice(["James", "Robert", "John", "Michael", "David", "Mary", "Emma", "Olivia"]), random.choice(
-        ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller"]
-    )
+    return random.choice(_FIRST_NAMES), random.choice(_LAST_NAMES)
 
 
 def _random_birthdate() -> str:
-    return f"{random.randint(1996, 2006):04d}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
+    year = random.randint(1988, 2005)
+    month = random.randint(1, 12)
+    if month in {1, 3, 5, 7, 8, 10, 12}:
+        day_limit = 31
+    elif month in {4, 6, 9, 11}:
+        day_limit = 30
+    else:
+        day_limit = 28
+    return f"{year:04d}-{month:02d}-{random.randint(1, day_limit):02d}"
 
 
 def _response_json(resp) -> dict:
@@ -412,6 +468,7 @@ def wait_for_code(mailbox: dict, *, proxy: str | None = None) -> str | None:
 
 from utils.sentinel import (
     SentinelTokenGenerator,
+    apply_oai_sc_cookie,
     build_sentinel_token as _build_sentinel_token_tuple,
     build_sentinel_with_so_token,
 )
@@ -425,13 +482,17 @@ def build_sentinel_token(
 ) -> str:
     """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
     fp = _browser_fingerprint(fingerprint)
-    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(
+    sentinel_val, oai_sc_val = _build_sentinel_token_tuple(
         session,
         device_id,
         flow,
         user_agent=fp["user_agent"],
         sec_ch_ua=fp["sec_ch_ua"],
+        env=_sentinel_env(fp),
+        apply_cookie=True,
     )
+    if oai_sc_val:
+        apply_oai_sc_cookie(session, oai_sc_val)
     return sentinel_val
 
 
@@ -440,7 +501,7 @@ def create_session(proxy: str = "", fingerprint: dict[str, str] | None = None) -
     kwargs = proxy_settings.build_session_kwargs(
         proxy=proxy,
         upstream=True,
-        impersonate=fp["impersonate"] if fingerprint else "chrome",
+        impersonate=(fp.get("impersonate") or "chrome") if fingerprint else "chrome",
         verify=False,
     )
     session = requests.Session(**kwargs)
@@ -585,9 +646,37 @@ class PlatformRegistrar:
         self.session_id = self.fingerprint["session_id"]
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self.geo_environment: dict[str, Any] = {}
 
     def close(self) -> None:
         self.session.close()
+
+    def _load_geo_environment(self, index: int) -> None:
+        proxy = str(self.proxy or "").strip()
+        if not proxy:
+            return
+        try:
+            from services.register import browser_register
+
+            geo = browser_register._proxy_geography(proxy, self.fingerprint)
+        except Exception as error:
+            step(index, f"HTTP 出口地理位置查询失败，沿用默认语言时区: {error}", "yellow")
+            return
+        if not geo:
+            step(index, "HTTP 出口地理位置查询失败，沿用默认语言时区", "yellow")
+            return
+        self.geo_environment = dict(geo)
+        self.fingerprint.update({
+            "timezone": str(geo.get("timezone") or ""),
+            "language": str(geo.get("language") or self.fingerprint.get("language") or "en-US"),
+            "accept_language": str(geo.get("accept_language") or self.fingerprint.get("accept_language") or "en-US,en;q=0.9"),
+            "latitude": str(geo.get("latitude") or ""),
+            "longitude": str(geo.get("longitude") or ""),
+            "geo_country": str(geo.get("country") or ""),
+            "geo_city": str(geo.get("city") or ""),
+        })
+        location = "/".join(filter(None, (str(geo.get("country") or ""), str(geo.get("city") or ""))))
+        step(index, f"HTTP 出口位置={location or 'unknown'} timezone={geo.get('timezone') or '-'} language={self.fingerprint.get('language')}")
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = _header_fingerprint(navigate_headers, self.fingerprint)
@@ -601,6 +690,21 @@ class PlatformRegistrar:
         headers["oai-device-id"] = self.device_id
         headers.update(_make_trace_headers())
         return headers
+
+    def _build_create_account_sentinel(self) -> tuple[str, str]:
+        fp = _browser_fingerprint(self.fingerprint)
+        sentinel_token, so_token, oai_sc = build_sentinel_with_so_token(
+            self.session,
+            self.device_id,
+            "oauth_create_account",
+            user_agent=fp["user_agent"],
+            sec_ch_ua=fp["sec_ch_ua"],
+            env=_sentinel_env(fp),
+            apply_cookie=True,
+        )
+        if oai_sc:
+            apply_oai_sc_cookie(self.session, oai_sc)
+        return sentinel_token, so_token
 
     def _refresh_cloudflare_clearance(self, target_url: str, index: int) -> ClearanceBundle | None:
         self.clearance_failure_reason = ""
@@ -634,6 +738,7 @@ class PlatformRegistrar:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
+        _human_pause(0.2, 0.8)
         self.code_verifier, code_challenge = _generate_pkce()
         params = {
             "issuer": auth_base,
@@ -677,6 +782,7 @@ class PlatformRegistrar:
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
+        _human_pause(0.6, 1.8)
         url = f"{auth_base}/api/accounts/user/register"
         headers = self._json_headers(f"{auth_base}/create-account/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.fingerprint)
@@ -702,6 +808,7 @@ class PlatformRegistrar:
 
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
+        _human_pause(0.4, 1.2)
         url = f"{auth_base}/api/accounts/email-otp/send"
         headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent, self.device_id)
         resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
@@ -719,6 +826,7 @@ class PlatformRegistrar:
 
     def _validate_otp(self, code: str, index: int) -> None:
         step(index, f"开始校验验证码 {code}")
+        _human_pause(0.5, 1.6)
         resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
         if resp is None or resp.status_code != 200:
             body = ""
@@ -731,6 +839,7 @@ class PlatformRegistrar:
 
     def _open_about_you(self, index: int) -> None:
         step(index, "进入账号资料页")
+        _human_pause(0.4, 1.3)
         url = f"{auth_base}/about-you"
         headers = _headers_with_clearance(
             self._navigate_headers(f"{auth_base}/email-verification"),
@@ -752,18 +861,10 @@ class PlatformRegistrar:
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
+        _human_pause(0.8, 2.4)
         url = f"{auth_base}/api/accounts/create_account"
         headers = self._json_headers(f"{auth_base}/about-you")
-
-        fp = _browser_fingerprint(self.fingerprint)
-        sentinel_token, so_token, _oai_sc = build_sentinel_with_so_token(
-            self.session,
-            self.device_id,
-            "oauth_create_account",
-            user_agent=fp["user_agent"],
-            sec_ch_ua=fp["sec_ch_ua"],
-        )
-
+        sentinel_token, so_token = self._build_create_account_sentinel()
         headers["openai-sentinel-token"] = sentinel_token
         if so_token:
             headers["openai-sentinel-so-token"] = so_token
@@ -775,15 +876,7 @@ class PlatformRegistrar:
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/about-you")
-
-            sentinel_token, so_token, _oai_sc = build_sentinel_with_so_token(
-                self.session,
-                self.device_id,
-                "oauth_create_account",
-                user_agent=fp["user_agent"],
-                sec_ch_ua=fp["sec_ch_ua"],
-            )
-
+            sentinel_token, so_token = self._build_create_account_sentinel()
             headers["openai-sentinel-token"] = sentinel_token
             if so_token:
                 headers["openai-sentinel-so-token"] = so_token
@@ -929,6 +1022,7 @@ class PlatformRegistrar:
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
+        self._load_geo_environment(index)
         mailbox = create_mailbox(proxy=self.proxy)
         email = str(mailbox.get("address") or "").strip()
         if not email:
@@ -939,6 +1033,7 @@ class PlatformRegistrar:
         try:
             password = _random_password()
             first_name, last_name = _random_name()
+            _human_pause(0.3, 1.0)
             landed = self._platform_authorize(email, index)
             source_type = "web"
             if landed == "login":

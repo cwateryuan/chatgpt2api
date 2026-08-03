@@ -795,17 +795,28 @@ class AccountService:
             
             # 添加 sentinel token
             try:
-                from utils.sentinel import build_sentinel_token
+                from utils.sentinel import apply_oai_sc_cookie, build_sentinel_token
                 sentinel_val, oai_sc_val = build_sentinel_token(
                     session,
                     device_id,
                     "password_verify",
                     user_agent=user_agent,
                     sec_ch_ua=fp["sec_ch_ua"],
+                    env={
+                        "language": str(fp.get("language") or fp.get("accept_language") or "en-US"),
+                        "accept_language": str(fp.get("accept_language") or "en-US,en;q=0.9"),
+                        "timezone": str(fp.get("timezone") or ""),
+                        "screen_width": str(fp.get("screen_width") or ""),
+                        "screen_height": str(fp.get("screen_height") or ""),
+                        "hardware_concurrency": str(fp.get("hardware_concurrency") or ""),
+                        "sec_ch_ua_platform": str(fp.get("sec_ch_ua_platform") or '"Windows"'),
+                        "sec_ch_ua_mobile": str(fp.get("sec_ch_ua_mobile") or "?0"),
+                    },
+                    apply_cookie=True,
                 )
                 login_headers["openai-sentinel-token"] = sentinel_val
                 if oai_sc_val:
-                    session.cookies.set("oai-sc", oai_sc_val, domain=".openai.com")
+                    apply_oai_sc_cookie(session, oai_sc_val)
             except Exception:
                 pass
             

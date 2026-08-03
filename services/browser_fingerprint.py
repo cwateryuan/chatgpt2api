@@ -12,6 +12,8 @@ REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
         "full_version": "142.0.0.0",
         "platform_version": "10.0.0",
         "accept_language": "en-US,en;q=0.9",
+        "sec_ch_ua_platform": '"Windows"',
+        "sec_ch_ua_mobile": "?0",
     },
     {
         "impersonate": "chrome136",
@@ -19,6 +21,8 @@ REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
         "full_version": "136.0.0.0",
         "platform_version": "10.0.0",
         "accept_language": "en-US,en;q=0.9",
+        "sec_ch_ua_platform": '"Windows"',
+        "sec_ch_ua_mobile": "?0",
     },
     {
         "impersonate": "chrome131",
@@ -26,6 +30,8 @@ REGISTER_BROWSER_PROFILES: tuple[dict[str, str], ...] = (
         "full_version": "131.0.0.0",
         "platform_version": "10.0.0",
         "accept_language": "en-US,en;q=0.9",
+        "sec_ch_ua_platform": '"Windows"',
+        "sec_ch_ua_mobile": "?0",
     },
 )
 
@@ -69,12 +75,16 @@ def complete_fingerprint(
     normalized.setdefault("major", major)
     normalized.setdefault("full_version", full_version)
     normalized.setdefault("user_agent", _chrome_user_agent(major, full_version))
-    normalized.setdefault("impersonate", "chrome")
+    normalized.setdefault("impersonate", f"chrome{major}" if major in {"131", "136", "142", "145", "146"} else "chrome")
     normalized.setdefault("accept_language", "en-US,en;q=0.9")
     normalized.setdefault("sec_ch_ua", _chrome_sec_ch_ua(major))
     normalized.setdefault("sec_ch_ua_mobile", "?0")
     normalized.setdefault("sec_ch_ua_platform", '"Windows"')
     normalized.setdefault("platform_version", "10.0.0")
+    language = str(normalized.get("language") or normalized["accept_language"].split(",", 1)[0]).strip()
+    if ";" in language:
+        language = language.split(";", 1)[0].strip()
+    normalized.setdefault("language", language or "en-US")
     if generate_ids:
         normalized.setdefault("device_id", str(uuid.uuid4()))
         normalized.setdefault("session_id", str(uuid.uuid4()))
