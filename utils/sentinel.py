@@ -7,17 +7,26 @@ from __future__ import annotations
 import base64
 import json
 import random
+import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin
 
 from utils.turnstile import solve_turnstile_token
 
 if TYPE_CHECKING:
     from curl_cffi.requests import Session
 
-DEFAULT_SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js"
+# Fallback only; live value is resolved from frame.html when possible.
+DEFAULT_SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js"
+SENTINEL_FRAME_URL = "https://sentinel.openai.com/backend-api/sentinel/frame.html"
+_SDK_CACHE_TTL_SECONDS = 3600.0
+_sdk_cache_lock = threading.Lock()
+_sdk_cache_url = ""
+_sdk_cache_expires_at = 0.0
 DEFAULT_SCREEN = "1920x1080"
 NAVIGATOR_KEYS = (
     "vendorSub-undefined",
@@ -86,7 +95,10 @@ class SentinelTokenGenerator:
         return random.choice([4, 8, 12, 16])
 
     def _sdk_url(self) -> str:
-        return str(self.env.get("sdk_url") or DEFAULT_SENTINEL_SDK_URL).strip() or DEFAULT_SENTINEL_SDK_URL
+        configured = str(self.env.get("sdk_url") or "").strip()
+        if configured:
+            return configured
+        return resolve_sentinel_sdk_url()
 
     def _local_time_string(self) -> str:
         tz_name = str(self.env.get("timezone") or "").strip()
@@ -168,6 +180,82 @@ DEFAULT_SENTINEL_USER_AGENT = (
 DEFAULT_SENTINEL_SEC_CH_UA = '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"'
 
 
+def parse_sentinel_sdk_url(html: str) -> str:
+    """Extract absolute sentinel sdk.js URL from frame/html markup."""
+    text = str(html or "")
+    for pattern in (
+        r"""src=['"](https://sentinel\.openai\.com/sentinel/[0-9a-f]+/sdk\.js)['"]""",
+        r"""src=['"](//sentinel\.openai\.com/sentinel/[0-9a-f]+/sdk\.js)['"]""",
+        r"""src=['"](/sentinel/[0-9a-f]+/sdk\.js)['"]""",
+        r"""(https://sentinel\.openai\.com/sentinel/[0-9a-f]+/sdk\.js)""",
+        r"""(/sentinel/[0-9a-f]+/sdk\.js)""",
+    ):
+        match = re.search(pattern, text, flags=re.I)
+        if not match:
+            continue
+        value = str(match.group(1) or "").strip()
+        if value.startswith("//"):
+            return f"https:{value}"
+        if value.startswith("/"):
+            return urljoin("https://sentinel.openai.com", value)
+        if value.startswith("https://"):
+            return value
+    return ""
+
+
+def resolve_sentinel_sdk_url(
+    session: "Session | None" = None,
+    *,
+    force: bool = False,
+    user_agent: str = "",
+) -> str:
+    """Return current sentinel sdk.js URL, refreshing from frame.html with TTL cache."""
+    global _sdk_cache_url, _sdk_cache_expires_at
+    now = time.monotonic()
+    with _sdk_cache_lock:
+        if not force and _sdk_cache_url and _sdk_cache_expires_at > now:
+            return _sdk_cache_url
+
+    html = ""
+    try:
+        if session is not None:
+            resp = session.get(
+                SENTINEL_FRAME_URL,
+                headers={
+                    "User-Agent": user_agent or DEFAULT_SENTINEL_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Referer": "https://auth.openai.com/",
+                },
+                timeout=15,
+                verify=False,
+            )
+            if int(getattr(resp, "status_code", 0) or 0) == 200:
+                html = str(getattr(resp, "text", "") or "")
+        else:
+            from curl_cffi import requests as curl_requests
+
+            resp = curl_requests.get(
+                SENTINEL_FRAME_URL,
+                headers={
+                    "User-Agent": user_agent or DEFAULT_SENTINEL_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+                timeout=15,
+                verify=False,
+                impersonate="chrome",
+            )
+            if int(getattr(resp, "status_code", 0) or 0) == 200:
+                html = str(getattr(resp, "text", "") or "")
+    except Exception:
+        html = ""
+
+    resolved = parse_sentinel_sdk_url(html) or DEFAULT_SENTINEL_SDK_URL
+    with _sdk_cache_lock:
+        _sdk_cache_url = resolved
+        _sdk_cache_expires_at = time.monotonic() + _SDK_CACHE_TTL_SECONDS
+    return resolved
+
+
 def apply_oai_sc_cookie(session: "Session", oai_sc_value: str) -> None:
     """Persist oai-sc on OpenAI auth cookie domains used by registration/login."""
     value = str(oai_sc_value or "").strip()
@@ -208,6 +296,8 @@ def _request_sentinel_payload(
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
     runtime_env = dict(env or {})
+    if not str(runtime_env.get("sdk_url") or "").strip():
+        runtime_env["sdk_url"] = resolve_sentinel_sdk_url(session, user_agent=ua)
     generator = SentinelTokenGenerator(device_id, ua, runtime_env)
     requirements_token = generator.generate_requirements_token()
     resp = session.post(

@@ -27,7 +27,12 @@ from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
-from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
+from utils.pow import (
+    build_legacy_requirements_token,
+    build_proof_token,
+    parse_client_build_meta,
+    parse_pow_resources,
+)
 from utils.turnstile import solve_turnstile_token
 
 
@@ -67,8 +72,9 @@ class ChatRequirements:
     raw_finalize: Optional[Dict[str, Any]] = None
 
 
-DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
-DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
+# Captured from live chatgpt.com after CF clearance (2026-08-03).
+DEFAULT_CLIENT_VERSION = "prod-3410020faf93d4c3977132397e1d459857a86a7c"
+DEFAULT_CLIENT_BUILD_NUMBER = "8848688"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
@@ -259,9 +265,14 @@ class OpenAIBackendAPI:
             return default
 
     def _client_contextual_info(self, *, time_since_loaded: int, app_name: bool = False) -> Dict[str, Any]:
+        # Avoid fixed loaded clocks that cluster automated traffic.
+        loaded = int(time_since_loaded)
+        if loaded > 0:
+            jitter = int(max(1, loaded * 0.15))
+            loaded = max(1, loaded + random.randint(-jitter, jitter))
         context: Dict[str, Any] = {
             "is_dark_mode": False,
-            "time_since_loaded": time_since_loaded,
+            "time_since_loaded": loaded,
             "page_height": self._fp_int("page_height", 900),
             "page_width": self._fp_int("page_width", 1400),
             "pixel_ratio": self._fp_float("pixel_ratio", 2.0),
@@ -271,6 +282,14 @@ class OpenAIBackendAPI:
         if app_name:
             context["app_name"] = "chatgpt.com"
         return context
+
+    def _apply_client_build(self, version: str = "", build_number: str = "") -> None:
+        next_version = str(version or "").strip() or self.client_version or DEFAULT_CLIENT_VERSION
+        next_build = str(build_number or "").strip() or self.client_build_number or DEFAULT_CLIENT_BUILD_NUMBER
+        self.client_version = next_version
+        self.client_build_number = next_build
+        self.session.headers["OAI-Client-Version"] = next_version
+        self.session.headers["OAI-Client-Build-Number"] = next_build
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
@@ -2665,16 +2684,28 @@ class OpenAIBackendAPI:
             response.close()
 
     def _bootstrap(self, deadline: ImageRequestDeadline | None = None) -> None:
-        """预热首页，并提取 PoW 相关脚本引用。"""
+        """预热首页，并提取 PoW 脚本与最新 client version/build。"""
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
             timeout=_timeout(30, deadline),
         )
         ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        html = str(response.text or "")
+        self.pow_script_sources, self.pow_data_build = parse_pow_resources(html)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+        version, build_number = parse_client_build_meta(html)
+        if version or build_number:
+            previous = (self.client_version, self.client_build_number)
+            self._apply_client_build(version=version or self.client_version, build_number=build_number or self.client_build_number)
+            if (self.client_version, self.client_build_number) != previous:
+                logger.info({
+                    "event": "client_build_refreshed",
+                    "client_version": self.client_version,
+                    "client_build_number": self.client_build_number,
+                    "pow_data_build": self.pow_data_build or "",
+                })
 
     def _get_chat_requirements(self, deadline: ImageRequestDeadline | None = None) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""

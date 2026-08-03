@@ -49,6 +49,32 @@ def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
     return script_sources, data_build
 
 
+def parse_client_build_meta(html_content: str) -> tuple[str, str]:
+    """Parse ChatGPT homepage client version/build from data-build / data-seq."""
+    text = str(html_content or "")
+    version = ""
+    build_number = ""
+    match = re.search(r'<html[^>]*\bdata-build="([^"]+)"', text, flags=re.I)
+    if match:
+        version = str(match.group(1) or "").strip()
+    if not version:
+        match = re.search(r'\b(prod-[a-f0-9]{20,40})\b', text, flags=re.I)
+        if match:
+            version = str(match.group(1) or "").strip()
+    match = re.search(r'<html[^>]*\bdata-seq="(\d{5,})"', text, flags=re.I)
+    if match:
+        build_number = str(match.group(1) or "").strip()
+    if not build_number:
+        match = re.search(
+            r'(?:OAI-Client-Build-Number|oai-client-build-number|clientBuildNumber|buildNumber)["\'=\s:]+(\d{5,})',
+            text,
+            flags=re.I,
+        )
+        if match:
+            build_number = str(match.group(1) or "").strip()
+    return version, build_number
+
+
 def _legacy_parse_time() -> str:
     now = datetime.now(timezone(timedelta(hours=-5)))
     return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
