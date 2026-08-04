@@ -696,8 +696,8 @@ class BrowserRegistrar:
         self.registration_proxy_password = ""
         self.geo_environment: dict[str, Any] = {}
 
-    def _bind_identity(self, email: str, index: int) -> BrowserIdentity:
-        identity = build_browser_identity(email)
+    def _bind_identity(self, email: str, index: int, *, runtime_product: str = "") -> BrowserIdentity:
+        identity = build_browser_identity(email, runtime_product=runtime_product)
         self.identity = identity
         self.fingerprint.update(identity.as_fingerprint_updates())
         # Keep device/session ids stable for the same mailbox across retries.
@@ -709,6 +709,7 @@ class BrowserRegistrar:
         step(
             index,
             f"浏览器身份已绑定 email_seed={identity.seed} "
+            f"ua=Chrome/{identity.chrome_major} "
             f"screen={identity.screen_width}x{identity.screen_height} "
             f"window={identity.window_width}x{identity.window_height} "
             f"cores={identity.hardware_concurrency} mem={identity.device_memory}G",
@@ -1136,31 +1137,30 @@ class BrowserRegistrar:
         return process, port
 
     def _apply_browser_hardening(self, port: int, index: int) -> dict[str, bool]:
-        identity = self.identity or build_browser_identity(str(self.fingerprint.get("device_id") or "default"))
         product = browser_devtools.browser_product_version(port, timeout=self._devtools_timeout(5))
-        major, full = parse_chrome_version(product)
+        email = str((self.identity.email if self.identity else "") or self.fingerprint.get("device_id") or "default")
+        # Rebuild identity with runtime product so spoofed majors stay <= real Chromium.
+        identity = build_browser_identity(email, runtime_product=product)
+        self.identity = identity
+        self.fingerprint.update(identity.as_fingerprint_updates())
         accept_language = str(
             self.geo_environment.get("accept_language")
             or self.fingerprint.get("accept_language")
             or "en-US,en;q=0.9"
         )
-        user_agent = build_user_agent(major, full)
-        metadata = build_user_agent_metadata(major, full, identity.platform_version)
+        user_agent = identity.user_agent
+        metadata = build_user_agent_metadata(
+            identity.chrome_major,
+            identity.chrome_full_version,
+            identity.platform_version,
+        )
         self.fingerprint = _align_fingerprint_platform(
             _fingerprint_with_user_agent(self.fingerprint, user_agent)
         )
         self.fingerprint.update(identity.as_fingerprint_updates())
-        self.fingerprint["major"] = major
-        self.fingerprint["full_version"] = full
-        self.fingerprint["sec_ch_ua"] = (
-            f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not_A Brand";v="24"'
-        )
-        self.fingerprint["sec_ch_ua_full_version_list"] = (
-            f'"Chromium";v="{full}", "Google Chrome";v="{full}", "Not_A Brand";v="24.0.0.0"'
-        )
-        self.fingerprint["impersonate"] = (
-            f"chrome{major}" if major in {"131", "136", "142", "145", "146"} else "chrome"
-        )
+        self.fingerprint["accept_language"] = accept_language
+        if accept_language:
+            self.fingerprint["language"] = accept_language.split(",", 1)[0].split(";", 1)[0].strip() or "en-US"
 
         geo_kwargs: dict[str, Any] = {
             "timezone_id": str(self.geo_environment.get("timezone") or ""),
@@ -1168,7 +1168,7 @@ class BrowserRegistrar:
             "accept_language": accept_language,
             "user_agent": user_agent,
             "user_agent_metadata": metadata,
-            "init_script": stealth_and_identity_script(identity),
+            "init_script": stealth_and_identity_script(identity, accept_language=accept_language),
             "screen_width": identity.screen_width,
             "screen_height": identity.screen_height,
             "window_width": identity.window_width,
@@ -1187,11 +1187,12 @@ class BrowserRegistrar:
             index,
             "浏览器加固已应用 "
             f"ua={'yes' if applied.get('user_agent') else 'no'} "
+            f"spoof=Chrome/{identity.chrome_major} "
             f"init={'yes' if applied.get('init_script') else 'no'} "
             f"screen={'yes' if applied.get('screen') else 'no'} "
             f"timezone={'yes' if applied.get('timezone') else 'no'} "
             f"locale={'yes' if applied.get('locale') else 'no'} "
-            f"product={product or major}",
+            f"runtime={product or 'unknown'}",
             "green" if applied.get("user_agent") and applied.get("init_script") else "yellow",
         )
         return applied
@@ -1514,6 +1515,7 @@ class BrowserRegistrar:
         process: subprocess.Popen[Any] | None = None
         port = 0
         proxy_auth: browser_devtools.ProxyAuthHandler | None = None
+        # Preliminary identity for window size / device ids; hardened again after runtime product is known.
         self._bind_identity(email, index)
         with tempfile.TemporaryDirectory(prefix="chatgpt2api-browser-") as profile_dir:
             try:
@@ -1527,6 +1529,9 @@ class BrowserRegistrar:
                     proxy_auth.start(timeout=min(5.0, self._devtools_timeout(5)))
                     step(index, "浏览器注册代理认证已启用")
                 try:
+                    # Re-bind with runtime Chromium version so UA spoof stays coherent.
+                    product = browser_devtools.browser_product_version(port, timeout=self._devtools_timeout(5))
+                    self._bind_identity(email, index, runtime_product=product)
                     self._apply_browser_hardening(port, index)
                 except Exception as error:
                     step(index, f"浏览器加固部分失败，继续注册: {_sanitized_error(error)}", "yellow")
