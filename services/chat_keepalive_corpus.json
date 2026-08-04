@@ -1,0 +1,106 @@
+{
+  "zh": [
+    {
+      "id": "zh_greet_01",
+      "text": "今天有点忙，随便聊两句就行。",
+      "followups": ["嗯嗯，你一般怎么安排休息？", "好的，那就先这样，谢谢。", "对了，你更喜欢安静还是热闹一点？"]
+    },
+    {
+      "id": "zh_greet_02",
+      "text": "嗨，最近怎么样？不用长篇，简单回我就行。",
+      "followups": ["听起来还行。你周末一般做什么？", "明白了，谢谢你的回答。", "那我先去忙了，回头再聊。"]
+    },
+    {
+      "id": "zh_daily_01",
+      "text": "给我一个简单的今日小建议，一句话就够。",
+      "followups": ["挺实用的。再补一个和效率有关的？", "好，我记下了。", "谢谢，先这样。"]
+    },
+    {
+      "id": "zh_daily_02",
+      "text": "随便说一个不伤脑的冷知识吧。",
+      "followups": ["有意思。再来一个更短的版本？", "哈哈还行。", "行，我先去干别的了。"]
+    },
+    {
+      "id": "zh_lang_01",
+      "text": "用一句话解释什么是“复盘”。",
+      "followups": ["能再给个生活里的小例子吗？", "清楚了，谢谢。", "好的，够用了。"]
+    },
+    {
+      "id": "zh_lang_02",
+      "text": "把“今天天气不错”改成更口语一点的说法。",
+      "followups": ["再给一个更正式一点的版本。", "这两个都挺好。", "收到，先这样。"]
+    },
+    {
+      "id": "zh_think_01",
+      "text": "如果只有十分钟空闲，你会建议做什么？",
+      "followups": ["那如果是在办公室呢？", "不错，简单就好。", "谢谢提醒。"]
+    },
+    {
+      "id": "zh_think_02",
+      "text": "帮我起一个很普通的待办标题，别太文艺。",
+      "followups": ["再来两个备选。", "第一个就行。", "好，我去写了。"]
+    },
+    {
+      "id": "zh_soft_01",
+      "text": "用很短的话鼓励一下快下班的人。",
+      "followups": ["再温柔一点可以吗？", "可以，够了。", "哈哈谢谢。"]
+    },
+    {
+      "id": "zh_soft_02",
+      "text": "推荐一个不花钱的放松方式，一句话。",
+      "followups": ["适合晚上吗？", "明白。", "先这样吧。"]
+    }
+  ],
+  "en": [
+    {
+      "id": "en_greet_01",
+      "text": "Hey, just checking in. Keep it short.",
+      "followups": ["Nice. What do you usually do to unwind?", "Got it, thanks.", "Alright, talk later."]
+    },
+    {
+      "id": "en_greet_02",
+      "text": "Hi there. How's your day going in one sentence?",
+      "followups": ["Fair enough. Any small win today?", "Thanks for the quick reply.", "Okay, I'll catch you later."]
+    },
+    {
+      "id": "en_daily_01",
+      "text": "Give me one tiny productivity tip.",
+      "followups": ["Can you make it even shorter?", "Useful, thanks.", "Cool, that's enough."]
+    },
+    {
+      "id": "en_daily_02",
+      "text": "Share one harmless fun fact.",
+      "followups": ["Got another super short one?", "Ha, okay.", "Thanks, signing off for now."]
+    },
+    {
+      "id": "en_lang_01",
+      "text": "Explain “trade-off” in one plain sentence.",
+      "followups": ["Give a daily-life example too.", "Clear enough.", "Perfect, thanks."]
+    },
+    {
+      "id": "en_lang_02",
+      "text": "Rewrite “I'm a bit busy today” in a more casual way.",
+      "followups": ["Now a slightly more formal version.", "Both work.", "Okay, I'll use the first one."]
+    },
+    {
+      "id": "en_think_01",
+      "text": "If I only have five free minutes, what should I do?",
+      "followups": ["What about at a desk?", "Simple is good.", "Thanks for the idea."]
+    },
+    {
+      "id": "en_think_02",
+      "text": "Suggest a boring but clear todo title.",
+      "followups": ["Two more alternatives, please.", "The first is fine.", "Great, I'll go with that."]
+    },
+    {
+      "id": "en_soft_01",
+      "text": "Send a short line of encouragement for someone wrapping up work.",
+      "followups": ["A calmer version, please.", "That works.", "Thanks!"]
+    },
+    {
+      "id": "en_soft_02",
+      "text": "One free way to relax, in a single sentence.",
+      "followups": ["Is it okay at night?", "Understood.", "Alright, that's all."]
+    }
+  ]
+}

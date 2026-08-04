@@ -315,6 +315,13 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        normalized["last_chat_keepalive_at"] = normalized.get("last_chat_keepalive_at") or None
+        normalized["last_chat_keepalive_error"] = normalized.get("last_chat_keepalive_error") or None
+        normalized["last_chat_keepalive_prompt_id"] = normalized.get("last_chat_keepalive_prompt_id") or None
+        try:
+            normalized["last_chat_keepalive_turns"] = int(normalized.get("last_chat_keepalive_turns") or 0)
+        except (TypeError, ValueError):
+            normalized["last_chat_keepalive_turns"] = 0
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
 

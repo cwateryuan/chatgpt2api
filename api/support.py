@@ -242,6 +242,12 @@ def start_full_account_refresh_worker(stop_event: Event) -> Thread:
     return thread
 
 
+def start_chat_keepalive_worker(stop_event: Event) -> Thread:
+    from services.chat_keepalive_service import start_chat_keepalive_worker as _start
+
+    return _start(stop_event)
+
+
 def resolve_web_asset(requested_path: str) -> Path | None:
     if not WEB_DIST_DIR.exists():
         return None
