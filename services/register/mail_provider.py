@@ -309,12 +309,18 @@ def _create_session(conf: dict):
 def _parse_received_at(value: Any) -> datetime | None:
     if isinstance(value, (int, float)):
         try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            timestamp = float(value)
+            # TempMail.lol v2 returns Unix timestamps in milliseconds.
+            while abs(timestamp) > 100_000_000_000:
+                timestamp /= 1000
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
         except Exception:
             return None
     text = str(value or "").strip()
     if not text:
         return None
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return _parse_received_at(float(text))
     try:
         date = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
         return date if date.tzinfo else date.replace(tzinfo=timezone.utc)
@@ -829,15 +835,70 @@ class TempMailLolProvider(BaseMailProvider):
             raise RuntimeError("TempMail.lol 缺少 address 或 token")
         return {"provider": self.name, "provider_ref": self.provider_ref, "address": address, "token": token}
 
-    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+    def _fetch_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
         data = self._request("GET", "/inbox", params={"token": mailbox["token"]})
+        if data.get("expired") is True:
+            raise RuntimeError("TempMail.lol 收件箱已过期")
         items = data.get("emails") or data.get("messages") or []
-        messages = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
-        if not messages:
-            return None
-        item = max(messages, key=lambda value: ((_parse_received_at(value.get("created_at") or value.get("createdAt") or value.get("date") or value.get("received_at") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(), str(value.get("id") or value.get("token") or "")))
-        text_content, html_content = _extract_content(item)
-        return {"provider": self.name, "mailbox": mailbox["address"], "message_id": str(item.get("id") or item.get("token") or ""), "subject": str(item.get("subject") or ""), "sender": str(item.get("from") or item.get("from_address") or ""), "text_content": text_content, "html_content": html_content, "received_at": _parse_received_at(item.get("created_at") or item.get("createdAt") or item.get("date") or item.get("received_at") or item.get("timestamp")), "raw": item}
+        raw_messages = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        messages: list[dict[str, Any]] = []
+        for item in raw_messages:
+            text_content, html_content = _extract_content(item)
+            messages.append(
+                {
+                    "provider": self.name,
+                    "mailbox": mailbox["address"],
+                    "message_id": str(item.get("id") or item.get("token") or ""),
+                    "subject": str(item.get("subject") or ""),
+                    "sender": str(item.get("from") or item.get("from_address") or ""),
+                    "text_content": text_content,
+                    "html_content": html_content,
+                    "received_at": _parse_received_at(
+                        item.get("created_at")
+                        or item.get("createdAt")
+                        or item.get("date")
+                        or item.get("received_at")
+                        or item.get("timestamp")
+                    ),
+                    "raw": item,
+                }
+            )
+        return sorted(
+            messages,
+            key=lambda value: (
+                (value.get("received_at") or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(),
+                str(value.get("message_id") or ""),
+            ),
+            reverse=True,
+        )
+
+    def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
+        messages = self._fetch_messages(mailbox)
+        return messages[0] if messages else None
+
+    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        if not isinstance(seen_value, list):
+            seen_value = []
+            mailbox["_seen_code_message_refs"] = seen_value
+        seen_refs = {str(item) for item in seen_value}
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+
+        while time.monotonic() < deadline:
+            for message in self._fetch_messages(mailbox):
+                ref = _message_tracking_ref(message)
+                if ref in seen_refs:
+                    continue
+                if not _message_after_code_request(message, mailbox):
+                    seen_value.append(ref)
+                    seen_refs.add(ref)
+                    continue
+                code = _extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    return code
+            time.sleep(max(0.2, self.conf["wait_interval"]))
+        return None
 
     def close(self) -> None:
         self.session.close()
