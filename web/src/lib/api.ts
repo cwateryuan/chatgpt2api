@@ -208,6 +208,7 @@ export type SettingsConfig = {
   };
   refresh_account_interval_minute?: number | string;
   full_account_refresh_enabled?: boolean;
+  image_retention_minutes?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
   image_account_concurrency?: number | string;

@@ -17,6 +17,11 @@ CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
+DEFAULT_IMAGE_RETENTION_MINUTES = 30 * 24 * 60
+MIN_IMAGE_RETENTION_MINUTES = 30
+IMAGE_CLEANUP_INTERVAL_SECONDS = 30 * 60
+IMAGE_CLEANUP_DB_BATCH_SIZE = 500
+
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
     "register": True,
@@ -96,6 +101,16 @@ def _normalize_bool(value: object, default: bool = False) -> bool:
     if value is None:
         return default
     return bool(value)
+
+
+def _normalize_image_retention_minutes(value: object, default: int) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not number.is_integer():
+        return default
+    return max(MIN_IMAGE_RETENTION_MINUTES, int(number))
 
 
 def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> int:
@@ -364,6 +379,8 @@ class ConfigStore:
         self._data = self._load()
         self._file_signature = self._stat_signature()
         self._storage_backend: StorageBackend | None = None
+        self._image_cleanup_lock = threading.Lock()
+        self._last_image_cleanup_at = 0.0
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
                 "❌ auth-key 未设置！\n"
@@ -481,11 +498,20 @@ class ConfigStore:
         return _normalize_bool(self.data.get("full_account_refresh_enabled"), True)
 
     @property
-    def image_retention_days(self) -> int:
+    def image_retention_minutes(self) -> int:
+        value = self.data.get("image_retention_minutes")
+        if value is not None:
+            return _normalize_image_retention_minutes(value, MIN_IMAGE_RETENTION_MINUTES)
         try:
-            return max(1, int(self.data.get("image_retention_days", 30)))
+            legacy_minutes = float(self.data.get("image_retention_days", 30)) * 24 * 60
         except (TypeError, ValueError):
-            return 30
+            return DEFAULT_IMAGE_RETENTION_MINUTES
+        return _normalize_image_retention_minutes(legacy_minutes, DEFAULT_IMAGE_RETENTION_MINUTES)
+
+    @property
+    def image_retention_days(self) -> float:
+        """Backward-compatible view for older API clients."""
+        return self.image_retention_minutes / (24 * 60)
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -600,31 +626,57 @@ class ConfigStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
-        removed = 0
-        removed_rels: list[str] = []
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                try:
-                    removed_rels.append(path.relative_to(self.images_dir).as_posix())
-                except Exception:
-                    pass
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+    def cleanup_old_images(self, *, force: bool = False) -> int:
+        with self._image_cleanup_lock:
+            now = time.monotonic()
+            if not force and now - self._last_image_cleanup_at < IMAGE_CLEANUP_INTERVAL_SECONDS:
+                return 0
+
+            cutoff = time.time() - self.image_retention_minutes * 60
+            removed = 0
+            backend: StorageBackend | None = None
             try:
-                path.rmdir()
-            except OSError:
-                pass
-        if removed_rels:
-            try:
-                backend = self.get_storage_backend()
-                if backend.supports_database_features():
-                    backend.delete_image_records(removed_rels)
+                candidate = self.get_storage_backend()
+                if candidate.supports_database_features():
+                    backend = candidate
             except Exception:
                 pass
-        return removed
+
+            removed_rels: list[str] = []
+
+            def flush_removed_records() -> None:
+                if not backend or not removed_rels:
+                    return
+                batch = list(removed_rels)
+                removed_rels.clear()
+                try:
+                    backend.delete_image_records(batch)
+                except Exception:
+                    pass
+
+            root = self.images_dir
+            for path in root.rglob("*"):
+                try:
+                    if not path.is_file() or path.stat().st_mtime >= cutoff:
+                        continue
+                    rel = path.relative_to(root).as_posix()
+                    path.unlink()
+                except (FileNotFoundError, OSError, ValueError):
+                    continue
+                removed += 1
+                if backend is not None:
+                    removed_rels.append(rel)
+                    if len(removed_rels) >= IMAGE_CLEANUP_DB_BATCH_SIZE:
+                        flush_removed_records()
+            flush_removed_records()
+
+            for path in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+            self._last_image_cleanup_at = time.monotonic()
+            return removed
 
     @property
     def base_url(self) -> str:
@@ -646,6 +698,7 @@ class ConfigStore:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["full_account_refresh_enabled"] = self.full_account_refresh_enabled
+        data["image_retention_minutes"] = self.image_retention_minutes
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
@@ -696,8 +749,26 @@ class ConfigStore:
             self._file_signature = self._stat_signature()
 
             incoming = self._drop_stale_update_values(dict(data or {}), previous_data, latest_data)
+            if "image_retention_minutes" in incoming:
+                incoming["image_retention_minutes"] = _normalize_image_retention_minutes(
+                    incoming.get("image_retention_minutes"),
+                    MIN_IMAGE_RETENTION_MINUTES,
+                )
+                incoming.pop("image_retention_days", None)
+            elif "image_retention_days" in incoming:
+                try:
+                    legacy_minutes = float(incoming.get("image_retention_days", 30)) * 24 * 60
+                except (TypeError, ValueError):
+                    legacy_minutes = DEFAULT_IMAGE_RETENTION_MINUTES
+                incoming["image_retention_minutes"] = _normalize_image_retention_minutes(
+                    legacy_minutes,
+                    DEFAULT_IMAGE_RETENTION_MINUTES,
+                )
+                incoming.pop("image_retention_days", None)
             next_data = dict(latest_data)
             next_data.update(incoming)
+            if "image_retention_minutes" in next_data:
+                next_data.pop("image_retention_days", None)
             if "backup" in next_data:
                 next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
             if "image_storage" in next_data:

@@ -43,7 +43,7 @@ def create_app() -> FastAPI:
         memory_recycle_thread = start_memory_recycle_scheduler(stop_event)
         register_service.start_supervisor()
         backup_service.start()
-        config.cleanup_old_images()
+        config.cleanup_old_images(force=True)
         try:
             yield
         finally:

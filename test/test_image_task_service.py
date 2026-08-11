@@ -32,7 +32,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             path,
             generation_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/image.png"}]}),
             edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
-            retention_days_getter=lambda: 30,
+            retention_minutes_getter=lambda: 30 * 24 * 60,
         )
 
     def test_duplicate_submit_uses_existing_task(self):
@@ -68,6 +68,28 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = wait_for_task(service, OWNER, "task-1", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
+
+    def test_terminal_tasks_use_minute_retention(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            now = time.time()
+            old_updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 31 * 60))
+            recent_updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - 29 * 60))
+            path.write_text(
+                json.dumps({
+                    "tasks": [
+                        {"id": "old", "owner_id": OWNER["id"], "status": "success", "updated_at": old_updated_at},
+                        {"id": "recent", "owner_id": OWNER["id"], "status": "success", "updated_at": recent_updated_at},
+                    ]
+                }),
+                encoding="utf-8",
+            )
+
+            service = ImageTaskService(path, retention_minutes_getter=lambda: 30)
+            items = service.list_tasks(OWNER, ["old", "recent"])
+
+            self.assertEqual([item["id"] for item in items["items"]], ["recent"])
+            self.assertEqual(items["missing_ids"], ["old"])
 
     def test_task_handler_receives_image_deadline(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

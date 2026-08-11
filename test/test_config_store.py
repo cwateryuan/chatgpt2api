@@ -1,7 +1,9 @@
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -108,6 +110,102 @@ class ConfigStoreTests(unittest.TestCase):
         tmp_dir, store = self._make_store({"full_account_refresh_enabled": "off"})
         with tmp_dir:
             self.assertFalse(store.full_account_refresh_enabled)
+
+    def test_image_retention_converts_legacy_days_to_minutes(self) -> None:
+        for days, expected_minutes in ((1, 1440), (15, 21600), (30, 43200)):
+            with self.subTest(days=days):
+                tmp_dir, store = self._make_store({"image_retention_days": days})
+                with tmp_dir:
+                    self.assertEqual(store.image_retention_minutes, expected_minutes)
+                    self.assertEqual(store.get()["image_retention_minutes"], expected_minutes)
+
+    def test_image_retention_update_uses_canonical_minutes(self) -> None:
+        tmp_dir, store = self._make_store({"image_retention_days": 15})
+        with tmp_dir:
+            updated = store.update({"image_retention_minutes": 60, "image_retention_days": 15})
+            saved = json.loads(store.path.read_text(encoding="utf-8"))
+
+            self.assertEqual(updated["image_retention_minutes"], 60)
+            self.assertEqual(updated["image_retention_days"], 60 / 1440)
+            self.assertEqual(saved["image_retention_minutes"], 60)
+            self.assertNotIn("image_retention_days", saved)
+
+            self.assertEqual(store.update({"image_retention_minutes": 29})["image_retention_minutes"], 30)
+            self.assertEqual(store.update({"image_retention_minutes": 60.5})["image_retention_minutes"], 30)
+
+    def test_legacy_retention_update_is_still_accepted(self) -> None:
+        tmp_dir, store = self._make_store()
+        with tmp_dir:
+            updated = store.update({"image_retention_days": 1})
+
+            self.assertEqual(updated["image_retention_minutes"], 1440)
+
+    def test_image_cleanup_is_throttled_serialized_and_batches_database_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"auth-key": "test-auth", "image_retention_minutes": 30}),
+                encoding="utf-8",
+            )
+            with mock.patch("services.config.DATA_DIR", root / "data"):
+                store = ConfigStore(config_path)
+                backend = mock.Mock()
+                backend.supports_database_features.return_value = True
+                store._storage_backend = backend
+                images_dir = store.images_dir
+                old_mtime = time.time() - 31 * 60
+
+                for index in range(1001):
+                    path = images_dir / "2026" / "08" / "11" / f"{index}.png"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"x")
+                    os.utime(path, (old_mtime, old_mtime))
+
+                self.assertEqual(store.cleanup_old_images(force=True), 1001)
+                batches = [call.args[0] for call in backend.delete_image_records.call_args_list]
+                self.assertEqual([len(batch) for batch in batches], [500, 500, 1])
+
+                throttled_path = images_dir / "throttled.png"
+                throttled_path.write_bytes(b"x")
+                os.utime(throttled_path, (old_mtime, old_mtime))
+                self.assertEqual(store.cleanup_old_images(), 0)
+                self.assertTrue(throttled_path.exists())
+
+                store._last_image_cleanup_at = 0.0
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(executor.map(lambda _item: store.cleanup_old_images(), range(2)))
+                self.assertEqual(sum(results), 1)
+                self.assertFalse(throttled_path.exists())
+
+    def test_image_cleanup_uses_minute_cutoffs(self) -> None:
+        for retention_minutes in (30, 60, 1440):
+            with self.subTest(retention_minutes=retention_minutes), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = root / "config.json"
+                config_path.write_text(
+                    json.dumps({"auth-key": "test-auth", "image_retention_minutes": retention_minutes}),
+                    encoding="utf-8",
+                )
+                with mock.patch("services.config.DATA_DIR", root / "data"):
+                    store = ConfigStore(config_path)
+                    backend = mock.Mock()
+                    backend.supports_database_features.return_value = False
+                    store._storage_backend = backend
+                    images_dir = store.images_dir
+                    expired = images_dir / "expired.png"
+                    retained = images_dir / "retained.png"
+                    expired.write_bytes(b"old")
+                    retained.write_bytes(b"new")
+                    now = time.time()
+                    expired_mtime = now - retention_minutes * 60 - 5
+                    retained_mtime = now - retention_minutes * 60 + 5
+                    os.utime(expired, (expired_mtime, expired_mtime))
+                    os.utime(retained, (retained_mtime, retained_mtime))
+
+                    self.assertEqual(store.cleanup_old_images(force=True), 1)
+                    self.assertFalse(expired.exists())
+                    self.assertTrue(retained.exists())
 
 
 if __name__ == "__main__":

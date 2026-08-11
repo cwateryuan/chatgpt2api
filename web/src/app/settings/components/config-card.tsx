@@ -23,7 +23,7 @@ export function ConfigCard() {
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
-  const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
+  const setImageRetentionMinutes = useSettingsStore((state) => state.setImageRetentionMinutes);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
@@ -146,14 +146,17 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">用于生成图片结果的访问前缀地址。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">图片自动清理</label>
+            <label className="text-sm text-stone-700">图片自动清理（分钟）</label>
             <Input
-              value={String(config?.image_retention_days || "")}
-              onChange={(event) => setImageRetentionDays(event.target.value)}
-              placeholder="30"
+              type="number"
+              min={30}
+              step={1}
+              value={String(config?.image_retention_minutes ?? "")}
+              onChange={(event) => setImageRetentionMinutes(event.target.value)}
+              placeholder="60"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">自动删除多少天前的本地图片。</p>
+            <p className="text-xs text-stone-500">自动删除超过该时长的本地图片，最小 30 分钟。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片轮询超时</label>
