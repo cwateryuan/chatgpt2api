@@ -18,6 +18,7 @@ from curl_cffi import requests
 from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
 from services.image_storage_service import IMAGE_INDEX_FILE
 from services.image_tags_service import TAGS_FILE
+from services.icloud_stats_service import ICLOUD_STATS_FILE
 
 
 def _utc_now() -> datetime:
@@ -639,6 +640,7 @@ class BackupService:
                     "snapshots/accounts.json",
                     _json_bytes(config.get_storage_backend().load_accounts()),
                 )
+                self._add_file_to_archive(archive, ICLOUD_STATS_FILE, "data/icloud_stats.json")
             if include.get("auth_keys_snapshot"):
                 self._add_bytes_to_archive(
                     archive,

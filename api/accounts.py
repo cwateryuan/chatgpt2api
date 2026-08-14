@@ -218,7 +218,8 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        items = account_service.list_accounts()
+        return {"items": items, "icloud_stats": account_service.get_icloud_stats(items)}
 
     @router.get("/api/accounts/image-pool-metrics")
     async def get_image_pool_metrics(authorization: str | None = Header(default=None)):
@@ -296,7 +297,9 @@ def create_router() -> APIRouter:
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return account_service.delete_accounts(tokens)
+        result = account_service.delete_accounts(tokens)
+        result["icloud_stats"] = account_service.get_icloud_stats(result.get("items") or [])
+        return result
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):

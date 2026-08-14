@@ -16,6 +16,7 @@ from api.support import (
     start_limited_account_watcher,
 )
 from services.backup_service import backup_service
+from services.account_service import account_service
 from services.config import config
 from services.debug_memory import start_memory_diagnostic_scheduler
 from services.image_service import start_image_cleanup_scheduler
@@ -33,6 +34,7 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         configure_thread_stack_size()
         configure_threadpool_tokens()
+        account_service.initialize_icloud_stats()
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         full_refresh_thread = start_full_account_refresh_worker(stop_event)

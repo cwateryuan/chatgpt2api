@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 
 from services.config import config
 from services.browser_fingerprint import account_fingerprint
+from services.icloud_stats_service import ICloudStatsService, icloud_stats_service
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
@@ -45,14 +46,78 @@ class AccountService:
     _relogin_progress: dict[str, dict] = {}
     _relogin_progress_lock = Lock()
 
-    def __init__(self, storage_backend: StorageBackend):
+    def __init__(self, storage_backend: StorageBackend, stats_service: ICloudStatsService | None = None):
         self.storage = storage_backend
+        self.icloud_stats = stats_service
         self._lock = Lock()
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._accounts = self._load_accounts()
         self._last_full_reload_at = time.monotonic()
         self._cumulative_total = self._load_cumulative_total()
+
+    def initialize_icloud_stats(self) -> None:
+        if self.icloud_stats is None:
+            return
+        try:
+            self.icloud_stats.ensure_baseline(self._accounts.values())
+        except Exception as exc:
+            logger.warning({"event": "icloud_stats_baseline_failed", "error": str(exc)})
+
+    def _record_icloud_registered(self, accounts: list[dict]) -> None:
+        if self.icloud_stats is None or not accounts:
+            return
+        try:
+            self.icloud_stats.record_registered(accounts)
+        except Exception as exc:
+            logger.warning({"event": "icloud_stats_register_failed", "error": str(exc)})
+
+    def _record_icloud_deleted(self, accounts: list[dict]) -> None:
+        if self.icloud_stats is None or not accounts:
+            return
+        try:
+            self.icloud_stats.record_deleted(accounts)
+        except Exception as exc:
+            logger.warning({"event": "icloud_stats_delete_failed", "error": str(exc)})
+
+    def get_icloud_stats(self, accounts: list[dict] | None = None) -> dict[str, Any]:
+        if accounts is None:
+            with self._lock:
+                self._reload_accounts_locked()
+                accounts = [dict(account) for account in self._accounts.values()]
+        if self.icloud_stats is None:
+            return {
+                "domain": "@icloud.com",
+                "registered_success_total": 0,
+                "current_accounts": 0,
+                "current_images": 0,
+                "deleted_accounts": 0,
+                "deleted_images": 0,
+                "over_25_accounts": 0,
+                "rate_limit_429_errors": 0,
+                "current_429_errors": 0,
+                "deleted_429_errors": 0,
+                "initialized_at": "",
+                "updated_at": "",
+            }
+        try:
+            return self.icloud_stats.snapshot(accounts)
+        except Exception as exc:
+            logger.warning({"event": "icloud_stats_snapshot_failed", "error": str(exc)})
+            return {
+                "domain": "@icloud.com",
+                "registered_success_total": 0,
+                "current_accounts": 0,
+                "current_images": 0,
+                "deleted_accounts": 0,
+                "deleted_images": 0,
+                "over_25_accounts": 0,
+                "rate_limit_429_errors": 0,
+                "current_429_errors": 0,
+                "deleted_429_errors": 0,
+                "initialized_at": "",
+                "updated_at": "",
+            }
 
     def _get_cumulative_file(self) -> Path:
         from services.config import DATA_DIR
@@ -307,6 +372,7 @@ class AccountService:
         normalized["restore_at"] = normalized.get("restore_at") or None
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
+        normalized["rate_limit_429"] = int(normalized.get("rate_limit_429") or 0)
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
@@ -1382,8 +1448,10 @@ class AccountService:
             added = 0
             skipped = 0
             changed_accounts: list[dict] = []
+            registered_accounts: list[dict] = []
             for access_token, payload in deduped.items():
                 current = self._accounts.get(access_token)
+                is_new = current is None
                 if current is None:
                     added += 1
                     self._cumulative_total += 1
@@ -1405,11 +1473,14 @@ class AccountService:
                 if account is not None:
                     self._accounts[access_token] = account
                     changed_accounts.append(account)
+                    if is_new and str(account.get("registration_engine") or "").strip():
+                        registered_accounts.append(account)
             if self._database_features_enabled():
                 for account in changed_accounts:
                     self._save_account(account)
             else:
                 self._save_accounts()
+            self._record_icloud_registered(registered_accounts)
             items = [dict(item) for item in self._accounts.values()]
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})
@@ -1422,11 +1493,17 @@ class AccountService:
         with self._lock:
             self._reload_accounts_locked()
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
-            removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
+            removed_accounts = [
+                account
+                for token in target_set
+                if (account := self._accounts.pop(token, None)) is not None
+            ]
+            removed = len(removed_accounts)
             runtime_state.clear_image_slots(target_set)
             runtime_state.delete_aliases_for(target_set)
             if removed:
                 self._delete_account_tokens(target_set)
+                self._record_icloud_deleted(removed_accounts)
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
@@ -1444,6 +1521,7 @@ class AccountService:
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
                 self._delete_account_tokens([access_token])
+                self._record_icloud_deleted([account])
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
@@ -1514,7 +1592,13 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def mark_image_result(
+        self,
+        access_token: str,
+        success: bool,
+        *,
+        rate_limit_429: bool = False,
+    ) -> dict | None:
         if not access_token:
             return None
         self.release_image_slot(access_token)
@@ -1536,12 +1620,15 @@ class AccountService:
                     next_item["status"] = "正常"
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                if rate_limit_429:
+                    next_item["rate_limit_429"] = int(next_item.get("rate_limit_429") or 0) + 1
             account = self._normalize_account(next_item)
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
                 self._delete_account_tokens([access_token])
+                self._record_icloud_deleted([account])
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
@@ -1945,4 +2032,4 @@ class AccountService:
         }
 
 
-account_service = AccountService(config.get_storage_backend())
+account_service = AccountService(config.get_storage_backend(), icloud_stats_service)

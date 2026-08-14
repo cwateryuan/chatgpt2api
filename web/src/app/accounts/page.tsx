@@ -57,6 +57,7 @@ import {
   type Account,
   type AccountRefreshResponse,
   type AccountStatus,
+  type ICloudAccountStats,
   type Model,
   type RefreshProgressResponse,
 } from "@/lib/api";
@@ -93,6 +94,16 @@ const metricCards = [
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+] as const;
+
+const icloudMetricCards = [
+  { key: "registered_success_total", label: "累计生成账号", color: "text-stone-900", icon: UserRound },
+  { key: "current_accounts", label: "正常账号（含限流）", color: "text-emerald-600", icon: CheckCircle2 },
+  { key: "current_images", label: "正常账号生成图片", color: "text-blue-500", icon: Download },
+  { key: "deleted_accounts", label: "已删除账号", color: "text-stone-600", icon: Trash2 },
+  { key: "deleted_images", label: "已删除账号生成图片", color: "text-stone-600", icon: Trash2 },
+  { key: "over_25_accounts", label: "生成大于 25 张", color: "text-orange-500", icon: CircleAlert },
+  { key: "rate_limit_429_errors", label: "429 错误", color: "text-rose-500", icon: Ban },
 ] as const;
 
 function isUnlimitedImageQuotaAccount(account: Account) {
@@ -201,6 +212,7 @@ function displayAccountSource(account: Account) {
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [icloudStats, setIcloudStats] = useState<ICloudAccountStats | null>(null);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
@@ -245,6 +257,7 @@ function AccountsPageContent() {
     try {
       const data = await fetchAccounts();
       setAccounts(data.items);
+      setIcloudStats(data.icloud_stats);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
     } catch (error) {
       const message = error instanceof Error ? error.message : "加载账户失败";
@@ -388,6 +401,9 @@ function AccountsPageContent() {
     try {
       const data = await deleteAccounts(tokens);
       setAccounts(data.items);
+      if (data.icloud_stats) {
+        setIcloudStats(data.icloud_stats);
+      }
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
@@ -1010,6 +1026,27 @@ function AccountsPageContent() {
             </div>
           </CardContent>
         </Card>
+      </section>
+
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-stone-700">@icloud.com 统计</h2>
+        </div>
+        <div className="grid overflow-hidden rounded-lg border border-stone-200 bg-white/90 shadow-sm sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+          {icloudMetricCards.map((item) => {
+            const Icon = item.icon;
+            const value = icloudStats?.[item.key] ?? 0;
+            return (
+              <div key={item.key} className="min-w-0 border-b border-stone-100 p-4 sm:border-r xl:border-b-0">
+                <div className="mb-3 flex min-h-8 items-start justify-between gap-2">
+                  <span className="text-xs font-medium leading-4 text-stone-500">{item.label}</span>
+                  <Icon className="size-4 shrink-0 text-stone-400" />
+                </div>
+                <div className={cn("text-2xl font-semibold", item.color)}>{formatCompact(value)}</div>
+              </div>
+            );
+          })}
+        </div>
       </section>
 
       <section className="space-y-4">

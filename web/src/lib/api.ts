@@ -36,10 +36,26 @@ export type Account = {
   restore_at?: string | null;
   success: number;
   fail: number;
+  rate_limit_429?: number;
   /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
   last_used_at?: string | null;
   proxy?: string | null;
+};
+
+export type ICloudAccountStats = {
+  domain: "@icloud.com";
+  registered_success_total: number;
+  current_accounts: number;
+  current_images: number;
+  deleted_accounts: number;
+  deleted_images: number;
+  over_25_accounts: number;
+  rate_limit_429_errors: number;
+  current_429_errors: number;
+  deleted_429_errors: number;
+  initialized_at: string;
+  updated_at: string;
 };
 
 export type AccountImportPayload = {
@@ -63,6 +79,7 @@ export type Model = {
 
 type AccountListResponse = {
   items: Account[];
+  icloud_stats: ICloudAccountStats;
 };
 
 type ModelListResponse = {
@@ -72,6 +89,7 @@ type ModelListResponse = {
 
 type AccountMutationResponse = {
   items: Account[];
+  icloud_stats?: ICloudAccountStats;
   added?: number;
   skipped?: number;
   removed?: number;

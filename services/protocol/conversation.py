@@ -1503,7 +1503,11 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(
+                token,
+                False,
+                rate_limit_429=getattr(exc, "status_code", None) == 429,
+            )
             slot_released = True
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
@@ -1552,7 +1556,11 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
+            account_service.mark_image_result(
+                token,
+                False,
+                rate_limit_429=getattr(exc, "status_code", None) == 429,
+            )
             slot_released = True
             last_error = str(exc)
             if deadline.remaining() <= 0:
