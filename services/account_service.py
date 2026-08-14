@@ -1918,13 +1918,17 @@ class AccountService:
     def get_image_pool_metrics(self) -> dict[str, int]:
         if self._database_features_enabled():
             try:
-                items = self.storage.list_image_candidate_accounts()
+                metrics = self.storage.get_image_pool_metrics()
+                if isinstance(metrics, dict):
+                    return {
+                        "current_quota": int(metrics.get("current_quota") or 0),
+                        "current_available": int(metrics.get("current_available") or 0),
+                    }
             except Exception:
-                with self._lock:
-                    items = list(self._accounts.values())
-        else:
-            with self._lock:
-                items = list(self._accounts.values())
+                pass
+        with self._lock:
+            self._reload_accounts_locked()
+            items = list(self._accounts.values())
         normal = [item for item in items if item.get("status") == "正常"]
         available = [item for item in normal if self._is_counted_as_image_pool_available(item)]
         return {

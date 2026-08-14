@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    case,
     Column,
     DateTime,
     Integer,
@@ -310,6 +311,39 @@ class DatabaseStorageBackend(StorageBackend):
                     "image_quota_unknown": bool(row.image_quota_unknown),
                 })
             return items
+        finally:
+            session.close()
+
+    def get_image_pool_metrics(self) -> dict[str, int]:
+        session = self.Session()
+        try:
+            normal = or_(
+                AccountModel.status == "正常",
+                AccountModel.status.is_(None),
+                AccountModel.status == "",
+            )
+            quota_known = or_(
+                AccountModel.image_quota_unknown.is_(False),
+                AccountModel.image_quota_unknown.is_(None),
+            )
+            available = and_(
+                normal,
+                or_(
+                    AccountModel.image_quota_unknown.is_(True),
+                    AccountModel.quota > 0,
+                ),
+            )
+            current_available, current_quota = session.query(
+                func.coalesce(func.sum(case((available, 1), else_=0)), 0),
+                func.coalesce(
+                    func.sum(case((and_(normal, quota_known), func.coalesce(AccountModel.quota, 0)), else_=0)),
+                    0,
+                ),
+            ).one()
+            return {
+                "current_available": int(current_available or 0),
+                "current_quota": int(current_quota or 0),
+            }
         finally:
             session.close()
 

@@ -220,6 +220,11 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return {"items": account_service.list_accounts()}
 
+    @router.get("/api/accounts/image-pool-metrics")
+    async def get_image_pool_metrics(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return account_service.get_image_pool_metrics()
+
     @router.get("/api/accounts/auto-refresh")
     async def get_account_auto_refresh(authorization: str | None = Header(default=None)):
         require_admin(authorization)

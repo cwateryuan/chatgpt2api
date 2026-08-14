@@ -67,6 +67,10 @@ class StorageBackend(ABC):
             if str(item.get("access_token") or item.get("accessToken") or "").strip() not in excluded
         ]
 
+    def get_image_pool_metrics(self) -> dict[str, int] | None:
+        """Return fresh aggregate image-pool metrics when the backend supports it."""
+        return None
+
     def save_image(self, item: dict[str, Any]) -> None:
         raise NotImplementedError
 
