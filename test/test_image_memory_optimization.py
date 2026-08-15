@@ -14,6 +14,7 @@ from services.protocol.conversation import (
     is_http2_stream_error,
 )
 from services.image_timeout import ImageRequestDeadline
+from utils.helper import UpstreamHTTPError
 
 
 class FakeBackend:
@@ -29,9 +30,15 @@ class FakeAccountService:
         self.tokens = iter(["token-1", "token-2"])
         self.released: list[str] = []
         self.marked: list[tuple[str, bool]] = []
+        self.rate_limited: list[str] = []
+        self.excluded_snapshots: list[set[str]] = []
 
-    def get_available_access_token(self, **_kwargs):
-        return next(self.tokens)
+    def get_available_access_token(self, **kwargs):
+        self.excluded_snapshots.append(set(kwargs.get("excluded_tokens") or set()))
+        try:
+            return next(self.tokens)
+        except StopIteration as exc:
+            raise RuntimeError("no available image quota") from exc
 
     def get_account(self, token):
         return {"email": f"{token}@example.test"}
@@ -39,8 +46,10 @@ class FakeAccountService:
     def release_image_slot(self, token):
         self.released.append(token)
 
-    def mark_image_result(self, token, success):
+    def mark_image_result(self, token, success, *, rate_limit_429=False):
         self.marked.append((token, success))
+        if rate_limit_429:
+            self.rate_limited.append(token)
         self.release_image_slot(token)
 
 
@@ -118,6 +127,73 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
         self.assertEqual(outputs[0].data[0]["url"], "http://app.test/image.png")
         self.assertIn("token-1", service.released)
         self.assertIn(("token-2", True), service.marked)
+
+    def test_file_upload_throttle_retries_with_another_account(self):
+        service = FakeAccountService()
+        calls = {"count": 0}
+
+        def fake_stream(_backend, _request, index, total):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise UpstreamHTTPError(
+                    "/backend-api/files",
+                    429,
+                    {
+                        "detail": {
+                            "code": "throttled",
+                            "error_code": "throttled",
+                            "message": "You've reached our limit of file uploads.",
+                        }
+                    },
+                )
+            yield ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=index,
+                total=total,
+                data=[{"url": "http://app.test/image.png"}],
+            )
+
+        with (
+            mock.patch("services.protocol.conversation.account_service", service),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend_class,
+            mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            mock.patch("services.protocol.conversation.trim_memory", lambda *_args, **_kwargs: None),
+        ):
+            backend_class.return_value.close.return_value = None
+            outputs = _generate_single_image(ConversationRequest(prompt="edit", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual(outputs[0].data[0]["url"], "http://app.test/image.png")
+        self.assertIn(("token-1", False), service.marked)
+        self.assertIn(("token-2", True), service.marked)
+        self.assertEqual(service.rate_limited, ["token-1"])
+        self.assertEqual(service.excluded_snapshots, [set(), {"token-1"}])
+
+    def test_file_upload_throttle_returns_429_after_accounts_are_exhausted(self):
+        service = FakeAccountService()
+
+        def fake_stream(_backend, _request, _index, _total):
+            raise UpstreamHTTPError(
+                "/backend-api/files",
+                429,
+                {"detail": {"code": "throttled", "error_code": "throttled"}},
+            )
+            yield
+
+        with (
+            mock.patch("services.protocol.conversation.account_service", service),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend_class,
+            mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            mock.patch("services.protocol.conversation.trim_memory", lambda *_args, **_kwargs: None),
+        ):
+            backend_class.return_value.close.return_value = None
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(ConversationRequest(prompt="edit", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(raised.exception.code, "throttled")
+        self.assertEqual(service.rate_limited, ["token-1", "token-2"])
+        self.assertEqual(service.excluded_snapshots[-1], {"token-1", "token-2"})
 
     def test_expired_deadline_raises_image_generation_timeout(self):
         deadline = ImageRequestDeadline(1, started_at=0)

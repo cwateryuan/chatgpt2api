@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import event
 
-from services.storage.database_storage import DatabaseStorageBackend
+from services.storage.database_storage import AccountModel, DatabaseStorageBackend
 
 
 class DatabaseStorageTests(unittest.TestCase):
@@ -64,6 +64,32 @@ class DatabaseStorageTests(unittest.TestCase):
         select_sql = "\n".join(statements).lower()
         self.assertIn("accounts.access_token", select_sql)
         self.assertNotIn("accounts.data", select_sql)
+
+    def test_legacy_schema_backfills_missing_status_from_account_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "accounts.db"
+            storage = DatabaseStorageBackend(f"sqlite:///{db_path}")
+            storage.upsert_account({
+                "access_token": "limited-token",
+                "status": "限流",
+                "quota": 0,
+                "image_quota_unknown": True,
+            })
+            session = storage.Session()
+            try:
+                row = session.query(AccountModel).filter(AccountModel.access_token == "limited-token").one()
+                row.status = None
+                session.commit()
+            finally:
+                session.close()
+                storage.engine.dispose()
+
+            reopened = DatabaseStorageBackend(f"sqlite:///{db_path}")
+            try:
+                candidate = reopened.list_image_candidate_accounts()[0]
+                self.assertEqual(candidate["status"], "限流")
+            finally:
+                reopened.engine.dispose()
 
 
 if __name__ == "__main__":

@@ -1243,6 +1243,7 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: ImageRequestDeadline | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1250,7 +1251,11 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens = {
+            str(token or "").strip()
+            for token in (excluded_tokens or set())
+            if str(token or "").strip()
+        }
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1260,6 +1265,18 @@ class AccountService:
                 deadline=deadline,
             )
             attempted_tokens.add(access_token)
+            # Candidate selection uses indexed database columns. Re-check the
+            # complete record before any upstream request in case legacy data
+            # or another worker left those columns out of sync with row.data.
+            stored_account = self.get_account(access_token)
+            if (
+                    not self._is_image_account_available(stored_account or {})
+                    or not self._account_matches_plan_type(stored_account or {}, plan_type)
+                    or not self._account_matches_any_plan_type(stored_account or {}, plan_types)
+                    or not self._account_matches_source_type(stored_account or {}, source_type)
+            ):
+                self.release_image_slot(access_token)
+                continue
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token", deadline=deadline)
             except Exception:

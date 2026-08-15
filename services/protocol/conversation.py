@@ -18,6 +18,7 @@ from services.memory import trim_memory
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -127,6 +128,20 @@ def is_connection_timeout_error(message: str) -> bool:
         or "read timed out" in text
         or "connect timeout" in text
     )
+
+
+def is_file_upload_throttled_error(error: Exception) -> bool:
+    if not isinstance(error, UpstreamHTTPError):
+        return False
+    if error.status_code != 429 or str(error.context or "").rstrip("/") != "/backend-api/files":
+        return False
+    body = error.body if isinstance(error.body, dict) else {}
+    detail = body.get("detail") if isinstance(body.get("detail"), dict) else body
+    codes = {
+        str(detail.get("code") or "").strip().lower(),
+        str(detail.get("error_code") or "").strip().lower(),
+    }
+    return "throttled" in codes
 
 
 def image_stream_error_message(message: str) -> str:
@@ -1365,11 +1380,16 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    # 文件上传额度耗尽时换账号重试次数（首次账号不计入）。
+    MAX_FILE_UPLOAD_THROTTLE_RETRIES = 4
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    file_upload_throttle_retry_count = 0
+    excluded_tokens: set[str] = set()
+    last_file_upload_throttle: UpstreamHTTPError | None = None
     account_email = ""
     deadline = _deadline_from_request(request)
 
@@ -1388,10 +1408,19 @@ def _generate_single_image(
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                 deadline=deadline,
+                excluded_tokens=excluded_tokens,
             )
         except ImageDeadlineExpired as exc:
             raise image_timeout_error(deadline, account_email=account_email) from exc
         except RuntimeError as exc:
+            if last_file_upload_throttle is not None:
+                raise ImageGenerationError(
+                    "All available accounts have reached the file upload limit. Please try again later.",
+                    status_code=429,
+                    error_type="rate_limit_error",
+                    code="throttled",
+                    account_email=account_email,
+                ) from last_file_upload_throttle
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
         emitted_for_token = False
@@ -1572,6 +1601,27 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if not emitted_for_token and is_file_upload_throttled_error(exc):
+                last_file_upload_throttle = exc
+                excluded_tokens.add(token)
+                file_upload_throttle_retry_count += 1
+                if file_upload_throttle_retry_count <= MAX_FILE_UPLOAD_THROTTLE_RETRIES:
+                    logger.warning({
+                        "event": "image_file_upload_throttled_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": file_upload_throttle_retry_count,
+                        "max_retries": MAX_FILE_UPLOAD_THROTTLE_RETRIES,
+                        "index": index,
+                    })
+                    continue
+                raise ImageGenerationError(
+                    "All attempted accounts have reached the file upload limit. Please try again later.",
+                    status_code=429,
+                    error_type="rate_limit_error",
+                    code="throttled",
+                    account_email=account_email,
+                ) from exc
             if is_http2_stream_error(last_error):
                 logger.warning({
                     "event": "image_stream_http2_error",

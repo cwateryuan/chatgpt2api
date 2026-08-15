@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
@@ -15,6 +15,7 @@ from services.config import config
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.openai_backend_api import InvalidAccessTokenError
 from services.runtime_state import runtime_state
+from services.storage.database_storage import AccountModel, DatabaseStorageBackend
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
@@ -99,6 +100,43 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
+
+    def test_get_available_access_token_rechecks_full_account_before_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "accounts.db"
+            storage = DatabaseStorageBackend(f"sqlite:///{db_path}")
+            storage.upsert_account(
+                {
+                    "access_token": "limited-token",
+                    "status": "限流",
+                    "type": "free",
+                    "quota": 0,
+                    "image_quota_unknown": True,
+                    "restore_at": "2099-08-15T12:56:47+08:00",
+                }
+            )
+            service = AccountService(storage)
+
+            session = storage.Session()
+            try:
+                row = session.query(AccountModel).filter(AccountModel.access_token == "limited-token").one()
+                row.status = "正常"
+                session.commit()
+            finally:
+                session.close()
+
+            fetch_remote_info = Mock()
+            service.fetch_remote_info = fetch_remote_info
+            try:
+                self.assertEqual(storage.get_image_pool_metrics()["current_available"], 1)
+                with self.assertRaisesRegex(RuntimeError, "no available image quota"):
+                    service.get_available_access_token()
+                self.assertEqual(storage.get_image_pool_metrics()["current_available"], 1)
+                fetch_remote_info.assert_not_called()
+                self.assertEqual(runtime_state.get_image_inflight("limited-token"), 0)
+            finally:
+                runtime_state.clear_image_slots({"limited-token"})
+                storage.engine.dispose()
 
     def test_image_pool_metrics_counts_only_image_usable_normal_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

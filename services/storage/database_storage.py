@@ -917,6 +917,17 @@ class DatabaseStorageBackend(StorageBackend):
                         )
                 except Exception:
                     pass
+                try:
+                    rows = conn.execute(text("SELECT id, data FROM accounts WHERE status IS NULL OR status = ''")).fetchall()
+                    for row_id, raw_data in rows:
+                        status = _string(_as_dict(raw_data).get("status"))
+                        if status:
+                            conn.execute(
+                                text("UPDATE accounts SET status = :status WHERE id = :id"),
+                                {"status": status, "id": row_id},
+                            )
+                except Exception:
+                    pass
 
             index_specs = [
                 ("idx_accounts_status", "accounts", "status"),
