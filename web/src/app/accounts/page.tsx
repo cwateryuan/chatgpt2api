@@ -66,10 +66,13 @@ import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
 
-const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
+type AccountStatusFilter = AccountStatus | "all" | "restore_due";
+
+const accountStatusOptions: { label: string; value: AccountStatusFilter }[] = [
   { label: "全部状态", value: "all" },
   { label: "正常", value: "正常" },
   { label: "限流", value: "限流" },
+  { label: "已到恢复时间", value: "restore_due" },
   { label: "异常", value: "异常" },
   { label: "禁用", value: "禁用" },
 ];
@@ -102,7 +105,7 @@ const icloudMetricCards = [
   { key: "current_images", label: "正常账号生成图片", color: "text-blue-500", icon: Download },
   { key: "deleted_accounts", label: "已删除账号", color: "text-stone-600", icon: Trash2 },
   { key: "deleted_images", label: "已删除账号生成图片", color: "text-stone-600", icon: Trash2 },
-  { key: "over_25_accounts", label: "生成大于 25 张", color: "text-orange-500", icon: CircleAlert },
+  { key: "over_40_accounts", label: "生成大于 40 张", color: "text-orange-500", icon: CircleAlert },
   { key: "rate_limit_429_errors", label: "429 错误", color: "text-rose-500", icon: Ban },
 ] as const;
 
@@ -217,7 +220,7 @@ function AccountsPageContent() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState<AccountStatus | "all">("all");
+  const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>("all");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("10");
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -337,7 +340,9 @@ function AccountsPageContent() {
       const searchMatched =
         normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
       const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
-      const statusMatched = statusFilter === "all" || account.status === statusFilter;
+      const statusMatched =
+        statusFilter === "all" ||
+        (statusFilter === "restore_due" ? Boolean(account.restore_due) : account.status === statusFilter);
       return searchMatched && typeMatched && statusMatched;
     });
   }, [accounts, query, statusFilter, typeFilter]);
@@ -1092,7 +1097,7 @@ function AccountsPageContent() {
             <Select
               value={statusFilter}
               onValueChange={(value) => {
-                setStatusFilter(value as AccountStatus | "all");
+                setStatusFilter(value as AccountStatusFilter);
                 setPage(1);
               }}
             >

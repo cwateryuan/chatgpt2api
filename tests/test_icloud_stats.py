@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,23 +25,43 @@ class ICloudStatsServiceTests(unittest.TestCase):
             service.ensure_baseline([*baseline, {"email": "ignored@icloud.com"}])
             service.record_registered([{"email": "new@icloud.com"}, {"email": "other@example.com"}])
             service.record_deleted([
-                {"email": "old@icloud.com", "success": 30, "rate_limit_429": 2},
+                {"email": "old@icloud.com", "success": 45, "rate_limit_429": 2},
                 {"email": "other@example.com", "success": 99, "rate_limit_429": 99},
             ])
 
             snapshot = ICloudStatsService(path).snapshot([
                 {"email": "live@icloud.com", "status": "正常", "success": 5, "rate_limit_429": 1},
                 {"email": "limited@icloud.com", "status": "限流", "success": 2},
-                {"email": "abnormal@icloud.com", "status": "异常", "success": 26},
+                {"email": "abnormal@icloud.com", "status": "异常", "success": 41},
             ])
 
             self.assertEqual(snapshot["registered_success_total"], 3)
             self.assertEqual(snapshot["current_accounts"], 2)
             self.assertEqual(snapshot["current_images"], 7)
             self.assertEqual(snapshot["deleted_accounts"], 1)
-            self.assertEqual(snapshot["deleted_images"], 30)
-            self.assertEqual(snapshot["over_25_accounts"], 2)
+            self.assertEqual(snapshot["deleted_images"], 45)
+            self.assertEqual(snapshot["over_40_accounts"], 2)
             self.assertEqual(snapshot["rate_limit_429_errors"], 3)
+
+    def test_legacy_over_25_history_is_not_counted_as_over_40(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            stats_path = Path(tmp_dir) / "icloud_stats.json"
+            stats_path.write_text(
+                json.dumps({
+                    "version": 1,
+                    "baseline_initialized": True,
+                    "deleted_over_25_accounts": 8,
+                }),
+                encoding="utf-8",
+            )
+            service = ICloudStatsService(stats_path)
+
+            snapshot = service.snapshot([
+                {"email": "exactly40@icloud.com", "status": "正常", "success": 40},
+                {"email": "over40@icloud.com", "status": "正常", "success": 41},
+            ])
+
+            self.assertEqual(snapshot["over_40_accounts"], 1)
 
     def test_account_service_archives_deleted_icloud_account(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -56,7 +77,7 @@ class ICloudStatsServiceTests(unittest.TestCase):
                     "email": "generated@icloud.com",
                     "registration_engine": "http",
                     "status": "正常",
-                    "success": 25,
+                    "success": 40,
                     "image_quota_unknown": True,
                 }
             ])
@@ -68,8 +89,8 @@ class ICloudStatsServiceTests(unittest.TestCase):
             self.assertEqual(result["removed"], 1)
             self.assertEqual(snapshot["registered_success_total"], 1)
             self.assertEqual(snapshot["deleted_accounts"], 1)
-            self.assertEqual(snapshot["deleted_images"], 26)
-            self.assertEqual(snapshot["over_25_accounts"], 1)
+            self.assertEqual(snapshot["deleted_images"], 41)
+            self.assertEqual(snapshot["over_40_accounts"], 1)
             self.assertEqual(snapshot["rate_limit_429_errors"], 1)
 
 

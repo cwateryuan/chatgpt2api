@@ -126,16 +126,16 @@ def _run_limited_account_refresh_cycle(stop_event: Event, *, hold_lock_seconds: 
     renew_thread = Thread(target=renew_lease, name="account-watcher-lock", daemon=True)
     renew_thread.start()
     try:
-        limited_tokens = account_service.list_limited_tokens()
+        recovery_tokens = account_service.list_image_recovery_tokens()
         expiring_tokens = account_service.list_expiring_access_tokens()
         keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
         token_refreshes = list(dict.fromkeys([*expiring_tokens, *keepalive_tokens]))
-        if limited_tokens:
+        if recovery_tokens:
             logger.info({
                 "event": "account_watcher_checking",
-                "limited_accounts": len(limited_tokens),
+                "recovery_accounts": len(recovery_tokens),
             })
-            account_service.refresh_accounts(limited_tokens)
+            account_service.refresh_accounts(recovery_tokens)
         if token_refreshes and not lease_lost.is_set() and not stop_event.is_set():
             logger.info({
                 "event": "account_watcher_token_maintenance",

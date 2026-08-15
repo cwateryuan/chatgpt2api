@@ -34,6 +34,7 @@ export type Account = {
   }>;
   default_model_slug?: string | null;
   restore_at?: string | null;
+  restore_due?: boolean;
   success: number;
   fail: number;
   rate_limit_429?: number;
@@ -50,7 +51,7 @@ export type ICloudAccountStats = {
   current_images: number;
   deleted_accounts: number;
   deleted_images: number;
-  over_25_accounts: number;
+  over_40_accounts: number;
   rate_limit_429_errors: number;
   current_429_errors: number;
   deleted_429_errors: number;

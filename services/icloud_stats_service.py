@@ -13,13 +13,15 @@ from services.config import DATA_DIR
 
 ICLOUD_DOMAIN = "@icloud.com"
 ICLOUD_STATS_FILE = DATA_DIR / "icloud_stats.json"
+GENERATION_MILESTONE = 40
 DEFAULT_STATS = {
-    "version": 1,
+    "version": 2,
     "baseline_initialized": False,
     "registered_success_total": 0,
     "deleted_accounts": 0,
     "deleted_images": 0,
     "deleted_over_25_accounts": 0,
+    "deleted_over_40_accounts": 0,
     "deleted_429_errors": 0,
     "initialized_at": "",
     "updated_at": "",
@@ -101,10 +103,12 @@ class ICloudStatsService:
             "deleted_accounts",
             "deleted_images",
             "deleted_over_25_accounts",
+            "deleted_over_40_accounts",
             "deleted_429_errors",
         ):
             stats[key] = _counter(stats.get(key))
         stats["baseline_initialized"] = bool(stats.get("baseline_initialized"))
+        stats["version"] = 2
         return stats
 
     def _save_unlocked(self, stats: dict[str, Any]) -> None:
@@ -150,8 +154,8 @@ class ICloudStatsService:
             stats = self._load_unlocked()
             stats["deleted_accounts"] += len(deleted)
             stats["deleted_images"] += sum(_counter(account.get("success")) for account in deleted)
-            stats["deleted_over_25_accounts"] += sum(
-                1 for account in deleted if _counter(account.get("success")) > 25
+            stats["deleted_over_40_accounts"] += sum(
+                1 for account in deleted if _counter(account.get("success")) > GENERATION_MILESTONE
             )
             stats["deleted_429_errors"] += sum(
                 _counter(account.get("rate_limit_429")) for account in deleted
@@ -168,7 +172,9 @@ class ICloudStatsService:
             stats = self._load_unlocked()
 
         current_429 = sum(_counter(account.get("rate_limit_429")) for account in current)
-        current_over_25 = sum(1 for account in current if _counter(account.get("success")) > 25)
+        current_over_40 = sum(
+            1 for account in current if _counter(account.get("success")) > GENERATION_MILESTONE
+        )
         return {
             "domain": ICLOUD_DOMAIN,
             "registered_success_total": stats["registered_success_total"],
@@ -176,7 +182,7 @@ class ICloudStatsService:
             "current_images": sum(_counter(account.get("success")) for account in normal_or_limited),
             "deleted_accounts": stats["deleted_accounts"],
             "deleted_images": stats["deleted_images"],
-            "over_25_accounts": current_over_25 + stats["deleted_over_25_accounts"],
+            "over_40_accounts": current_over_40 + stats["deleted_over_40_accounts"],
             "rate_limit_429_errors": current_429 + stats["deleted_429_errors"],
             "current_429_errors": current_429,
             "deleted_429_errors": stats["deleted_429_errors"],

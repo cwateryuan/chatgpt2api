@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import secrets
 import time
@@ -36,6 +37,8 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _ACCOUNT_CACHE_TTL_SECONDS = 2.0
+    _UNKNOWN_RESTORE_RECHECK_SECONDS = 60 * 60
+    _UNKNOWN_RESTORE_RECHECK_PREFIX = "account:image:unknown-restore-recheck"
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
 
@@ -93,7 +96,7 @@ class AccountService:
                 "current_images": 0,
                 "deleted_accounts": 0,
                 "deleted_images": 0,
-                "over_25_accounts": 0,
+                "over_40_accounts": 0,
                 "rate_limit_429_errors": 0,
                 "current_429_errors": 0,
                 "deleted_429_errors": 0,
@@ -111,7 +114,7 @@ class AccountService:
                 "current_images": 0,
                 "deleted_accounts": 0,
                 "deleted_images": 0,
-                "over_25_accounts": 0,
+                "over_40_accounts": 0,
                 "rate_limit_429_errors": 0,
                 "current_429_errors": 0,
                 "deleted_429_errors": 0,
@@ -1365,8 +1368,47 @@ class AccountService:
                 account = dict(item)
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(inflight.get(token, 0))
+                account["restore_due"] = self._is_image_restore_due(account)
                 result.append(account)
             return result
+
+    @classmethod
+    def _is_image_restore_due(cls, account: dict, now: datetime | None = None) -> bool:
+        if not isinstance(account, dict) or account.get("status") not in {"正常", "限流"}:
+            return False
+        if bool(account.get("image_quota_unknown")) or int(account.get("quota") or 0) > 0:
+            return False
+        restore_at = cls._parse_time(account.get("restore_at"))
+        return restore_at is not None and restore_at <= (now or datetime.now(timezone.utc))
+
+    def list_image_recovery_tokens(self) -> list[str]:
+        with self._lock:
+            self._reload_accounts_locked()
+            now = datetime.now(timezone.utc)
+            tokens = []
+            for item in self._accounts.values():
+                token = str(item.get("access_token") or "").strip()
+                if not token:
+                    continue
+
+                restore_at = self._parse_time(item.get("restore_at"))
+                if restore_at is not None:
+                    if self._is_image_restore_due(item, now):
+                        tokens.append(token)
+                    continue
+
+                if item.get("status") != "限流":
+                    continue
+                token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+                recheck_key = f"{self._UNKNOWN_RESTORE_RECHECK_PREFIX}:{token_hash}"
+                if runtime_state.get_flag(recheck_key):
+                    continue
+                runtime_state.set_flag(
+                    recheck_key,
+                    ttl_seconds=self._UNKNOWN_RESTORE_RECHECK_SECONDS,
+                )
+                tokens.append(token)
+            return tokens
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
@@ -1522,8 +1564,7 @@ class AccountService:
                 self._delete_account_tokens(target_set)
                 self._record_icloud_deleted(removed_accounts)
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
-            items = [dict(item) for item in self._accounts.values()]
-        return {"removed": removed, "items": items}
+        return {"removed": removed, "items": self.list_accounts()}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:

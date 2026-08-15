@@ -157,6 +157,91 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(metrics["current_available"], 2)
             self.assertEqual(metrics["current_quota"], 2)
 
+    def test_restore_due_accounts_are_included_in_automatic_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "normal-due",
+                        "status": "正常",
+                        "quota": 0,
+                        "restore_at": "2000-01-01T00:00:00+00:00",
+                    },
+                    {
+                        "access_token": "limited-future",
+                        "status": "限流",
+                        "quota": 0,
+                        "restore_at": "2999-01-01T00:00:00+00:00",
+                    },
+                    {
+                        "access_token": "limited-without-restore",
+                        "status": "限流",
+                        "quota": 0,
+                    },
+                    {
+                        "access_token": "normal-future",
+                        "status": "正常",
+                        "quota": 0,
+                        "restore_at": "2999-01-01T00:00:00+00:00",
+                    },
+                    {
+                        "access_token": "normal-with-quota",
+                        "status": "正常",
+                        "quota": 1,
+                        "restore_at": "2000-01-01T00:00:00+00:00",
+                    },
+                    {
+                        "access_token": "normal-unknown",
+                        "status": "正常",
+                        "quota": 0,
+                        "image_quota_unknown": True,
+                        "restore_at": "2000-01-01T00:00:00+00:00",
+                    },
+                ]
+            )
+
+            recheck_flags: set[str] = set()
+            with patch.object(
+                runtime_state,
+                "get_flag",
+                side_effect=lambda key: "1" if key in recheck_flags else "",
+            ), patch.object(
+                runtime_state,
+                "set_flag",
+                side_effect=lambda key, **_kwargs: recheck_flags.add(key),
+            ) as set_recheck_flag:
+                self.assertEqual(
+                    service.list_image_recovery_tokens(),
+                    ["normal-due", "limited-without-restore"],
+                )
+                self.assertEqual(
+                    service.list_image_recovery_tokens(),
+                    ["normal-due"],
+                )
+                self.assertEqual(set_recheck_flag.call_count, 1)
+                self.assertEqual(
+                    set_recheck_flag.call_args.kwargs["ttl_seconds"],
+                    60 * 60,
+                )
+            restore_due = {
+                item["access_token"]: item["restore_due"]
+                for item in service.list_accounts()
+            }
+            self.assertTrue(restore_due["normal-due"])
+            self.assertFalse(restore_due["limited-future"])
+            self.assertFalse(restore_due["limited-without-restore"])
+            self.assertFalse(restore_due["normal-future"])
+            self.assertFalse(restore_due["normal-with-quota"])
+            self.assertFalse(restore_due["normal-unknown"])
+
+            delete_result = service.delete_accounts(["normal-future"])
+            remaining = {
+                item["access_token"]: item
+                for item in delete_result["items"]
+            }
+            self.assertTrue(remaining["normal-due"]["restore_due"])
+
     def test_image_slot_wait_respects_deadline_when_all_slots_are_full(self) -> None:
         original_concurrency = config.data.get("image_account_concurrency")
         config.data["image_account_concurrency"] = 1
