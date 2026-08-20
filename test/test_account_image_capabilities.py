@@ -46,12 +46,19 @@ class AccountCapabilityTests(unittest.TestCase):
                         "quota": 0,
                         "image_quota_unknown": True,
                     },
+                    {
+                        "access_token": "normal-with-quota",
+                        "status": "正常",
+                        "quota": 4,
+                        "last_remote_refresh_at": "2026-08-19T00:00:00+00:00",
+                    },
                 ]
             )
 
             candidates = service.list_remote_refresh_candidates(limit=10)
 
             self.assertNotIn("limited-future", candidates)
+            self.assertNotIn("normal-with-quota", candidates)
             self.assertIn("limited-due", candidates)
             self.assertIn("unchecked", candidates)
 

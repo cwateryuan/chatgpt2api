@@ -1796,6 +1796,9 @@ class AccountService:
                     continue
                 last = self._parse_time(item.get("last_remote_refresh_at"))
                 is_unchecked = last is None
+                limited_due = item.get("status") == "限流" and (
+                    restore_at is None or restore_at <= now
+                )
                 stale_zero = (
                     item.get("status") == "正常"
                     and not bool(item.get("image_quota_unknown"))
@@ -1803,6 +1806,8 @@ class AccountService:
                     and last is not None
                     and (now - last).total_seconds() >= self._AUTO_REMOTE_ZERO_QUOTA_STALE_SECONDS
                 )
+                if not (is_unchecked or stale_zero or limited_due):
+                    continue
                 priority = 0 if is_unchecked else 1 if stale_zero else 2
                 candidates.append((priority, last or self._parse_time(item.get("created_at")) or now, token))
         candidates.sort(key=lambda value: (value[0], value[1], value[2]))
