@@ -529,7 +529,7 @@ return 0
             return ""
         if normalized_kind in {"refresh", "relogin"}:
             return f"account:{normalized_kind}_progress:{normalized_id}"
-        if normalized_kind in {"bulk_image_delete", "bulk_account_import"}:
+        if normalized_kind in {"bulk_image_delete", "bulk_account_import", "bulk_account_refresh"}:
             return f"bulk:{normalized_kind}:progress:{normalized_id}"
         return ""
 

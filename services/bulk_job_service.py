@@ -17,6 +17,7 @@ from services.image_storage_service import image_storage_service
 from services.image_tags_service import remove_many_tags
 from services.maintenance_activity import maintenance_activity
 from services.memory import trim_memory
+from services.proxy_service import proxy_settings
 from services.runtime_state import runtime_state
 from utils.helper import anonymize_token
 from utils.log import logger
@@ -41,6 +42,7 @@ def _env_float_ms(name: str, default_ms: int, minimum_ms: int = 0) -> float:
 class BulkJobService:
     IMAGE_DELETE_KIND = "bulk_image_delete"
     ACCOUNT_IMPORT_KIND = "bulk_account_import"
+    ACCOUNT_REFRESH_KIND = "bulk_account_refresh"
     _GLOBAL_LOCK_KEY = "lock:bulk:maintenance:global"
 
     def __init__(self) -> None:
@@ -69,7 +71,7 @@ class BulkJobService:
         job_id = str(job_id or "").strip()
         if not job_id:
             raise HTTPException(status_code=404, detail={"error": "job not found"})
-        for kind in (self.IMAGE_DELETE_KIND, self.ACCOUNT_IMPORT_KIND):
+        for kind in (self.IMAGE_DELETE_KIND, self.ACCOUNT_IMPORT_KIND, self.ACCOUNT_REFRESH_KIND):
             progress = runtime_state.get_progress(kind, job_id)
             if not progress:
                 continue
@@ -155,19 +157,44 @@ class BulkJobService:
         )
         return job_id
 
+    def submit_account_refresh(self, *, tokens: list[str], source: str = "manual") -> str:
+        self.require_redis()
+        unique_tokens = list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
+        if not unique_tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+        job_id = uuid.uuid4().hex
+        now = time.time()
+        runtime_state.set_progress(
+            self.ACCOUNT_REFRESH_KIND,
+            job_id,
+            {
+                "job_id": job_id, "kind": self.ACCOUNT_REFRESH_KIND, "source": source,
+                "status": "queued", "total": len(unique_tokens), "processed": 0,
+                "refreshed": 0, "failed": 0, "errors": [],
+                "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
+                "total_quota": 0, "current_proxy_index": 0,
+                "proxy_pool_size": len(proxy_settings.account_refresh_proxy_pool()),
+                "done": False, "error": None, "cancel_requested": False,
+                "created_at": now, "updated_at": now,
+            },
+            ttl_seconds=self.ttl_seconds,
+        )
+        self._start_thread(job_id, self.ACCOUNT_REFRESH_KIND, lambda: self._run_account_refresh(job_id, unique_tokens))
+        return job_id
+
     def _start_thread(self, job_id: str, kind: str, target: Callable[[], None]) -> None:
         thread = threading.Thread(target=target, daemon=True, name=f"bulk-{kind}-{job_id[:12]}")
         with self._local_lock:
             self._threads[job_id] = thread
         thread.start()
 
-    def _run_with_global_lock(self, kind: str, job_id: str, runner: Callable[[str], None]) -> None:
+    def _run_with_global_lock(self, kind: str, job_id: str, runner: Callable[[str], Any]) -> Any:
         owner = runtime_state.acquire_lock(self._GLOBAL_LOCK_KEY, ttl_seconds=self.lock_ttl_seconds)
         if not owner:
             self._mark_done(kind, job_id, status="error", error="another bulk maintenance job is already running")
             with self._local_lock:
                 self._threads.pop(job_id, None)
-            return
+            return None
         renew_stop = threading.Event()
         renew_thread = threading.Thread(
             target=self._renew_lock_worker,
@@ -178,7 +205,7 @@ class BulkJobService:
         renew_thread.start()
         try:
             with maintenance_activity.track(kind):
-                runner(owner)
+                return runner(owner)
         except Exception as exc:
             self._mark_done(kind, job_id, status="error", error=str(exc))
             logger.error({"event": "bulk_job_error", "kind": kind, "job_id": job_id, "error": str(exc)})
@@ -291,15 +318,133 @@ class BulkJobService:
         return {"removed": len(removed_items)}
 
     def _run_account_import(self, job_id: str, tokens: list[str], accounts: list[dict[str, Any]]) -> None:
-        self._run_with_global_lock(
+        imported_tokens = self._run_with_global_lock(
             self.ACCOUNT_IMPORT_KIND,
             job_id,
             lambda owner: self._execute_account_import(job_id, tokens, accounts, owner),
         )
+        # The global maintenance lock has been released before the remote work is
+        # queued. Import completion therefore never waits on slow upstream calls.
+        if not isinstance(imported_tokens, list):
+            return
+        if self._cancel_requested(self.ACCOUNT_IMPORT_KIND, job_id):
+            self._mark_done(self.ACCOUNT_IMPORT_KIND, job_id, status="cancelled")
+            return
+        try:
+            refresh_job_id = self.submit_account_refresh(tokens=imported_tokens, source="import") if imported_tokens else ""
+        except Exception as exc:
+            self._update(
+                self.ACCOUNT_IMPORT_KIND,
+                job_id,
+                lambda p: {**p, "phase": "imported", "refresh_error": str(exc), "updated_at": time.time()},
+            )
+        else:
+            self._update(
+                self.ACCOUNT_IMPORT_KIND,
+                job_id,
+                lambda p: {
+                    **p,
+                    "phase": "imported",
+                    "refresh_job_id": refresh_job_id or None,
+                    "refresh_total": len(imported_tokens),
+                    "updated_at": time.time(),
+                },
+            )
+        self._mark_done(self.ACCOUNT_IMPORT_KIND, job_id, status="success")
 
-    def _execute_account_import(self, job_id: str, tokens: list[str], accounts: list[dict[str, Any]], lock_owner: str) -> None:
+    def _run_account_refresh(self, job_id: str, tokens: list[str]) -> None:
+        self._run_with_global_lock(
+            self.ACCOUNT_REFRESH_KIND, job_id,
+            lambda owner: self._execute_account_refresh(job_id, tokens, owner),
+        )
+
+    def _execute_account_refresh(self, job_id: str, tokens: list[str], lock_owner: str) -> None:
+        workers = min(_env_int("APP_BULK_ACCOUNT_REFRESH_WORKERS", 10, 1), len(tokens))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bulk-account-refresh") as executor:
+            pending: dict[Any, str] = {}
+            iterator = iter(tokens)
+
+            def submit_next() -> bool:
+                if not self._lock_still_owned(lock_owner) or self._cancel_requested(self.ACCOUNT_REFRESH_KIND, job_id):
+                    return False
+                try:
+                    token = next(iterator)
+                except StopIteration:
+                    return False
+                pending[executor.submit(self._refresh_account_with_pool, token)] = token
+                return True
+
+            for _ in range(workers):
+                submit_next()
+            while pending:
+                if not self._lock_still_owned(lock_owner):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    self._mark_done(self.ACCOUNT_REFRESH_KIND, job_id, status="error", error="bulk maintenance lock lost")
+                    return
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    token = pending.pop(future)
+                    try:
+                        account, proxy_index = future.result()
+                        error = None
+                    except Exception as exc:
+                        account, proxy_index, error = None, 0, str(exc)
+                    self._update_refresh_job_progress(job_id, token, account, error, proxy_index)
+                    if self._cancel_requested(self.ACCOUNT_REFRESH_KIND, job_id):
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        self._mark_done(self.ACCOUNT_REFRESH_KIND, job_id, status="cancelled")
+                        return
+                    submit_next()
+        self._mark_done(self.ACCOUNT_REFRESH_KIND, job_id, status="success")
+
+    @staticmethod
+    def _refresh_retryable(error: Exception) -> bool:
+        text = str(error or "").lower()
+        return "403" in text or any(part in text for part in ("timeout", "timed out", "connection", "network", "proxy", "tls"))
+
+    def _refresh_account_with_pool(self, token: str) -> tuple[dict[str, Any] | None, int]:
+        pool = proxy_settings.account_refresh_proxy_pool()
+        attempts = 2 if pool else 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            proxy = proxy_settings.next_account_refresh_proxy() if pool else ""
+            try:
+                account = account_service.fetch_remote_info(token, "bulk_account_refresh", False, refresh_proxy=proxy)
+                if account is None:
+                    raise RuntimeError("remote refresh returned no account")
+                return account, pool.index(proxy) + 1 if proxy in pool else 0
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 >= attempts or not self._refresh_retryable(exc):
+                    break
+        error = str(last_error or "remote refresh failed")
+        account_service.record_remote_refresh_failure(token, error)
+        raise RuntimeError(error)
+
+    def _update_refresh_job_progress(
+        self, job_id: str, token: str, account: dict[str, Any] | None, error: str | None, proxy_index: int,
+    ) -> None:
+        if error:
+            self._append_error(self.ACCOUNT_REFRESH_KIND, job_id, {"token": anonymize_token(token), "error": error})
+        status = str((account or {}).get("status") or "正常").strip() or "正常"
+        quota = max(0, int((account or {}).get("quota") or 0))
+        def updater(progress: dict[str, Any]) -> dict[str, Any]:
+            progress["processed"] = int(progress.get("processed") or 0) + 1
+            progress["current_proxy_index"] = proxy_index
+            if error:
+                progress["failed"] = int(progress.get("failed") or 0) + 1
+            elif account is not None:
+                progress["refreshed"] = int(progress.get("refreshed") or 0) + 1
+                counts = dict(progress.get("status_counts") or {})
+                counts[status] = int(counts.get(status) or 0) + 1
+                progress["status_counts"] = counts
+                progress["total_quota"] = int(progress.get("total_quota") or 0) + quota
+            progress["updated_at"] = time.time()
+            return progress
+        self._update(self.ACCOUNT_REFRESH_KIND, job_id, updater)
+
+    def _execute_account_import(self, job_id: str, tokens: list[str], accounts: list[dict[str, Any]], lock_owner: str) -> list[str] | None:
         import_batch_size = _env_int("APP_BULK_ACCOUNT_IMPORT_BATCH_SIZE", 100, 1)
-        refresh_workers = _env_int("APP_BULK_ACCOUNT_REFRESH_WORKERS", 2, 1)
         payloads = self._build_account_payloads(tokens, accounts)
         total = len(payloads)
         self._update(
@@ -330,20 +475,8 @@ class BulkJobService:
             )
         if self._cancel_requested(self.ACCOUNT_IMPORT_KIND, job_id):
             self._mark_done(self.ACCOUNT_IMPORT_KIND, job_id, status="cancelled")
-            return
-        self._update(
-            self.ACCOUNT_IMPORT_KIND,
-            job_id,
-            lambda p: {**p, "phase": "refreshing", "refresh_total": len(imported_tokens), "refresh_processed": 0, "updated_at": time.time()},
-        )
-        refresh_status = self._refresh_imported_accounts(job_id, imported_tokens, refresh_workers, lock_owner)
-        if refresh_status == "cancelled":
-            self._mark_done(self.ACCOUNT_IMPORT_KIND, job_id, status="cancelled")
-            return
-        if refresh_status == "lock_lost":
-            self._mark_done(self.ACCOUNT_IMPORT_KIND, job_id, status="error", error="bulk maintenance lock lost")
-            return
-        self._mark_done(self.ACCOUNT_IMPORT_KIND, job_id, status="success")
+            return None
+        return imported_tokens
 
     def _build_account_payloads(self, tokens: list[str], accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         deduped: dict[str, dict[str, Any]] = {}
@@ -382,7 +515,10 @@ class BulkJobService:
                     added += 1
                     account_service._cumulative_total += 1
                     account_service._save_cumulative_total()
-                    current = {"created_at": account_service._now()}
+                    current = {
+                        "created_at": account_service._now(),
+                        "image_quota_unknown": not ("quota" in payload or "restore_at" in payload),
+                    }
                 else:
                     skipped += 1
                 incoming = dict(payload)
@@ -420,7 +556,10 @@ class BulkJobService:
             normalized_current = account_service._normalize_account(current) if isinstance(current, dict) else None
             if normalized_current is None:
                 added += 1
-                normalized_current = {"created_at": account_service._now()}
+                normalized_current = {
+                    "created_at": account_service._now(),
+                    "image_quota_unknown": not ("quota" in payload or "restore_at" in payload),
+                }
             else:
                 skipped += 1
             incoming = dict(payload)
@@ -444,69 +583,6 @@ class BulkJobService:
                 account_service._accounts[token] = account
             tokens.append(token)
         return {"added": added, "skipped": skipped, "tokens": tokens}
-
-    def _refresh_imported_accounts(self, job_id: str, tokens: list[str], max_workers: int, lock_owner: str) -> str:
-        if not tokens:
-            return "success"
-        workers = min(max_workers, len(tokens))
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bulk-account-refresh") as executor:
-            pending: dict[Any, str] = {}
-            iterator = iter(tokens)
-
-            def submit_next() -> bool:
-                if not self._lock_still_owned(lock_owner):
-                    return False
-                if self._cancel_requested(self.ACCOUNT_IMPORT_KIND, job_id):
-                    return False
-                try:
-                    token = next(iterator)
-                except StopIteration:
-                    return False
-                future = executor.submit(account_service.fetch_remote_info, token, "bulk_account_import", False)
-                pending[future] = token
-                return True
-
-            for _ in range(workers):
-                submit_next()
-            while pending:
-                if not self._lock_still_owned(lock_owner):
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    return "lock_lost"
-                done, _pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    token = pending.pop(future)
-                    try:
-                        account = future.result()
-                    except Exception as exc:
-                        self._update_account_refresh_progress(job_id, token, None, str(exc))
-                    else:
-                        self._update_account_refresh_progress(job_id, token, account, None)
-                    if self._cancel_requested(self.ACCOUNT_IMPORT_KIND, job_id):
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        return "cancelled"
-                    submit_next()
-        return "success"
-
-    def _update_account_refresh_progress(self, job_id: str, token: str, account: dict[str, Any] | None, error: str | None) -> None:
-        if error:
-            self._append_error(self.ACCOUNT_IMPORT_KIND, job_id, {"token": anonymize_token(token), "error": error})
-        status = str((account or {}).get("status") or "正常").strip() or "正常"
-        quota = max(0, int((account or {}).get("quota") or 0))
-
-        def updater(progress: dict[str, Any]) -> dict[str, Any]:
-            progress["refresh_processed"] = int(progress.get("refresh_processed") or 0) + 1
-            if error:
-                progress["failed"] = int(progress.get("failed") or 0) + 1
-            elif account is not None:
-                progress["refreshed"] = int(progress.get("refreshed") or 0) + 1
-                counts = dict(progress.get("status_counts") or {})
-                counts[status] = int(counts.get(status) or 0) + 1
-                progress["status_counts"] = counts
-                progress["total_quota"] = int(progress.get("total_quota") or 0) + quota
-            progress["updated_at"] = time.time()
-            return progress
-
-        self._update(self.ACCOUNT_IMPORT_KIND, job_id, updater)
 
     def _cancel_requested(self, kind: str, job_id: str) -> bool:
         progress = runtime_state.get_progress(kind, job_id) or {}

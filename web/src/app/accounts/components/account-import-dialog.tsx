@@ -230,7 +230,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           onImported();
           setOpen(false);
           resetState();
-          toast.error(`后台导入任务已取消，已导入 ${latest.imported ?? 0} 个，已刷新 ${latest.refreshed ?? 0} 个`);
+          toast.error(`后台导入任务已取消，已导入 ${latest.imported ?? 0} 个`);
           return;
         }
         if (latest.error) {
@@ -240,7 +240,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         setOpen(false);
         resetState();
         toast.success(
-          `${successText ?? "导入完成"}，新增 ${latest.imported ?? 0} 个，跳过 ${latest.skipped ?? 0} 个重复项，已刷新 ${latest.refreshed ?? 0} 个`,
+          `${successText ?? "导入完成"}，新增 ${latest.imported ?? 0} 个，跳过 ${latest.skipped ?? 0} 个重复项${latest.refresh_job_id ? "；额度刷新已转入后台" : ""}`,
         );
         return;
       }
@@ -831,20 +831,16 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           {importProgress ? (
             <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 text-sm text-stone-600">
               <div className="flex items-center justify-between">
-                <span>{importProgress.phase === "refreshing" ? "正在低优先级刷新账号" : "正在低优先级导入账号"}</span>
+                <span>{importProgress.phase === "imported" ? "账号已写入，额度刷新在后台继续" : "正在低优先级导入账号"}</span>
                 <span className="font-medium text-stone-800">
-                  {importProgress.phase === "refreshing"
-                    ? `${importProgress.refresh_processed ?? 0}/${importProgress.refresh_total ?? 0}`
-                    : `${importProgress.processed}/${importProgress.total}`}
+                  {`${importProgress.processed}/${importProgress.total}`}
                 </span>
               </div>
               <div className="mt-2 h-2 overflow-hidden rounded-full bg-white">
                 <div
                   className="h-full rounded-full bg-stone-900 transition-all"
                   style={{
-                    width: `${Math.min(100, Math.max(0, importProgress.phase === "refreshing"
-                      ? (((importProgress.refresh_processed ?? 0) / Math.max(1, importProgress.refresh_total ?? 1)) * 100)
-                      : ((importProgress.processed / Math.max(1, importProgress.total)) * 100)))}%`,
+                    width: `${Math.min(100, Math.max(0, (importProgress.processed / Math.max(1, importProgress.total)) * 100))}%`,
                   }}
                 />
               </div>

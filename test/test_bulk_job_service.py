@@ -79,6 +79,21 @@ class BulkJobServiceTests(unittest.TestCase):
         self.assertTrue(updated["cancel_requested"])
         self.assertEqual(updated["processed"], 1)
 
+    def test_account_import_queues_a_separate_refresh_after_releasing_lock(self) -> None:
+        service = BulkJobService()
+        imported = ["token-a", "token-b"]
+        with mock.patch.object(service, "_run_with_global_lock", return_value=imported) as run_locked, \
+             mock.patch.object(service, "submit_account_refresh", return_value="refresh-job") as submit_refresh, \
+             mock.patch.object(service, "_update") as update, \
+             mock.patch.object(service, "_mark_done") as mark_done:
+            service._run_account_import("import-job", imported, [])
+
+        run_locked.assert_called_once()
+        submit_refresh.assert_called_once_with(tokens=imported, source="import")
+        update.assert_called_once()
+        self.assertEqual(update.call_args.args[:2], (service.ACCOUNT_IMPORT_KIND, "import-job"))
+        mark_done.assert_called_once_with(service.ACCOUNT_IMPORT_KIND, "import-job", status="success")
+
 
 if __name__ == "__main__":
     unittest.main()

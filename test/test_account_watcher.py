@@ -68,13 +68,13 @@ class AccountWatcherTests(unittest.TestCase):
         self.assertFalse(ran)
         fake_accounts.refresh_accounts.assert_not_called()
 
-    def test_full_refresh_cycle_refreshes_every_stored_account(self) -> None:
+    def test_full_refresh_cycle_uses_bounded_priority_candidates(self) -> None:
         fake_config = mock.Mock(full_account_refresh_enabled=True)
         fake_runtime = mock.Mock()
         fake_runtime.acquire_lock.return_value = "owner"
         fake_accounts = mock.Mock()
-        fake_accounts.list_tokens.return_value = ["normal", "limited", "abnormal", "disabled"]
-        fake_accounts.refresh_accounts.return_value = {"refreshed": 4, "errors": []}
+        fake_accounts.list_remote_refresh_candidates.return_value = ["unchecked", "stale-zero"]
+        fake_accounts.refresh_accounts.return_value = {"refreshed": 2, "errors": []}
 
         with (
             mock.patch.object(support, "config", fake_config),
@@ -85,7 +85,7 @@ class AccountWatcherTests(unittest.TestCase):
 
         self.assertTrue(ran)
         fake_accounts.refresh_accounts.assert_called_once_with(
-            ["normal", "limited", "abnormal", "disabled"],
+            ["unchecked", "stale-zero"],
             defer_invalid_removal=False,
             include_items=False,
         )
@@ -126,14 +126,14 @@ class AccountWatcherTests(unittest.TestCase):
             ttl_seconds=support.FULL_ACCOUNT_REFRESH_LOCK_TTL_SECONDS,
             allow_memory_fallback=False,
         )
-        fake_accounts.list_tokens.assert_not_called()
+        fake_accounts.list_remote_refresh_candidates.assert_not_called()
 
     def test_full_refresh_cycle_releases_lock_after_error(self) -> None:
         fake_config = mock.Mock(full_account_refresh_enabled=True)
         fake_runtime = mock.Mock()
         fake_runtime.acquire_lock.return_value = "owner"
         fake_accounts = mock.Mock()
-        fake_accounts.list_tokens.return_value = ["token"]
+        fake_accounts.list_remote_refresh_candidates.return_value = ["token"]
         fake_accounts.refresh_accounts.side_effect = RuntimeError("refresh failed")
 
         with (
@@ -152,7 +152,7 @@ class AccountWatcherTests(unittest.TestCase):
         fake_runtime.acquire_lock.return_value = "owner"
         fake_runtime.extend_lock.return_value = True
         fake_accounts = mock.Mock()
-        fake_accounts.list_tokens.return_value = ["token"]
+        fake_accounts.list_remote_refresh_candidates.return_value = ["token"]
 
         def slow_refresh(*_args, **_kwargs):
             time.sleep(0.05)

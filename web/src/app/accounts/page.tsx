@@ -5,10 +5,12 @@ import type { ComponentProps } from "react";
 import {
   Ban,
   CheckCircle2,
+  X,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
   CircleOff,
+  CalendarDays,
   Copy,
   Download,
   Link2,
@@ -44,6 +46,7 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
+  cancelBulkJob,
   fetchAccountAutoRefresh,
   fetchAccounts,
   fetchModels,
@@ -55,7 +58,6 @@ import {
   updateAccount,
   updateAccountAutoRefresh,
   type Account,
-  type AccountRefreshResponse,
   type AccountStatus,
   type ICloudAccountStats,
   type Model,
@@ -114,7 +116,7 @@ function isUnlimitedImageQuotaAccount(account: Account) {
 }
 
 function imageQuotaUnknown(account: Account) {
-  return Boolean(account.image_quota_unknown);
+  return Boolean(account.image_quota_unknown) || !String(account.last_remote_refresh_at || "").trim();
 }
 
 function formatCompact(value: number) {
@@ -127,6 +129,9 @@ function formatCompact(value: number) {
 function formatQuota(account: Account) {
   if (isUnlimitedImageQuotaAccount(account)) {
     return "∞";
+  }
+  if (!String(account.last_remote_refresh_at || "").trim()) {
+    return "待刷新";
   }
   if (imageQuotaUnknown(account)) {
     return "未知";
@@ -221,6 +226,7 @@ function AccountsPageContent() {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>("all");
+  const [createdDateFilter, setCreatedDateFilter] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("10");
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
@@ -232,7 +238,9 @@ function AccountsPageContent() {
   const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
   const [isLoadingAutoRefresh, setIsLoadingAutoRefresh] = useState(true);
   const [isSavingAutoRefresh, setIsSavingAutoRefresh] = useState(false);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [activeRefreshJobId, setActiveRefreshJobId] = useState<string | null>(null);
+  const [refreshNoProgressWarning, setRefreshNoProgressWarning] = useState(false);
+  const isRefreshing = activeRefreshJobId !== null;
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
@@ -250,7 +258,7 @@ function AccountsPageContent() {
     message: "",
     email: "",
   });
-  const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const refreshPollingCancelledRef = useRef(false);
   const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
 
   const loadAccounts = async (silent = false) => {
@@ -328,9 +336,8 @@ function AccountsPageContent() {
     void loadModels();
     void loadAutoRefresh();
 
-    // 清理进度条定时器
     return () => {
-      if (progressRef.current) clearInterval(progressRef.current);
+      refreshPollingCancelledRef.current = true;
     };
   }, []);
 
@@ -343,9 +350,18 @@ function AccountsPageContent() {
       const statusMatched =
         statusFilter === "all" ||
         (statusFilter === "restore_due" ? Boolean(account.restore_due) : account.status === statusFilter);
-      return searchMatched && typeMatched && statusMatched;
+      const rawCreatedAt = String(account.created_at || "").trim();
+      const parsedCreatedAt = rawCreatedAt
+        ? new Date(/[zZ]|[+-]\d\d:\d\d$/.test(rawCreatedAt) ? rawCreatedAt : `${rawCreatedAt}Z`)
+        : null;
+      const createdDate = parsedCreatedAt && !Number.isNaN(parsedCreatedAt.getTime())
+        ? new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+        }).format(parsedCreatedAt)
+        : "";
+      return searchMatched && typeMatched && statusMatched && (!createdDateFilter || createdDate === createdDateFilter);
     });
-  }, [accounts, query, statusFilter, typeFilter]);
+  }, [accounts, createdDateFilter, query, statusFilter, typeFilter]);
 
   const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / Number(pageSize)));
   const safePage = Math.min(page, pageCount);
@@ -425,31 +441,8 @@ function AccountsPageContent() {
       return;
     }
 
-    if (accessTokens.length === 1) {
-      setRefreshingTokens((prev) => new Set([...prev, accessTokens[0]]));
-      try {
-        const { progress_id } = await refreshAccounts(accessTokens);
-        // 单账号：轮询等待完成
-        await pollRefreshProgress(progress_id, (progress) => {
-          if (progress.done && progress.result) {
-            setAccounts(progress.result.items);
-            setSelectedIds((prev) => prev.filter((id) => progress.result!.items.some((item) => item.access_token === id)));
-          }
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "刷新账户失败";
-        toast.error(message);
-      } finally {
-        setRefreshingTokens((prev) => {
-          const next = new Set(prev);
-          next.delete(accessTokens[0]);
-          return next;
-        });
-      }
-      return;
-    }
-
-    setIsRefreshing(true);
+    const isSingle = accessTokens.length === 1;
+    if (isSingle) setRefreshingTokens((prev) => new Set([...prev, accessTokens[0]]));
 
     // 计算非选中账号的基数（统计卡片联动用）
     const selectedTokenSet = new Set(accessTokens);
@@ -474,122 +467,63 @@ function AccountsPageContent() {
     });
 
     try {
-      const { progress_id } = await refreshAccounts(accessTokens);
+      const { job_id } = await refreshAccounts(accessTokens);
+      refreshPollingCancelledRef.current = false;
+      setActiveRefreshJobId(job_id);
+      setRefreshNoProgressWarning(false);
+      toast.success(`已提交 ${accessTokens.length} 个账号的后台刷新任务`);
 
-      // 轮询进度到完成
-      const data = await new Promise<AccountRefreshResponse>((resolve, reject) => {
-        const pollTimer = setInterval(async () => {
-          try {
-            const p = await fetchRefreshProgress(progress_id);
-            if (p.done) {
-              clearInterval(pollTimer);
-              if (p.error) {
-                reject(new Error(p.error));
-                return;
-              }
-              if (!p.result) {
-                reject(new Error("刷新结果为空"));
-                return;
-              }
-              // 更新最终进度显示
-              setProgress((prev) => ({
-                ...prev,
-                current: prev.total,
-                message: "刷新完成",
-              }));
-              // 清除联动统计
-              setRefreshSummary(null);
-              resolve(p.result);
-            } else {
-              // 实时更新进度
-              setProgress((prev) => ({
-                ...prev,
-                current: p.processed,
-              }));
-              // 实时更新统计卡片：基数 + 已刷新的累加结果
-              const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
-              const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
-              const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
-              const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
-              let runningQuota: string | number;
-              if (baseHasUnlimited) {
-                runningQuota = "∞";
-              } else if (baseHasUnknown) {
-                runningQuota = "未知";
-              } else {
-                runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: runningLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: runningQuota,
-              });
-            }
-          } catch (err) {
-            clearInterval(pollTimer);
-            reject(err);
-          }
-        }, 300);
-      });
-
-      // 刷新完成，更新数据
-      setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
-
-      const relogined = data.relogined ?? 0;
-
-      // 显示重新登录进度
-      if (relogined > 0) {
-        setProgress({
-          visible: true,
-          current: 0,
-          total: relogined,
-          message: `正在尝试对 ${relogined} 个账号进行移除异常状态`,
-          email: "",
-        });
-        // 模拟重新登录进度
-        let reCount = 0;
-        await new Promise<void>((resolve) => {
-          const timer = setInterval(() => {
-            reCount += 1;
-            if (reCount >= relogined) {
-              clearInterval(timer);
-              setProgress({
-                visible: true,
-                current: relogined,
-                total: relogined,
-                message: "移除异常状态完成",
-                email: "",
-              });
-              setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-              resolve();
-            } else {
-              setProgress((prev) => ({ ...prev, current: reCount }));
-            }
-          }, 150);
-          setTimeout(resolve, 2000);
-        });
-      } else {
-        setProgress({
-          visible: true,
-          current: total,
-          total,
-          message: "刷新完成",
-          email: "",
-        });
-        setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
+      let lastProcessed = 0;
+      let lastProgressAt = Date.now();
+      let data: RefreshProgressResponse;
+      for (;;) {
+        if (refreshPollingCancelledRef.current) {
+          return;
+        }
+        const stalledTimer = window.setTimeout(() => setRefreshNoProgressWarning(true), 120_000);
+        let p: RefreshProgressResponse;
+        try {
+          p = await fetchRefreshProgress(job_id);
+        } finally {
+          window.clearTimeout(stalledTimer);
+        }
+        if (p.processed > lastProcessed) {
+          lastProcessed = p.processed;
+          lastProgressAt = Date.now();
+          setRefreshNoProgressWarning(false);
+        } else if (!p.done && Date.now() - lastProgressAt >= 120_000) {
+          setRefreshNoProgressWarning(true);
+        }
+        setProgress((prev) => ({ ...prev, current: p.processed, message: p.status === "cancelling" ? "正在取消刷新..." : prev.message }));
+        const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
+        const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
+        const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
+        const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
+        const runningQuota: string | number = baseHasUnlimited ? "∞" : baseHasUnknown
+          ? "未知" : formatCompact(baseQuotaNum + (p.total_quota ?? 0));
+        setRefreshSummary({ total: accounts.length, active: runningActive, limited: runningLimited, abnormal: runningAbnormal, disabled: runningDisabled, quota: runningQuota });
+        if (p.done) {
+          data = p;
+          break;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
       }
 
-      if ((data.errors ?? []).length > 0) {
+      await loadAccounts(true);
+      const wasCancelled = data.status === "cancelled";
+      setProgress({ visible: true, current: data.processed, total, message: wasCancelled ? "刷新已取消" : "刷新完成", email: "" });
+      setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
+      if (wasCancelled) {
+        toast.info(`刷新已取消，已处理 ${data.processed} 个账号`);
+      } else if (data.error) {
+        throw new Error(data.error);
+      } else if ((data.errors ?? []).length > 0) {
         const firstError = data.errors?.[0]?.error;
         toast.error(
-          `刷新成功 ${data.refreshed} 个，失败 ${(data.errors ?? []).length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
+          `刷新成功 ${data.refreshed ?? 0} 个，失败 ${(data.errors ?? []).length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
         );
       } else {
-        toast.success(`刷新成功 ${data.refreshed} 个账户${relogined > 0 ? `，已触发 ${relogined} 个账号重新登录` : ""}`);
+        toast.success(`刷新成功 ${data.refreshed ?? 0} 个账户`);
       }
     } catch (error) {
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
@@ -597,33 +531,26 @@ function AccountsPageContent() {
       const message = error instanceof Error ? error.message : "刷新账户失败";
       toast.error(message);
     } finally {
-      setIsRefreshing(false);
+      setActiveRefreshJobId(null);
+      setRefreshNoProgressWarning(false);
+      if (isSingle) {
+        setRefreshingTokens((prev) => {
+          const next = new Set(prev);
+          next.delete(accessTokens[0]);
+          return next;
+        });
+      }
     }
   };
 
-  const pollRefreshProgress = async (
-    progressId: string,
-    onUpdate: (p: RefreshProgressResponse) => void,
-  ): Promise<void> => {
-    return new Promise<void>((resolve, reject) => {
-      const timer = setInterval(async () => {
-        try {
-          const p = await fetchRefreshProgress(progressId);
-          if (p.done) {
-            clearInterval(timer);
-            if (p.error) {
-              reject(new Error(p.error));
-            } else {
-              onUpdate(p);
-              resolve();
-            }
-          }
-        } catch (err) {
-          clearInterval(timer);
-          reject(err);
-        }
-      }, 500);
-    });
+  const handleCancelRefresh = async () => {
+    if (!activeRefreshJobId) return;
+    try {
+      await cancelBulkJob(activeRefreshJobId);
+      toast.success("已请求取消后台刷新任务");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "取消刷新失败");
+    }
   };
 
   const handleReLogin = async (accessTokens: string[]) => {
@@ -844,7 +771,7 @@ function AccountsPageContent() {
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void loadAccounts()}
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isDeleting}
           >
             <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
             刷新
@@ -853,13 +780,13 @@ function AccountsPageContent() {
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
+            disabled={isLoading || isDeleting || accounts.length === 0 || activeRefreshJobId !== null}
           >
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
             一键刷新所有账号信息和额度
           </Button>
           <AccountImportDialog
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isDeleting}
             onImported={(items) => {
               if (items) {
                 setAccounts(items);
@@ -901,6 +828,20 @@ function AccountsPageContent() {
                 style={{ width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%` }}
               />
             </div>
+            {refreshNoProgressWarning ? (
+              <p className="mt-2 text-xs text-amber-700">任务超过 2 分钟没有进展，正在等待当前网络请求；可取消后重试。</p>
+            ) : null}
+            {activeRefreshJobId ? (
+              <Button
+                type="button"
+                variant="outline"
+                className="mt-3 h-8 rounded-lg border-stone-200 bg-white px-3 text-xs text-stone-700"
+                onClick={() => void handleCancelRefresh()}
+              >
+                <X className="size-3.5" />
+                取消刷新
+              </Button>
+            ) : null}
           </div>
         </div>
       )}
@@ -1112,6 +1053,19 @@ function AccountsPageContent() {
                 ))}
               </SelectContent>
             </Select>
+            <div className="relative w-full lg:w-[160px]">
+              <CalendarDays className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
+              <Input
+                type="date"
+                value={createdDateFilter}
+                onChange={(event) => {
+                  setCreatedDateFilter(event.target.value);
+                  setPage(1);
+                }}
+                aria-label="按创建日期筛选（北京时间）"
+                className="h-10 rounded-xl border-stone-200 bg-white/85 pl-9"
+              />
+            </div>
           </div>
         </div>
 

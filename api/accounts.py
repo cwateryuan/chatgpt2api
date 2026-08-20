@@ -310,22 +310,12 @@ def create_router() -> APIRouter:
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
 
-        progress_id = str(uuid.uuid4())
-
-        async def _do_refresh():
-            try:
-                await run_in_threadpool(account_service.refresh_accounts, access_tokens, progress_id, False)
-            except Exception as e:
-                account_service.finish_refresh_progress(progress_id, error=str(e))
-
-        asyncio.create_task(_do_refresh())
-
-        return {"progress_id": progress_id}
+        return {"job_id": bulk_job_service.submit_account_refresh(tokens=access_tokens)}
 
     @router.get("/api/accounts/refresh/progress/{progress_id}")
     async def get_refresh_progress(progress_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        progress = account_service.get_refresh_progress(progress_id)
+        progress = bulk_job_service.get_job(bulk_job_service.ACCOUNT_REFRESH_KIND, progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
         return progress

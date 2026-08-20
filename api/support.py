@@ -206,7 +206,7 @@ def _run_full_account_refresh_cycle(stop_event: Event) -> bool:
     renew_thread = Thread(target=renew_lease, name="full-account-refresh-lock", daemon=True)
     renew_thread.start()
     try:
-        access_tokens = account_service.list_tokens()
+        access_tokens = account_service.list_remote_refresh_candidates()
         if not access_tokens or lease_lost.is_set() or stop_event.is_set():
             return True
         logger.info({"event": "full_account_refresh_started", "accounts": len(access_tokens)})

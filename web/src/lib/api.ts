@@ -42,6 +42,10 @@ export type Account = {
   image_inflight?: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  created_at?: string | null;
+  last_remote_refresh_at?: string | null;
+  last_remote_refresh_error?: string | null;
+  last_remote_refresh_error_at?: string | null;
 };
 
 export type ICloudAccountStats = {
@@ -107,6 +111,9 @@ export type AccountRefreshResponse = {
 };
 
 export type RefreshProgressResponse = {
+  job_id?: string;
+  kind?: "bulk_account_refresh";
+  status?: "queued" | "running" | "cancelling" | "cancelled" | "success" | "error";
   total: number;
   processed: number;
   done: boolean;
@@ -114,7 +121,13 @@ export type RefreshProgressResponse = {
   status_counts?: Record<string, number>;
   total_quota?: number;
   result?: AccountRefreshResponse | null;
+  refreshed?: number;
+  failed?: number;
+  errors?: Array<{ token?: string; error?: string }>;
   results?: Array<{ token: string; status: string; error?: string | null }>;
+  current_proxy_index?: number;
+  proxy_pool_size?: number;
+  updated_at?: number;
 };
 
 export type BulkImageDeleteProgress = {
@@ -135,7 +148,7 @@ export type BulkAccountImportProgress = {
   job_id: string;
   kind: "bulk_account_import";
   status: "queued" | "running" | "cancelling" | "cancelled" | "success" | "error";
-  phase: "queued" | "importing" | "refreshing";
+  phase: "queued" | "importing" | "imported";
   total: number;
   processed: number;
   imported: number;
@@ -144,6 +157,8 @@ export type BulkAccountImportProgress = {
   failed: number;
   refresh_total?: number;
   refresh_processed?: number;
+  refresh_job_id?: string | null;
+  refresh_error?: string | null;
   status_counts?: Record<string, number>;
   total_quota?: number;
   done: boolean;
@@ -180,6 +195,7 @@ export type ProxyRuntimeSettings = {
   egress_mode: ProxyRuntimeEgressMode;
   proxy_url: string;
   resource_proxy_url: string;
+  account_refresh_proxy_pool: string[];
   skip_ssl_verify: boolean;
   reset_session_status_codes: number[];
   clearance: ProxyRuntimeClearanceSettings;
@@ -194,6 +210,8 @@ export type ProxyRuntimeStatus = {
   clearance_mode: ProxyRuntimeClearanceMode | string;
   has_clearance_bundle: boolean;
   cached_clearance_hosts: string[];
+  account_refresh_proxy_pool_size?: number;
+  account_refresh_proxy_index?: number;
 };
 
 export type ProxyRuntimeResponse = {
@@ -488,7 +506,7 @@ export async function fetchAccountImportJob(jobId: string) {
 }
 
 export async function cancelBulkJob(jobId: string) {
-  return httpRequest<BulkImageDeleteProgress | BulkAccountImportProgress>(`/api/bulk-jobs/${jobId}/cancel`, {
+  return httpRequest<BulkImageDeleteProgress | BulkAccountImportProgress | RefreshProgressResponse>(`/api/bulk-jobs/${jobId}/cancel`, {
     method: "POST",
   });
 }
@@ -522,7 +540,7 @@ export async function deleteAccounts(tokens: string[]) {
 }
 
 export async function refreshAccounts(accessTokens: string[]) {
-  return httpRequest<{ progress_id: string }>("/api/accounts/refresh", {
+  return httpRequest<{ job_id: string }>("/api/accounts/refresh", {
     method: "POST",
     body: { access_tokens: accessTokens },
   });

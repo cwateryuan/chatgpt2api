@@ -49,6 +49,7 @@ const DEFAULT_PROXY_RUNTIME: ProxyRuntimeSettings = {
   egress_mode: "direct",
   proxy_url: "",
   resource_proxy_url: "",
+  account_refresh_proxy_pool: [],
   skip_ssl_verify: false,
   reset_session_status_codes: [403],
   clearance: {
@@ -95,6 +96,9 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
     egress_mode: egressMode as ProxyRuntimeEgressMode,
     proxy_url: String(source.proxy_url || ""),
     resource_proxy_url: String(source.resource_proxy_url || ""),
+    account_refresh_proxy_pool: Array.isArray(source.account_refresh_proxy_pool)
+      ? source.account_refresh_proxy_pool.map((item) => String(item).trim()).filter(Boolean)
+      : [],
     skip_ssl_verify: Boolean(source.skip_ssl_verify),
     reset_session_status_codes: statusCodes.length > 0 ? statusCodes : [403],
     clearance: {
@@ -559,6 +563,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           ...normalizeProxyRuntime(config.proxy_runtime),
           proxy_url: String(config.proxy_runtime?.proxy_url || "").trim(),
           resource_proxy_url: String(config.proxy_runtime?.resource_proxy_url || "").trim(),
+          account_refresh_proxy_pool: Array.isArray(config.proxy_runtime?.account_refresh_proxy_pool)
+            ? config.proxy_runtime.account_refresh_proxy_pool.map((item) => String(item).trim()).filter(Boolean)
+            : [],
           reset_session_status_codes: normalizeProxyRuntime({
             reset_session_status_codes: (config.proxy_runtime?.reset_session_status_codes || [403])
               .map((item) => Number(item))

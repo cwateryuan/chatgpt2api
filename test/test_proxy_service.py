@@ -75,6 +75,26 @@ class ProxyServiceTests(unittest.TestCase):
 
         self.assertEqual(kwargs["proxy"], "socks5h://account.example:1080")
 
+    def test_refresh_pool_round_robin_and_explicit_proxy_override(self) -> None:
+        runtime = make_runtime(
+            enabled=True,
+            egress_mode="single_proxy",
+            proxy_url="http://runtime.example:8080",
+            account_refresh_proxy_pool=["http://warp-1:1080", "http://warp-2:1080"],
+        )
+        store = ProxySettingsStore(FakeConfig(runtime=runtime))
+
+        self.assertEqual([store.next_account_refresh_proxy() for _ in range(4)], [
+            "http://warp-1:1080", "http://warp-2:1080", "http://warp-1:1080", "http://warp-2:1080",
+        ])
+        kwargs = store.build_session_kwargs(
+            account={"proxy": "http://account.example:1080"},
+            proxy="http://warp-1:1080",
+            upstream=True,
+            prefer_explicit_proxy=True,
+        )
+        self.assertEqual(kwargs["proxy"], "http://warp-1:1080")
+
     def test_proxy_runtime_single_proxy_wins_over_explicit_and_legacy_proxy_when_enabled(self) -> None:
         runtime = make_runtime(enabled=True, egress_mode="single_proxy", proxy_url=" socks5://runtime.example:1080 ")
         store = ProxySettingsStore(FakeConfig(legacy_proxy="http://legacy.example:8080", runtime=runtime))

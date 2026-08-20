@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import threading
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 from services.storage.base import StorageBackend
 
@@ -66,6 +67,7 @@ DEFAULT_PROXY_RUNTIME = {
     "egress_mode": "direct",
     "proxy_url": "",
     "resource_proxy_url": "",
+    "account_refresh_proxy_pool": [],
     "skip_ssl_verify": False,
     "reset_session_status_codes": [403],
     "clearance": {
@@ -264,11 +266,25 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     if not cf_clearance and _normalize_bool(clearance_source.get("has_cf_clearance"), False):
         cf_clearance = existing_cf_clearance
 
+    raw_refresh_pool = source.get("account_refresh_proxy_pool")
+    if isinstance(raw_refresh_pool, str):
+        raw_refresh_pool = raw_refresh_pool.splitlines()
+    refresh_pool: list[str] = []
+    if isinstance(raw_refresh_pool, (list, tuple)):
+        from urllib.parse import urlparse
+        for item in raw_refresh_pool:
+            candidate = str(item or "").strip()
+            parsed = urlparse(candidate)
+            if candidate and parsed.scheme.lower() in {"http", "https", "socks5", "socks5h"} and parsed.netloc:
+                if candidate not in refresh_pool:
+                    refresh_pool.append(candidate)
+
     return {
         "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_PROXY_RUNTIME["enabled"])),
         "egress_mode": egress_mode,
         "proxy_url": str(source.get("proxy_url") or "").strip(),
         "resource_proxy_url": str(source.get("resource_proxy_url") or "").strip(),
+        "account_refresh_proxy_pool": refresh_pool,
         "skip_ssl_verify": _normalize_bool(
             source.get("skip_ssl_verify"),
             bool(DEFAULT_PROXY_RUNTIME["skip_ssl_verify"]),
@@ -298,6 +314,47 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
             ),
         },
     }
+
+
+def _mask_proxy_url(value: object) -> str:
+    """Keep a proxy endpoint useful in the UI without exposing credentials."""
+    candidate = str(value or "").strip()
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return candidate
+    if not parsed.scheme or "@" not in parsed.netloc:
+        return candidate
+    host = parsed.netloc.rsplit("@", 1)[1]
+    return urlunsplit((parsed.scheme, f"***@{host}", parsed.path, parsed.query, parsed.fragment))
+
+
+def _restore_masked_proxy_pool(incoming: object, existing: object) -> object:
+    """Preserve stored credentials when the settings UI posts its redacted copy."""
+    values = incoming.splitlines() if isinstance(incoming, str) else incoming
+    saved = existing if isinstance(existing, list) else []
+    raw_by_mask = {_mask_proxy_url(item): item for item in saved}
+    if not isinstance(values, (list, tuple)):
+        return incoming
+    return [raw_by_mask.get(str(item or "").strip(), item) for item in values]
+
+
+def _validate_account_refresh_proxy_pool(value: object) -> None:
+    values = value.splitlines() if isinstance(value, str) else value
+    if values is None:
+        return
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("账号刷新代理池必须是代理 URL 列表")
+    for item in values:
+        candidate = str(item or "").strip()
+        if not candidate:
+            continue
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError as exc:
+            raise ValueError("账号刷新代理池包含无效代理 URL") from exc
+        if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h"} or not parsed.netloc:
+            raise ValueError("账号刷新代理池仅支持带主机的 http/https/socks5/socks5h URL")
 
 
 def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
@@ -433,10 +490,16 @@ class ConfigStore:
     ) -> dict[str, object]:
         if isinstance(value, dict):
             incoming = dict(value)
-            previous_clearance = _normalize_proxy_runtime_settings(base_data.get("proxy_runtime")).get("clearance")
+            previous_runtime = _normalize_proxy_runtime_settings(base_data.get("proxy_runtime"))
+            previous_clearance = previous_runtime.get("clearance")
             if isinstance(previous_clearance, dict):
                 incoming["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
                 incoming["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
+            incoming["account_refresh_proxy_pool"] = _restore_masked_proxy_pool(
+                incoming.get("account_refresh_proxy_pool"),
+                previous_runtime.get("account_refresh_proxy_pool"),
+            )
+            _validate_account_refresh_proxy_pool(incoming.get("account_refresh_proxy_pool"))
             return _normalize_proxy_runtime_settings(incoming)
         return _normalize_proxy_runtime_settings(value)
 
@@ -728,6 +791,9 @@ class ConfigStore:
 
     def get_public_proxy_runtime_settings(self) -> dict[str, object]:
         runtime = copy.deepcopy(self.get_proxy_runtime_settings())
+        pool = runtime.get("account_refresh_proxy_pool")
+        if isinstance(pool, list):
+            runtime["account_refresh_proxy_pool"] = [_mask_proxy_url(item) for item in pool]
         clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
         if isinstance(clearance, dict):
             cf_cookies = str(clearance.get("cf_cookies") or "").strip()

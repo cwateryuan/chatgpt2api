@@ -39,6 +39,8 @@ class AccountService:
     _ACCOUNT_CACHE_TTL_SECONDS = 2.0
     _UNKNOWN_RESTORE_RECHECK_SECONDS = 60 * 60
     _UNKNOWN_RESTORE_RECHECK_PREFIX = "account:image:unknown-restore-recheck"
+    _AUTO_REMOTE_REFRESH_BATCH_SIZE = 100
+    _AUTO_REMOTE_ZERO_QUOTA_STALE_SECONDS = 60 * 60
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
 
@@ -359,7 +361,7 @@ class AccountService:
         normalized["type"] = normalized.get("type") or "free"
         normalized["status"] = normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
-        normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown"))
+        normalized["image_quota_unknown"] = bool(normalized.get("image_quota_unknown", False))
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
@@ -381,6 +383,9 @@ class AccountService:
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
         normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
         normalized["last_refresh_error_at"] = normalized.get("last_refresh_error_at") or None
+        normalized["last_remote_refresh_at"] = normalized.get("last_remote_refresh_at") or None
+        normalized["last_remote_refresh_error"] = normalized.get("last_remote_refresh_error") or None
+        normalized["last_remote_refresh_error_at"] = normalized.get("last_remote_refresh_error_at") or None
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
@@ -504,13 +509,15 @@ class AccountService:
         due_at = anchor + timedelta(seconds=self._REFRESH_TOKEN_KEEPALIVE_SECONDS)
         return due_at if due_at <= now else None
 
-    def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
+    def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None, refresh_proxy: str = "") -> dict[str, str]:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
         fp = account_fingerprint(account)
         session = requests.Session(**proxy_settings.build_session_kwargs(
             account=account,
+            proxy=refresh_proxy,
+            prefer_explicit_proxy=bool(refresh_proxy),
             impersonate=fp["impersonate"],
             verify=True,
         ))
@@ -592,7 +599,7 @@ class AccountService:
         )
         return new_token
 
-    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
+    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token", refresh_proxy: str = "") -> str:
         if not access_token:
             return ""
         with self._token_refresh_lock:
@@ -614,7 +621,7 @@ class AccountService:
                 return active_token
             try:
                 try:
-                    token_data = self._request_access_token_refresh(refresh_token, account)
+                    token_data = self._request_access_token_refresh(refresh_token, account, refresh_proxy=refresh_proxy)
                 except Exception as exc:
                     error_str = str(exc or "")
                     self._record_token_refresh_error(active_token, event, error_str)
@@ -1515,7 +1522,10 @@ class AccountService:
                     added += 1
                     self._cumulative_total += 1
                     self._save_cumulative_total()
-                    current = {"created_at": self._now()}
+                    current = {
+                        "created_at": self._now(),
+                        "image_quota_unknown": not ("quota" in payload or "restore_at" in payload),
+                    }
                 else:
                     skipped += 1
                 incoming = dict(payload)
@@ -1700,20 +1710,21 @@ class AccountService:
         event: str = "fetch_remote_info",
         defer_invalid_removal: bool = True,
         deadline: ImageRequestDeadline | None = None,
+        refresh_proxy: str = "",
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight", refresh_proxy=refresh_proxy) or access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            with OpenAIBackendAPI(active_token) as backend:
+            with OpenAIBackendAPI(active_token, refresh_proxy=refresh_proxy) as backend:
                 result = backend.get_user_info(deadline=deadline)
         except InvalidAccessTokenError as exc:
-            refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
+            refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token", refresh_proxy=refresh_proxy)
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    with OpenAIBackendAPI(refreshed_token) as backend:
+                    with OpenAIBackendAPI(refreshed_token, refresh_proxy=refresh_proxy) as backend:
                         result = backend.get_user_info(deadline=deadline)
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
@@ -1735,7 +1746,62 @@ class AccountService:
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        result["last_remote_refresh_at"] = datetime.now(timezone.utc).isoformat()
+        result["last_remote_refresh_error"] = None
+        result["last_remote_refresh_error_at"] = None
+        return self.update_account(active_token, result, quiet=True)
+
+    def record_remote_refresh_failure(self, access_token: str, error: str) -> None:
+        self.update_account(access_token, {
+            "last_remote_refresh_error": str(error or "remote refresh failed"),
+            "last_remote_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+        }, quiet=True)
+
+    def _fetch_remote_info_with_refresh_proxy(
+        self, access_token: str, event: str, defer_invalid_removal: bool,
+    ) -> dict[str, Any] | None:
+        from services.proxy_service import proxy_settings
+        pool = proxy_settings.account_refresh_proxy_pool()
+        attempts = 2 if pool else 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            proxy = proxy_settings.next_account_refresh_proxy() if pool else ""
+            try:
+                return self.fetch_remote_info(access_token, event, defer_invalid_removal, refresh_proxy=proxy)
+            except Exception as exc:
+                last_error = exc
+                text = str(exc or "").lower()
+                retryable = "403" in text or any(key in text for key in ("timeout", "connection", "network", "proxy", "tls"))
+                if attempt + 1 >= attempts or not retryable:
+                    break
+        error = str(last_error or "remote refresh failed")
+        self.record_remote_refresh_failure(access_token, error)
+        raise RuntimeError(error)
+
+    def list_remote_refresh_candidates(self, limit: int | None = None) -> list[str]:
+        """Return a bounded, oldest-first refresh set; new/stale zero-quota accounts lead."""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            self._reload_accounts_locked()
+            candidates: list[tuple[int, datetime, str]] = []
+            for item in self._accounts.values():
+                token = str(item.get("access_token") or "").strip()
+                if not token or item.get("status") == "禁用":
+                    continue
+                last = self._parse_time(item.get("last_remote_refresh_at"))
+                is_unchecked = last is None
+                stale_zero = (
+                    item.get("status") == "正常"
+                    and not bool(item.get("image_quota_unknown"))
+                    and int(item.get("quota") or 0) == 0
+                    and last is not None
+                    and (now - last).total_seconds() >= self._AUTO_REMOTE_ZERO_QUOTA_STALE_SECONDS
+                )
+                priority = 0 if is_unchecked else 1 if stale_zero else 2
+                candidates.append((priority, last or self._parse_time(item.get("created_at")) or now, token))
+        candidates.sort(key=lambda value: (value[0], value[1], value[2]))
+        max_items = max(1, int(limit or self._AUTO_REMOTE_REFRESH_BATCH_SIZE))
+        return [token for _priority, _last, token in candidates[:max_items]]
 
     # ---- 刷新进度追踪 ----
 
@@ -1855,7 +1921,7 @@ class AccountService:
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal): token
+                executor.submit(self._fetch_remote_info_with_refresh_proxy, token, "refresh_accounts", defer_invalid_removal): token
                 for token in access_tokens
             }
             for future in as_completed(futures):

@@ -174,6 +174,20 @@ export function ProxyRuntimeCard() {
             />
           </div>
 
+          <div className="space-y-2 md:col-span-2">
+            <label className="text-sm text-stone-700">账号刷新代理池</label>
+            <Textarea
+              value={runtime.account_refresh_proxy_pool.join("\n")}
+              onChange={(event) => setProxyRuntimeField(
+                "account_refresh_proxy_pool",
+                event.target.value.split("\n").map((item) => item.trim()).filter(Boolean),
+              )}
+              placeholder={"http://cf-warp-proxy-01:1080\nhttp://cf-warp-proxy-02:1080"}
+              className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
+            />
+            <p className="text-xs leading-5 text-stone-500">每行一个代理，仅用于账号刷新，按轮询分配。</p>
+          </div>
+
           <div className="space-y-2">
             <label className="text-sm text-stone-700">重置会话状态码</label>
             <Input

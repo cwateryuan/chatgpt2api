@@ -167,6 +167,7 @@ class ProxySettingsStore:
         self._provider_cache: dict[str, FlareSolverrClearanceProvider] = {}
         self._flight_locks: dict[tuple[str, str, str], threading.Lock] = {}
         self._lock = threading.RLock()
+        self._refresh_proxy_index = 0
 
     def get_profile(
         self,
@@ -174,6 +175,7 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = False,
+        prefer_explicit_proxy: bool = False,
     ) -> ProxyRuntimeProfile:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
@@ -193,7 +195,10 @@ class ProxySettingsStore:
 
         selected_proxy = ""
         source = "direct"
-        if account_proxy:
+        if explicit_proxy and prefer_explicit_proxy:
+            selected_proxy = explicit_proxy
+            source = "explicit"
+        elif account_proxy:
             selected_proxy = account_proxy
             source = "account"
         elif runtime_proxy:
@@ -223,14 +228,36 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = False,
+        prefer_explicit_proxy: bool = False,
         **session_kwargs,
     ) -> dict[str, object]:
-        profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
+        profile = self.get_profile(
+            account=account, proxy=proxy, resource=resource, upstream=upstream,
+            prefer_explicit_proxy=prefer_explicit_proxy,
+        )
         if profile.proxy_url:
             session_kwargs["proxy"] = profile.proxy_url
         if profile.runtime_enabled and profile.skip_ssl_verify:
             session_kwargs["verify"] = False
         return session_kwargs
+
+    def next_account_refresh_proxy(self) -> str:
+        """Select a refresh-only proxy without changing normal upstream routing."""
+        runtime = self._get_runtime_settings()
+        pool = runtime.get("account_refresh_proxy_pool")
+        proxies = [normalize_proxy_url(str(item)) for item in pool] if isinstance(pool, list) else []
+        proxies = [item for item in proxies if item]
+        if not proxies:
+            return ""
+        with self._lock:
+            proxy = proxies[self._refresh_proxy_index % len(proxies)]
+            self._refresh_proxy_index = (self._refresh_proxy_index + 1) % len(proxies)
+            return proxy
+
+    def account_refresh_proxy_pool(self) -> list[str]:
+        runtime = self._get_runtime_settings()
+        pool = runtime.get("account_refresh_proxy_pool")
+        return [normalize_proxy_url(str(item)) for item in pool] if isinstance(pool, list) else []
 
     def build_headers(
         self,
@@ -344,6 +371,8 @@ class ProxySettingsStore:
         with self._lock:
             cached_hosts = [host for _proxy, host, _scope in self._clearance_cache]
             cached_count = len(self._clearance_cache)
+            pool = self.account_refresh_proxy_pool()
+            refresh_index = self._refresh_proxy_index % len(pool) if pool else 0
         return {
             "enabled": profile.runtime_enabled,
             "egress_mode": profile.egress_mode,
@@ -353,6 +382,8 @@ class ProxySettingsStore:
             "clearance_mode": profile.clearance_mode,
             "has_clearance_bundle": cached_count > 0,
             "cached_clearance_hosts": sorted(set(cached_hosts)),
+            "account_refresh_proxy_pool_size": len(pool),
+            "account_refresh_proxy_index": refresh_index,
         }
 
     def _get_runtime_settings(self) -> dict[str, object]:

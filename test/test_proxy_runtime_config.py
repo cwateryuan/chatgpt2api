@@ -215,6 +215,19 @@ class ProxyRuntimeConfigTests(unittest.TestCase):
             self.assertEqual(updated_public["proxy_runtime"]["clearance"]["cf_cookies"], "")
             self.assertEqual(updated_public["proxy_runtime"]["clearance"]["cf_clearance"], "")
 
+    def test_public_proxy_pool_masks_credentials_and_preserves_them_on_save(self) -> None:
+        existing = copy.deepcopy(DEFAULT_PROXY_RUNTIME)
+        existing["account_refresh_proxy_pool"] = ["http://user:secret@warp.example:1080"]
+        tmp_dir, store = self._make_store({"proxy_runtime": existing})
+        with tmp_dir:
+            public_runtime = store.get_public_proxy_runtime_settings()
+            self.assertEqual(public_runtime["account_refresh_proxy_pool"], ["http://***@warp.example:1080"])
+            self.assertNotIn("secret", json.dumps(public_runtime))
+
+            store.update({"proxy_runtime": public_runtime})
+            raw = store.get_proxy_runtime_settings()
+            self.assertEqual(raw["account_refresh_proxy_pool"], ["http://user:secret@warp.example:1080"])
+
 
 if __name__ == "__main__":
     unittest.main()

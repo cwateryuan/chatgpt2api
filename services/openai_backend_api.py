@@ -170,7 +170,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", refresh_proxy: str = "") -> None:
         """初始化后端客户端。
 
         参数：
@@ -180,6 +180,7 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
+        self.refresh_proxy = str(refresh_proxy or "").strip()
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
         self.fp = self._build_fp()
@@ -194,6 +195,8 @@ class OpenAIBackendAPI:
         self.progress_callback: Callable[[str], None] | None = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
+            proxy=self.refresh_proxy,
+            prefer_explicit_proxy=bool(self.refresh_proxy),
             impersonate=self.fp["impersonate"],
             upstream=True,
             verify=True,
