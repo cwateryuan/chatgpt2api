@@ -21,6 +21,40 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_remote_refresh_candidates_skip_limited_accounts_until_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [
+                    {
+                        "access_token": "limited-future",
+                        "status": "限流",
+                        "quota": 0,
+                        "restore_at": "2099-01-01T00:00:00+00:00",
+                        "last_remote_refresh_at": "2026-08-19T00:00:00+00:00",
+                    },
+                    {
+                        "access_token": "limited-due",
+                        "status": "限流",
+                        "quota": 0,
+                        "restore_at": "2000-01-01T00:00:00+00:00",
+                        "last_remote_refresh_at": "2026-08-19T00:00:00+00:00",
+                    },
+                    {
+                        "access_token": "unchecked",
+                        "status": "正常",
+                        "quota": 0,
+                        "image_quota_unknown": True,
+                    },
+                ]
+            )
+
+            candidates = service.list_remote_refresh_candidates(limit=10)
+
+            self.assertNotIn("limited-future", candidates)
+            self.assertIn("limited-due", candidates)
+            self.assertIn("unchecked", candidates)
+
     def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:
         self.assertFalse(
             AccountService._is_image_account_available(

@@ -1788,6 +1788,12 @@ class AccountService:
                 token = str(item.get("access_token") or "").strip()
                 if not token or item.get("status") == "禁用":
                     continue
+                restore_at = self._parse_time(item.get("restore_at"))
+                # A known future recovery time means the account cannot recover yet.
+                # Leave it to the recovery watcher instead of spending a refresh slot
+                # on repeated quota checks until that time.
+                if item.get("status") == "限流" and restore_at is not None and restore_at > now:
+                    continue
                 last = self._parse_time(item.get("last_remote_refresh_at"))
                 is_unchecked = last is None
                 stale_zero = (
