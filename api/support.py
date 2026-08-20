@@ -15,7 +15,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
 ACCOUNT_WATCHER_LOCK = "lock:account:watcher"
 ACCOUNT_WATCHER_LOCK_TTL_SECONDS = 120
-FULL_ACCOUNT_REFRESH_LOCK = "lock:account:full-refresh"
+# Share the bulk maintenance lease with manual import/refresh/delete jobs so the
+# automatic quota worker cannot overlap a user-triggered maintenance task.
+FULL_ACCOUNT_REFRESH_LOCK = "lock:bulk:maintenance:global"
 FULL_ACCOUNT_REFRESH_LOCK_TTL_SECONDS = 120
 FULL_ACCOUNT_REFRESH_INTERVAL_SECONDS = 60
 

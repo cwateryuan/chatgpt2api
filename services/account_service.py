@@ -1788,17 +1788,12 @@ class AccountService:
                 token = str(item.get("access_token") or "").strip()
                 if not token or item.get("status") == "禁用":
                     continue
-                restore_at = self._parse_time(item.get("restore_at"))
-                # A known future recovery time means the account cannot recover yet.
-                # Leave it to the recovery watcher instead of spending a refresh slot
-                # on repeated quota checks until that time.
-                if item.get("status") == "限流" and restore_at is not None and restore_at > now:
+                # Limited accounts are owned by the legacy recovery watcher. Keeping
+                # them out here avoids duplicate quota requests from two schedulers.
+                if item.get("status") == "限流":
                     continue
                 last = self._parse_time(item.get("last_remote_refresh_at"))
                 is_unchecked = last is None
-                limited_due = item.get("status") == "限流" and (
-                    restore_at is None or restore_at <= now
-                )
                 stale_zero = (
                     item.get("status") == "正常"
                     and not bool(item.get("image_quota_unknown"))

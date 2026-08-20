@@ -21,7 +21,7 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
-    def test_remote_refresh_candidates_skip_limited_accounts_until_restore(self) -> None:
+    def test_remote_refresh_candidates_leave_limited_accounts_to_recovery_watcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
@@ -59,7 +59,7 @@ class AccountCapabilityTests(unittest.TestCase):
 
             self.assertNotIn("limited-future", candidates)
             self.assertNotIn("normal-with-quota", candidates)
-            self.assertIn("limited-due", candidates)
+            self.assertNotIn("limited-due", candidates)
             self.assertIn("unchecked", candidates)
 
     def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:
