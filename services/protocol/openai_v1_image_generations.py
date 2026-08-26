@@ -23,7 +23,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
-    timeout_secs = float(body.get("timeout_secs") or config.image_poll_timeout_secs)
+    timeout_secs = float(body.get("timeout_secs") or config.image_request_timeout_secs)
     deadline = body.get("deadline")
     if not isinstance(deadline, ImageRequestDeadline):
         deadline = ImageRequestDeadline(timeout_secs)

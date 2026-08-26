@@ -248,6 +248,8 @@ export type SettingsConfig = {
   image_retention_minutes?: number | string;
   image_retention_days?: number | string;
   image_poll_timeout_secs?: number | string;
+  image_stream_timeout_secs?: number | string;
+  image_stream_recovery_enabled?: boolean;
   image_account_concurrency?: number | string;
   image_parallel_generation?: boolean;
   image_settle_enabled?: boolean;

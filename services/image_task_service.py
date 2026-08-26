@@ -13,6 +13,7 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.image_timeout import ImageRequestDeadline
+from services.image_failure import classify_image_exception
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
@@ -134,6 +135,9 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["usage"] = task.get("usage")
     if task.get("error"):
         item["error"] = task.get("error")
+    for field in ("error_code", "failure_scope", "failure_retryable", "failure_account_failure", "recovery_path"):
+        if task.get(field) is not None:
+            item[field] = task.get(field)
     if task.get("progress"):
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
@@ -321,7 +325,7 @@ class ImageTaskService:
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
-        timeout_secs = float(config.image_poll_timeout_secs)
+        timeout_secs = float(config.image_request_timeout_secs)
         payload_with_progress = {
             **handler_payload,
             "progress_callback": progress_callback,
@@ -361,11 +365,16 @@ class ImageTaskService:
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
+            failure = classify_image_exception(exc)
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
+                              error_code=failure.response_code or failure.code,
+                              failure_scope=failure.scope,
+                              failure_retryable=failure.retryable,
+                              failure_account_failure=failure.account_failure,
                               **({"conversation_id": conversation_id} if conversation_id else {}))
             self._log_call(
                 identity,
@@ -377,7 +386,7 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
-                extra_detail=log_detail,
+                extra_detail={**log_detail, **failure.diagnostic_fields()},
             )
 
     def _log_call(
@@ -498,7 +507,7 @@ class ImageTaskService:
     def _recover_unfinished_locked(self) -> bool:
         changed = False
         try:
-            poll_timeout_secs = int(config.image_poll_timeout_secs)
+            poll_timeout_secs = int(config.image_request_timeout_secs)
         except Exception:
             poll_timeout_secs = 120
         stale_cutoff = time.time() - max(300, poll_timeout_secs * 2)

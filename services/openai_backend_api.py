@@ -23,6 +23,15 @@ from PIL import Image
 from services.account_service import account_service
 from services.browser_fingerprint import account_fingerprint
 from services.config import config
+from services.image_failure import (
+    ImageFailure,
+    ImageFailureError,
+    classify_conversation_failure,
+    classify_image_exception,
+    classify_task_failure,
+    image_failure,
+    merge_message_failure,
+)
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -37,16 +46,16 @@ from utils.turnstile import solve_turnstile_token
 
 
 class InvalidAccessTokenError(RuntimeError):
-    pass
+    code = "auth_invalid"
 
 
 class ImagePollTimeoutError(RuntimeError):
-    pass
+    code = "image_poll_timeout"
 
 
 class ImageContentPolicyError(RuntimeError):
     """Raised when image generation is blocked by content policy moderation."""
-    pass
+    code = "content_policy_violation"
 
 
 def _timeout(default_secs: float, deadline: ImageRequestDeadline | None = None) -> float:
@@ -311,9 +320,23 @@ class OpenAIBackendAPI:
         return 0, None, True
 
     def _raise_on_error(self, response: Any, path: str) -> None:
+        body: Any = getattr(response, "text", "")
+        try:
+            body = response.json()
+        except Exception:
+            pass
+        retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+        retry_after = int(retry_after_header) if str(retry_after_header or "").strip().isdigit() else None
         if response.status_code == 401:
-            raise InvalidAccessTokenError(f"token invalidated ({path})")
-        raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
+            error = InvalidAccessTokenError(f"token invalidated ({path})")
+            # Keep the same diagnostics as other upstream failures so the image
+            # classifier and logs can inspect the original response safely.
+            error.status_code = 401
+            error.body = body
+            error.retry_after = retry_after
+            error.context = path
+            raise error
+        raise UpstreamHTTPError(path, int(response.status_code), body, retry_after=retry_after)
 
     def _get_me(self, deadline: ImageRequestDeadline | None = None) -> Dict[str, Any]:
         path = "/backend-api/me"
@@ -2220,6 +2243,7 @@ class OpenAIBackendAPI:
             return True
 
         last_task_error = ""
+        pending_task_failure: ImageFailure | None = None
         while _remaining() > 0:
             attempt += 1
             # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
@@ -2231,13 +2255,17 @@ class OpenAIBackendAPI:
                     timeout_secs=max(0.001, min(5.0, _remaining())),
                 )
                 for task in tasks:
-                    is_error, error_msg, metadata = self.check_task_error(task)
-                    if is_error and error_msg:
-                        last_task_error = error_msg
+                    candidate = classify_task_failure(task)
+                    if candidate is not None:
+                        pending_task_failure = merge_message_failure(pending_task_failure, candidate)
+                        is_error, error_msg, metadata = self.check_task_error(task)
+                        if is_error and error_msg:
+                            last_task_error = error_msg
                         logger.info({
-                            "event": "image_poll_task_error_not_blocking",
+                            "event": "image_poll_task_failure_detected",
                             "conversation_id": conversation_id,
                             "attempt": attempt,
+                            "failure_code": candidate.code,
                             "error_msg": error_msg,
                             "metadata": metadata,
                         })
@@ -2277,20 +2305,19 @@ class OpenAIBackendAPI:
                     if sediment_id not in sediment_ids:
                         sediment_ids.append(sediment_id)
 
-            # 检查对话文本中是否包含内容政策违规错误
-            # 当上游拒绝生成图片时，错误消息会出现在对话文档的 assistant 消息中，
-            # 而非 /backend-api/tasks/ 的 task error 结构中。
-            # 如果在没有找到图片文件 ID 的同时检测到内容政策违规，立即中断轮询。
             if not file_ids and not sediment_ids:
-                policy_msg = self._find_content_policy_error_in_conversation(conversation)
-                if policy_msg:
+                conversation_failure = classify_conversation_failure(conversation)
+                pending_failure = merge_message_failure(pending_task_failure, conversation_failure)
+                if pending_failure is not None:
+                    raw_detail = pending_failure.public_detail or pending_failure.raw_detail or last_task_error
                     logger.warning({
-                        "event": "image_poll_conversation_text_policy_violation",
+                        "event": "image_poll_terminal_failure",
                         "conversation_id": conversation_id,
                         "attempt": attempt,
-                        "error_msg": policy_msg[:200],
+                        "failure_code": pending_failure.code,
+                        "error_msg": str(raw_detail)[:200],
                     })
-                    raise ImageContentPolicyError(policy_msg)
+                    raise ImageFailureError(str(raw_detail or "image generation failed"), failure=pending_failure)
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
@@ -2338,6 +2365,7 @@ class OpenAIBackendAPI:
             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
             f"也可能是账号被限流或生图队列拥堵导致。"
         )
+        setattr(exc, "failure", image_failure("image_poll_timeout", raw_detail=str(exc)))
         if last_task_error:
             setattr(exc, "task_error", last_task_error)
         setattr(exc, "conversation_id", conversation_id or "")
@@ -2425,18 +2453,22 @@ class OpenAIBackendAPI:
         metadata = img_msg.get("metadata") or {}
         content = img_msg.get("content") or {}
         author = img_msg.get("author") or {}
-
-        is_error = metadata.get("is_error", False)
-        is_text_only = content.get("content_type") == "text"
-        is_assistant_role = author.get("role") == "assistant"
-
-        # 提取错误文本
-        error_msg = ""
-        if is_error and is_text_only:
-            parts = content.get("parts", [])
-            error_msg = "".join(p for p in parts if isinstance(p, str))
-
-        return is_error, error_msg, metadata
+        role = str(author.get("role") or "").strip().lower()
+        content_type = str(content.get("content_type") or "").strip().lower()
+        failure = classify_task_failure(task)
+        # Tool parameter payloads may carry is_error while the image task is still running.
+        # Only an assistant text terminal or an explicit tool system_error is actionable.
+        actionable = failure is not None and (
+            (role == "assistant" and content_type in {"text", "code"})
+            or (role == "tool" and content_type == "system_error")
+        )
+        if not actionable:
+            return False, "", metadata
+        parts = content.get("parts", [])
+        error_msg = "".join(part for part in parts if isinstance(part, str))
+        if not error_msg:
+            error_msg = str(content.get("text") or "").strip()
+        return True, error_msg, metadata
 
     def _resolve_image_urls(
             self,

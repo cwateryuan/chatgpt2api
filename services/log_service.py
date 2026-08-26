@@ -200,9 +200,10 @@ def _request_excerpt(text: object, limit: int = 1000) -> str:
 
 
 def _image_error_response(exc: Exception) -> JSONResponse:
-    from services.protocol.conversation import public_image_error_message
+    from services.image_failure import ImageGenerationError, classify_image_exception, public_image_error_message
 
-    message = public_image_error_message(str(exc))
+    failure = classify_image_exception(exc)
+    message = public_image_error_message(failure, exc)
     if "no available image quota" in message.lower():
         return openai_error_response(
             {
@@ -217,7 +218,8 @@ def _image_error_response(exc: Exception) -> JSONResponse:
         )
     if hasattr(exc, "to_openai_error") and hasattr(exc, "status_code"):
         return JSONResponse(status_code=int(exc.status_code), content=exc.to_openai_error())
-    return openai_error_response(message, 502)
+    generated = ImageGenerationError(message, failure=failure)
+    return JSONResponse(status_code=int(generated.status_code), content=generated.to_openai_error())
 
 
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
@@ -247,19 +249,21 @@ class LoggedCall:
     extra_detail: dict[str, Any] = field(default_factory=dict)
 
     async def run(self, handler, *args, sse: str = "openai"):
-        from services.protocol.conversation import ImageGenerationError
+        from services.image_failure import ImageGenerationError, classify_image_exception
 
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+                     conversation_id=getattr(exc, "conversation_id", ""),
+                     extra_detail=classify_image_exception(exc).diagnostic_fields())
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                     extra_detail=classify_image_exception(exc).diagnostic_fields())
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
@@ -275,13 +279,15 @@ class LoggedCall:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     conversation_id=getattr(exc, "conversation_id", ""))
+                     conversation_id=getattr(exc, "conversation_id", ""),
+                     extra_detail=classify_image_exception(exc).diagnostic_fields())
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
-            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""))
+            self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
+                     extra_detail=classify_image_exception(exc).diagnostic_fields())
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
@@ -303,6 +309,8 @@ class LoggedCall:
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
+            from services.image_failure import classify_image_exception
+            failure = classify_image_exception(exc)
             self.log(
                 "流式调用失败",
                 status="failed",
@@ -310,11 +318,13 @@ class LoggedCall:
                 urls=urls,
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
                 conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
+                extra_detail=failure.diagnostic_fields(),
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
-                from services.protocol.conversation import ImageGenerationError, public_image_error_message
+                from services.image_failure import ImageGenerationError, classify_image_exception, public_image_error_message
 
-                raise ImageGenerationError(public_image_error_message(str(exc))) from exc
+                failure = classify_image_exception(exc)
+                raise ImageGenerationError(public_image_error_message(failure, exc), failure=failure) from exc
             raise
         finally:
             if not failed:

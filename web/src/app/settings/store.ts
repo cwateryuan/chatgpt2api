@@ -188,6 +188,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       return Number.isFinite(legacyDays) ? Math.max(30, Math.round(legacyDays * 24 * 60)) : 30 * 24 * 60;
     })(),
     image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
+    image_stream_timeout_secs: Number(config.image_stream_timeout_secs || 80),
+    image_stream_recovery_enabled: Boolean(config.image_stream_recovery_enabled !== false),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -379,6 +381,8 @@ type SettingsStore = {
   setRefreshAccountIntervalMinute: (value: string) => void;
   setImageRetentionMinutes: (value: string) => void;
   setImagePollTimeoutSecs: (value: string) => void;
+  setImageStreamTimeoutSecs: (value: string) => void;
+  setImageStreamRecoveryEnabled: (value: boolean) => void;
   setImageAccountConcurrency: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
@@ -531,6 +535,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         image_retention_minutes: Number.isInteger(retentionMinutes) ? Math.max(30, retentionMinutes) : 30,
         image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
+        image_stream_timeout_secs: Math.max(1, Number(config.image_stream_timeout_secs) || 80),
+        image_stream_recovery_enabled: Boolean(config.image_stream_recovery_enabled !== false),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
@@ -634,6 +640,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImagePollTimeoutSecs: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {});
+  },
+
+  setImageStreamTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_stream_timeout_secs: value } } : {});
+  },
+
+  setImageStreamRecoveryEnabled: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_stream_recovery_enabled: value } } : {});
   },
 
   setImageAccountConcurrency: (value) => {

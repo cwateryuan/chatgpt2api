@@ -1138,7 +1138,7 @@ class AccountService:
 
     @staticmethod
     def _image_slot_ttl_seconds() -> int:
-        timeout = int(config.image_poll_timeout_secs or 120)
+        timeout = int(config.image_request_timeout_secs or 230)
         return max(60, timeout + 60)
 
     def _image_slot_wait_diagnostics(

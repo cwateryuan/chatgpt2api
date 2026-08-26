@@ -526,6 +526,16 @@ class ConfigStore:
             previous_value = _normalize_positive_int(previous_data.get("image_poll_timeout_secs"), 120, 1)
             latest_value = _normalize_positive_int(latest_data.get("image_poll_timeout_secs"), 120, 1)
             return incoming_value == previous_value and incoming_value != latest_value
+        if key == "image_stream_timeout_secs":
+            incoming_value = _normalize_positive_int(value, 80, 1)
+            previous_value = _normalize_positive_int(previous_data.get("image_stream_timeout_secs"), 80, 1)
+            latest_value = _normalize_positive_int(latest_data.get("image_stream_timeout_secs"), 80, 1)
+            return incoming_value == previous_value and incoming_value != latest_value
+        if key == "image_stream_recovery_enabled":
+            incoming_value = _normalize_bool(value, True)
+            previous_value = _normalize_bool(previous_data.get("image_stream_recovery_enabled"), True)
+            latest_value = _normalize_bool(latest_data.get("image_stream_recovery_enabled"), True)
+            return incoming_value == previous_value and incoming_value != latest_value
         return previous_data.get(key) == value and latest_data.get(key) != previous_data.get(key)
 
     def _drop_stale_update_values(
@@ -534,7 +544,7 @@ class ConfigStore:
         previous_data: dict[str, object],
         latest_data: dict[str, object],
     ) -> dict[str, object]:
-        protected_keys = {"proxy_runtime", "log_levels", "image_poll_timeout_secs"}
+        protected_keys = {"proxy_runtime", "log_levels", "image_poll_timeout_secs", "image_stream_timeout_secs", "image_stream_recovery_enabled"}
         result = dict(incoming)
         for key in protected_keys.intersection(result):
             if self._is_stale_update_value(key, result[key], previous_data, latest_data):
@@ -582,6 +592,21 @@ class ConfigStore:
             return max(1, int(self.data.get("image_poll_timeout_secs", 120)))
         except (TypeError, ValueError):
             return 120
+
+    @property
+    def image_stream_timeout_secs(self) -> int:
+        try:
+            return max(1, int(self.data.get("image_stream_timeout_secs", 80)))
+        except (TypeError, ValueError):
+            return 80
+
+    @property
+    def image_stream_recovery_enabled(self) -> bool:
+        return _normalize_bool(self.data.get("image_stream_recovery_enabled", True), True)
+
+    @property
+    def image_request_timeout_secs(self) -> int:
+        return self.image_stream_timeout_secs + self.image_poll_timeout_secs + 30
 
     @property
     def image_poll_interval_secs(self) -> float:
@@ -764,6 +789,9 @@ class ConfigStore:
         data["image_retention_minutes"] = self.image_retention_minutes
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
+        data["image_stream_timeout_secs"] = self.image_stream_timeout_secs
+        data["image_stream_recovery_enabled"] = self.image_stream_recovery_enabled
+        data["image_request_timeout_secs"] = self.image_request_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency

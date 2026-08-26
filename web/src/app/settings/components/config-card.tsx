@@ -25,6 +25,8 @@ export function ConfigCard() {
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionMinutes = useSettingsStore((state) => state.setImageRetentionMinutes);
   const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
+  const setImageStreamTimeoutSecs = useSettingsStore((state) => state.setImageStreamTimeoutSecs);
+  const setImageStreamRecoveryEnabled = useSettingsStore((state) => state.setImageStreamRecoveryEnabled);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
@@ -169,6 +171,19 @@ export function ConfigCard() {
             <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
           </div>
           <div className="space-y-2">
+            <label className="text-sm text-stone-700">图片 SSE 超时</label>
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              value={String(config?.image_stream_timeout_secs || "")}
+              onChange={(event) => setImageStreamTimeoutSecs(event.target.value)}
+              placeholder="80"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">单位秒，等待上游生成流响应的最长时间；超时后会尝试恢复已提交的任务。</p>
+          </div>
+          <div className="space-y-2">
             <label className="text-sm text-stone-700">单账号图片并发</label>
             <Input
               value={String(config?.image_account_concurrency || "")}
@@ -177,6 +192,16 @@ export function ConfigCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
+          <div className="space-y-2">
+            <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+              <Checkbox
+                checked={Boolean(config?.image_stream_recovery_enabled !== false)}
+                onCheckedChange={(checked) => setImageStreamRecoveryEnabled(Boolean(checked))}
+              />
+              <span className="text-sm text-stone-700">SSE 中断后恢复图片任务</span>
+            </div>
+            <p className="text-xs text-stone-500">只查询已有任务和对话，不会重复提交生图请求。</p>
           </div>
           <div className="space-y-2">
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">

@@ -76,7 +76,7 @@ def _unfinished_image_tasks() -> int:
         from services.image_task_service import UNFINISHED_STATUSES, _file_lock, _task_activity_ts, image_task_service
 
         try:
-            poll_timeout_secs = int(config.image_poll_timeout_secs)
+            poll_timeout_secs = int(config.image_request_timeout_secs)
         except Exception:
             poll_timeout_secs = 120
         stale_cutoff = time.time() - max(300, poll_timeout_secs * 2)
