@@ -3,8 +3,6 @@
   "refresh_account_interval_minute": 5,
   "image_retention_days": 15,
   "image_poll_timeout_secs": 120,
-  "image_stream_timeout_secs": 80,
-  "image_stream_recovery_enabled": true,
   "auto_remove_rate_limited_accounts": false,
   "auto_remove_invalid_accounts": true,
   "log_levels": [
