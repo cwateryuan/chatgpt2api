@@ -3,12 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import Condition, Lock, RLock, Thread
 from typing import Any
 from urllib.parse import urlencode
 
@@ -54,9 +55,14 @@ class AccountService:
     def __init__(self, storage_backend: StorageBackend, stats_service: ICloudStatsService | None = None):
         self.storage = storage_backend
         self.icloud_stats = stats_service
-        self._lock = Lock()
+        self._lock = RLock()
         self._token_refresh_lock = Lock()
-        self._image_slot_condition = Condition(self._lock)
+        self._image_slot_condition = Condition(Lock())
+        self._candidate_cache_lock = Lock()
+        self._candidate_cache_refresh_lock = Lock()
+        self._candidate_cache_generation = 0
+        self._candidate_cache: dict[tuple[str, str, tuple[str, ...]], tuple[float, list[dict[str, Any]]]] = {}
+        self._account_update_locks: dict[str, Lock] = {}
         self._accounts = self._load_accounts()
         self._last_full_reload_at = time.monotonic()
         self._cumulative_total = self._load_cumulative_total()
@@ -193,17 +199,62 @@ class AccountService:
         }
 
     def _save_accounts(self) -> None:
+        with self._lock:
+            snapshot = [dict(item) for item in self._accounts.values()]
         if self._database_features_enabled():
-            for account in self._accounts.values():
-                self.storage.upsert_account(dict(account))
+            for account in snapshot:
+                self.storage.upsert_account(account)
+            self._invalidate_candidate_cache()
             return
-        self.storage.save_accounts(list(self._accounts.values()))
+        self.storage.save_accounts(snapshot)
+        self._invalidate_candidate_cache()
 
     def _save_account(self, account: dict) -> None:
         if self._database_features_enabled():
             self.storage.upsert_account(dict(account))
+            self._invalidate_candidate_cache()
             return
-        self._save_accounts()
+        with self._lock:
+            snapshot = [dict(item) for item in self._accounts.values()]
+        self.storage.save_accounts(snapshot)
+        self._invalidate_candidate_cache()
+
+    def _invalidate_candidate_cache(self) -> None:
+        with self._candidate_cache_lock:
+            self._candidate_cache.clear()
+            self._candidate_cache_generation += 1
+
+    @staticmethod
+    def _candidate_fields_changed(before: dict[str, Any] | None, after: dict[str, Any] | None) -> bool:
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return True
+        return any(
+            before.get(field) != after.get(field)
+            for field in ("status", "type", "source_type", "quota", "image_quota_unknown")
+        )
+
+    @staticmethod
+    def _candidate_cache_enabled() -> bool:
+        value = str(os.getenv("APP_IMAGE_CANDIDATE_CACHE_ENABLED") or "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _image_slot_probe_limit(candidate_count: int) -> int:
+        """Read the bounded Redis probe size; zero restores legacy full probing."""
+        try:
+            value = int(str(os.getenv("APP_IMAGE_SLOT_PROBE_LIMIT") or "128").strip())
+        except (TypeError, ValueError):
+            value = 128
+        return max(0, value) if candidate_count else 0
+
+    def _account_update_lock(self, access_token: str) -> Lock:
+        token = str(access_token or "").strip()
+        with self._lock:
+            lock = self._account_update_locks.get(token)
+            if lock is None:
+                lock = Lock()
+                self._account_update_locks[token] = lock
+            return lock
 
     def _delete_account_tokens(self, tokens: list[str] | set[str]) -> int:
         cleaned = [str(token or "").strip() for token in tokens if str(token or "").strip()]
@@ -228,10 +279,10 @@ class AccountService:
             self._accounts = self._load_accounts()
             self._last_full_reload_at = now
 
-    def _load_account_for_token_locked(self, access_token: str) -> tuple[str, dict | None]:
+    def _load_account_for_token_locked(self, access_token: str, *, fresh: bool = True) -> tuple[str, dict | None]:
         token = self._resolve_access_token_locked(access_token)
         cached = self._accounts.get(token)
-        if not self._database_features_enabled():
+        if not self._database_features_enabled() or not fresh:
             return token, dict(cached) if cached else None
         candidates = [token]
         alias = runtime_state.get_alias(token)
@@ -455,22 +506,22 @@ class AccountService:
             return self._resolve_access_token_locked(access_token)
 
     def _get_account_for_token(self, access_token: str) -> tuple[str, dict | None]:
+        account = self.get_account(access_token)
         with self._lock:
-            return self._load_account_for_token_locked(access_token)
+            resolved = str((account or {}).get("access_token") or self._resolve_access_token_locked(access_token) or access_token).strip()
+        return resolved, account
 
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
-            resolved, current = self._load_account_for_token_locked(access_token)
-            if current is None:
-                return
-            next_item = dict(current)
-            next_item["last_token_refresh_error"] = str(error or "refresh token failed")
-            next_item["last_token_refresh_error_at"] = now
-            account = self._normalize_account(next_item)
-            if account is not None:
-                self._accounts[resolved] = account
-                self._save_account(account)
+        updated = self.update_account(
+            access_token,
+            {
+                "last_token_refresh_error": str(error or "refresh token failed"),
+                "last_token_refresh_error_at": datetime.now(timezone.utc).isoformat(),
+            },
+            quiet=True,
+        )
+        if updated is None:
+            return
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
@@ -554,42 +605,45 @@ class AccountService:
 
     def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
         now = datetime.now(timezone.utc).isoformat()
-        with self._image_slot_condition:
+        with self._lock:
             old_token = self._resolve_access_token_locked(old_access_token)
-            current = self._accounts.get(old_token)
-            if current is None:
-                return old_token
-            new_token = str(token_data.get("access_token") or old_token).strip()
-            if not new_token:
-                return old_token
+            current = dict(self._accounts.get(old_token) or {})
+        if not current:
+            return old_token
+        new_token = str(token_data.get("access_token") or old_token).strip()
+        if not new_token:
+            return old_token
 
-            next_item = dict(current)
-            next_item["access_token"] = new_token
-            if token_data.get("refresh_token"):
-                next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
-            if token_data.get("id_token"):
-                next_item["id_token"] = str(token_data.get("id_token") or "").strip()
-            next_item["last_token_refresh_at"] = now
-            next_item["last_token_refresh_error"] = None
-            next_item["last_token_refresh_error_at"] = None
-            next_item["invalid_count"] = 0
-            next_item["last_invalid_at"] = None
-            next_item["last_refresh_error"] = None
-            next_item["last_refresh_error_at"] = None
+        next_item = dict(current)
+        next_item["access_token"] = new_token
+        if token_data.get("refresh_token"):
+            next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
+        if token_data.get("id_token"):
+            next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+        next_item["last_token_refresh_at"] = now
+        next_item["last_token_refresh_error"] = None
+        next_item["last_token_refresh_error_at"] = None
+        next_item["invalid_count"] = 0
+        next_item["last_invalid_at"] = None
+        next_item["last_refresh_error"] = None
+        next_item["last_refresh_error_at"] = None
 
-            account = self._normalize_account(next_item)
-            if account is None:
-                return old_token
+        account = self._normalize_account(next_item)
+        if account is None:
+            return old_token
 
-            rotated = new_token != old_token
-            if rotated:
+        rotated = new_token != old_token
+        if rotated:
+            with self._lock:
                 self._accounts.pop(old_token, None)
-                runtime_state.set_alias(old_token, new_token)
-                runtime_state.transfer_image_slot(old_token, new_token, self._image_slot_ttl_seconds())
-                if self._database_features_enabled():
-                    self.storage.delete_account_tokens([old_token])
+            runtime_state.set_alias(old_token, new_token)
+            runtime_state.transfer_image_slot(old_token, new_token, self._image_slot_ttl_seconds())
+            if self._database_features_enabled():
+                self.storage.delete_account_tokens([old_token])
+        with self._lock:
             self._accounts[new_token] = account
-            self._save_account(account)
+        self._save_account(account)
+        with self._image_slot_condition:
             self._image_slot_condition.notify_all()
 
         log_service.add(
@@ -1097,17 +1151,71 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         excluded = {str(token or "").strip() for token in (excluded_tokens or set()) if str(token or "").strip()}
-        if self._database_features_enabled():
-            try:
-                items = [
-                    item
-                    for item in self.storage.list_image_candidate_accounts(excluded)
-                    if isinstance(item, dict)
-                ]
-            except Exception:
-                items = list(self._accounts.values())
-        else:
-            items = list(self._accounts.values())
+        normalized_plan = self._normalize_account_type(plan_type) if plan_type else ""
+        normalized_source = self._normalize_source_type(source_type) if source_type else ""
+        normalized_plans = tuple(sorted({
+            normalized
+            for item in (plan_types or ())
+            if (normalized := self._normalize_account_type(item))
+        }))
+        cache_key = (str(normalized_plan or "").lower(), normalized_source, tuple(item.lower() for item in normalized_plans))
+        now = time.monotonic()
+        with self._candidate_cache_lock:
+            cached = self._candidate_cache.get(cache_key)
+            generation = self._candidate_cache_generation
+        cache_valid = cached is not None and now - cached[0] < self._ACCOUNT_CACHE_TTL_SECONDS
+        if not self._candidate_cache_enabled():
+            cache_valid = False
+        if not cache_valid:
+            # Single-flight the refresh so a burst of requests cannot issue one
+            # candidate query per request.  Re-check after taking the lock.
+            refresh_started_at = time.monotonic()
+            with self._candidate_cache_refresh_lock:
+                now = time.monotonic()
+                with self._candidate_cache_lock:
+                    cached = self._candidate_cache.get(cache_key)
+                    generation = self._candidate_cache_generation
+                cache_valid = (
+                    self._candidate_cache_enabled()
+                    and cached is not None
+                    and now - cached[0] < self._ACCOUNT_CACHE_TTL_SECONDS
+                )
+                if not cache_valid:
+                    if self._database_features_enabled():
+                        try:
+                            loaded_items = self.storage.list_image_candidate_tokens(
+                                plan_type=normalized_plan or None,
+                                source_type=normalized_source or None,
+                                plan_types=normalized_plans or None,
+                            )
+                        except Exception:
+                            with self._lock:
+                                loaded_items = list(self._accounts.values())
+                    else:
+                        with self._lock:
+                            loaded_items = list(self._accounts.values())
+                    loaded_items = [item for item in loaded_items if isinstance(item, dict)]
+                    with self._candidate_cache_lock:
+                        # A local account update may have invalidated the
+                        # snapshot while the SQL query was in flight.  Do not
+                        # repopulate a cache with that stale result.
+                        current_generation = self._candidate_cache_generation
+                        if current_generation == generation and self._candidate_cache_enabled():
+                            cached = (now, loaded_items)
+                            self._candidate_cache[cache_key] = cached
+                        else:
+                            cached = self._candidate_cache.get(cache_key)
+                    if cached is None:
+                        cached = (now, loaded_items)
+            logger.debug({
+                "event": "image_candidate_cache_refresh",
+                "cache_enabled": self._candidate_cache_enabled(),
+                "candidate_count": len(cached[1]) if cached is not None else 0,
+                "refresh_ms": round((time.monotonic() - refresh_started_at) * 1000.0, 1),
+                "plan_type": normalized_plan or None,
+                "source_type": normalized_source or None,
+            })
+        items = list(cached[1]) if cached is not None else []
         return [
             token
             for item in items
@@ -1204,47 +1312,58 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: ImageRequestDeadline | None = None,
     ) -> str:
-        with self._image_slot_condition:
-            while True:
-                if deadline is not None:
-                    try:
-                        deadline.require()
-                    except ImageDeadlineExpired:
-                        logger.warning({
-                            "event": "account_slot_wait_timeout",
-                            **self._image_slot_wait_diagnostics(
-                                excluded_tokens,
-                                plan_type,
-                                source_type,
-                                plan_types,
-                                deadline,
-                            ),
-                        })
-                        raise
-                ready_tokens = self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-                if not ready_tokens:
-                    raise RuntimeError(
-                        f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
-                        if plan_type or source_type else "no available image quota"
-                    )
-                access_token = runtime_state.acquire_image_slot(
-                    ready_tokens,
-                    max_concurrency=max(1, int(config.image_account_concurrency or 1)),
-                    ttl_seconds=self._image_slot_ttl_seconds(),
+        wait_started_at = time.monotonic()
+        wait_attempts = 0
+        while True:
+            wait_attempts += 1
+            if deadline is not None:
+                try:
+                    deadline.require()
+                except ImageDeadlineExpired:
+                    logger.warning({
+                        "event": "account_slot_wait_timeout",
+                        **self._image_slot_wait_diagnostics(
+                            excluded_tokens,
+                            plan_type,
+                            source_type,
+                            plan_types,
+                            deadline,
+                        ),
+                    })
+                    raise
+            ready_tokens = self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+            if not ready_tokens:
+                raise RuntimeError(
+                    f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
+                    if plan_type or source_type else "no available image quota"
                 )
-                if access_token:
-                    return access_token
-                wait_for = 1.0
-                if deadline is not None:
-                    wait_for = min(wait_for, max(0.001, deadline.require()))
+            access_token = runtime_state.acquire_image_slot(
+                ready_tokens,
+                max_concurrency=max(1, int(config.image_account_concurrency or 1)),
+                ttl_seconds=self._image_slot_ttl_seconds(),
+                probe_limit=self._image_slot_probe_limit(len(ready_tokens)),
+            )
+            if access_token:
+                logger.debug({
+                    "event": "image_slot_acquired",
+                    "candidate_count": len(ready_tokens),
+                    "wait_attempts": wait_attempts,
+                    "slot_wait_ms": round((time.monotonic() - wait_started_at) * 1000.0, 1),
+                })
+                return access_token
+            wait_for = 0.1
+            if deadline is not None:
+                wait_for = min(wait_for, max(0.001, deadline.require()))
+            with self._image_slot_condition:
                 self._image_slot_condition.wait(timeout=wait_for)
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
             return
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
         with self._image_slot_condition:
-            access_token = self._resolve_access_token_locked(access_token)
-            runtime_state.release_image_slot(access_token)
+            runtime_state.release_image_slot(resolved)
             self._image_slot_condition.notify_all()
 
     def get_available_access_token(
@@ -1254,6 +1373,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: ImageRequestDeadline | None = None,
             excluded_tokens: set[str] | None = None,
+            request_proxy: str = "",
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1288,7 +1408,12 @@ class AccountService:
                 self.release_image_slot(access_token)
                 continue
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token", deadline=deadline)
+                account = self.fetch_remote_info(
+                    access_token,
+                    "get_available_access_token",
+                    deadline=deadline,
+                    request_proxy=request_proxy,
+                )
             except Exception:
                 self.release_image_slot(access_token)
                 continue
@@ -1356,9 +1481,38 @@ class AccountService:
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
             return None
+        raw_token = str(access_token).strip()
         with self._lock:
-            _resolved, account = self._load_account_for_token_locked(access_token)
-            return dict(account) if account else None
+            resolved = self._resolve_access_token_locked(raw_token)
+            candidates = [resolved] if resolved else []
+            alias = runtime_state.get_alias(resolved) if resolved else ""
+            if alias and alias not in candidates:
+                candidates.append(alias)
+            if raw_token and raw_token not in candidates:
+                candidates.append(raw_token)
+            cached_item = self._accounts.get(resolved) if resolved else None
+            cached = dict(cached_item) if isinstance(cached_item, dict) else None
+
+        if not self._database_features_enabled():
+            return cached
+
+        had_error = False
+        for candidate in candidates:
+            try:
+                loaded = self.storage.get_account(candidate)
+            except Exception:
+                had_error = True
+                continue
+            account = self._normalize_account(loaded) if isinstance(loaded, dict) else None
+            if account is None:
+                continue
+            canonical = str(account.get("access_token") or candidate).strip()
+            with self._lock:
+                self._accounts[canonical] = account
+                if canonical != resolved:
+                    self._accounts.pop(resolved, None)
+            return dict(account)
+        return cached if had_error and cached else None
 
     def list_accounts(self) -> list[dict]:
         """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。
@@ -1474,17 +1628,13 @@ class AccountService:
         """Return the account fingerprint and persist generated IDs exactly once."""
         if not access_token:
             return account_fingerprint({})
-        with self._lock:
-            resolved, current = self._load_account_for_token_locked(access_token)
-            if current is None:
-                return account_fingerprint({})
-            fp = account_fingerprint(current)
-            if current.get("fp") != fp:
-                next_item = self._normalize_account({**current, "fp": fp})
-                if next_item is not None:
-                    self._accounts[resolved] = next_item
-                    self._save_account(next_item)
-            return dict(fp)
+        current = self.get_account(access_token)
+        if current is None:
+            return account_fingerprint({})
+        fp = account_fingerprint(current)
+        if current.get("fp") != fp:
+            self.update_account(access_token, {"fp": fp}, quiet=True)
+        return dict(fp)
 
     def add_accounts(self, tokens: list[str], source_type: str = "web") -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))
@@ -1574,46 +1724,75 @@ class AccountService:
                 self._delete_account_tokens(target_set)
                 self._record_icloud_deleted(removed_accounts)
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
+                self._invalidate_candidate_cache()
         return {"removed": removed, "items": self.list_accounts()}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
             return None
-        with self._lock:
-            access_token, current = self._load_account_for_token_locked(access_token)
-            if current is None:
-                return None
-            account = self._normalize_account({**current, **updates, "access_token": access_token})
-            if account is None:
-                return None
+        update_lock = self._account_update_lock(access_token)
+        with update_lock:
+            with self._lock:
+                resolved = self._resolve_access_token_locked(access_token) or str(access_token).strip()
+
+            if self._database_features_enabled():
+                candidate_changed = False
+
+                def apply_updates(current: dict[str, Any] | None) -> dict[str, Any] | None:
+                    nonlocal candidate_changed
+                    if current is None:
+                        return None
+                    token = str(current.get("access_token") or resolved).strip()
+                    updated = self._normalize_account({**current, **updates, "access_token": token})
+                    candidate_changed = self._candidate_fields_changed(current, updated)
+                    return updated
+
+                account = self.storage.mutate_account(resolved, apply_updates)
+                if account is None and resolved != str(access_token).strip():
+                    resolved = str(access_token).strip()
+                    account = self.storage.mutate_account(resolved, apply_updates)
+                if account is None:
+                    return None
+                resolved = str(account.get("access_token") or resolved).strip()
+            else:
+                with self._lock:
+                    resolved, current = self._load_account_for_token_locked(access_token, fresh=False)
+                if current is None:
+                    return None
+                account = self._normalize_account({**current, **updates, "access_token": resolved})
+                if account is None:
+                    return None
+
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
-                self._delete_account_tokens([access_token])
+                with self._lock:
+                    self._accounts.pop(resolved, None)
+                self._delete_account_tokens([resolved])
                 self._record_icloud_deleted([account])
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(resolved)})
+                self._invalidate_candidate_cache()
                 return None
-            self._accounts[access_token] = account
-            self._save_account(account)
+            with self._lock:
+                self._accounts[resolved] = account
+            if not self._database_features_enabled():
+                self._save_account(account)
+            elif candidate_changed:
+                self._invalidate_candidate_cache()
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                                {"token": anonymize_token(access_token), "status": account.get("status")})
+                                {"token": anonymize_token(resolved), "status": account.get("status")})
             return dict(account)
-        return None
 
     def _record_refresh_success(self, access_token: str) -> None:
-        with self._lock:
-            access_token, current = self._load_account_for_token_locked(access_token)
-            if current is None:
-                return
-            next_item = dict(current)
-            next_item["invalid_count"] = 0
-            next_item["last_invalid_at"] = None
-            next_item["last_refresh_error"] = None
-            next_item["last_refresh_error_at"] = None
-            account = self._normalize_account(next_item)
-            if account is not None:
-                self._accounts[access_token] = account
-                self._save_account(account)
+        self.update_account(
+            access_token,
+            {
+                "invalid_count": 0,
+                "last_invalid_at": None,
+                "last_refresh_error": None,
+                "last_refresh_error_at": None,
+            },
+            quiet=True,
+        )
 
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
@@ -1637,27 +1816,54 @@ class AccountService:
         defer_invalid_removal: bool = True,
     ) -> bool:
         now = datetime.now(timezone.utc)
-        with self._lock:
-            access_token, current = self._load_account_for_token_locked(access_token)
-            if current is None:
-                return True
-            should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
-            next_item = dict(current)
-            next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
-            next_item["last_invalid_at"] = now.isoformat()
-            next_item["last_refresh_error"] = str(error or "invalid access token")
-            next_item["last_refresh_error_at"] = now.isoformat()
-            account = self._normalize_account(next_item)
+        resolved, current = self._get_account_for_token(access_token)
+        if current is None:
+            return True
+
+        should_defer = False
+        update_lock = self._account_update_lock(resolved)
+        with update_lock:
+            if self._database_features_enabled():
+                def apply_invalid(item: dict[str, Any] | None) -> dict[str, Any] | None:
+                    nonlocal should_defer
+                    if item is None:
+                        return None
+                    should_defer = defer_invalid_removal and self._should_defer_invalid_token(item, now)
+                    next_item = dict(item)
+                    next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
+                    next_item["last_invalid_at"] = now.isoformat()
+                    next_item["last_refresh_error"] = str(error or "invalid access token")
+                    next_item["last_refresh_error_at"] = now.isoformat()
+                    return self._normalize_account(next_item)
+
+                account = self.storage.mutate_account(resolved, apply_invalid)
+            else:
+                with self._lock:
+                    resolved, current = self._load_account_for_token_locked(resolved, fresh=False)
+                if current is None:
+                    return True
+                should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
+                next_item = dict(current)
+                next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
+                next_item["last_invalid_at"] = now.isoformat()
+                next_item["last_refresh_error"] = str(error or "invalid access token")
+                next_item["last_refresh_error_at"] = now.isoformat()
+                account = self._normalize_account(next_item)
+                if account is not None:
+                    with self._lock:
+                        self._accounts[resolved] = account
+                    self._save_account(account)
             if account is not None:
-                self._accounts[access_token] = account
-                self._save_account(account)
-            if should_defer:
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
-                    "暂缓标记异常账号",
-                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
-                )
-                return False
+                with self._lock:
+                    self._accounts[resolved] = account
+
+        if should_defer:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "暂缓标记异常账号",
+                {"source": event, "token": anonymize_token(resolved), "error": str(error or "")},
+            )
+            return False
         return True
 
     def mark_image_result(
@@ -1670,39 +1876,72 @@ class AccountService:
         if not access_token:
             return None
         self.release_image_slot(access_token)
-        with self._lock:
-            access_token, current = self._load_account_for_token_locked(access_token)
-            if current is None:
-                return None
-            next_item = dict(current)
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            image_quota_unknown = bool(next_item.get("image_quota_unknown"))
-            if success:
-                next_item["success"] = int(next_item.get("success") or 0) + 1
-                if not image_quota_unknown:
-                    next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
-                if not image_quota_unknown and next_item["quota"] == 0:
-                    next_item["status"] = "限流"
-                    next_item["restore_at"] = next_item.get("restore_at") or None
-                elif next_item.get("status") == "限流":
-                    next_item["status"] = "正常"
+        update_lock = self._account_update_lock(access_token)
+        with update_lock:
+            with self._lock:
+                resolved = self._resolve_access_token_locked(access_token) or str(access_token).strip()
+
+            def apply_result(current: dict[str, Any] | None) -> dict[str, Any] | None:
+                if current is None:
+                    return None
+                next_item = dict(current)
+                next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                image_quota_unknown = bool(next_item.get("image_quota_unknown"))
+                if success:
+                    next_item["success"] = int(next_item.get("success") or 0) + 1
+                    if not image_quota_unknown:
+                        next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
+                    if not image_quota_unknown and next_item["quota"] == 0:
+                        next_item["status"] = "限流"
+                        next_item["restore_at"] = next_item.get("restore_at") or None
+                    elif next_item.get("status") == "限流":
+                        next_item["status"] = "正常"
+                else:
+                    next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                    if rate_limit_429:
+                        next_item["rate_limit_429"] = int(next_item.get("rate_limit_429") or 0) + 1
+                return self._normalize_account(next_item)
+
+            if self._database_features_enabled():
+                candidate_changed = False
+
+                def apply_result_with_change(current: dict[str, Any] | None) -> dict[str, Any] | None:
+                    nonlocal candidate_changed
+                    updated = apply_result(current)
+                    candidate_changed = self._candidate_fields_changed(current, updated)
+                    return updated
+
+                account = self.storage.mutate_account(resolved, apply_result_with_change)
+                if account is None and resolved != str(access_token).strip():
+                    resolved = str(access_token).strip()
+                    account = self.storage.mutate_account(resolved, apply_result_with_change)
+                if account is None:
+                    return None
+                resolved = str(account.get("access_token") or resolved).strip()
             else:
-                next_item["fail"] = int(next_item.get("fail") or 0) + 1
-                if rate_limit_429:
-                    next_item["rate_limit_429"] = int(next_item.get("rate_limit_429") or 0) + 1
-            account = self._normalize_account(next_item)
-            if account is None:
-                return None
+                with self._lock:
+                    resolved, current = self._load_account_for_token_locked(access_token, fresh=False)
+                if current is None:
+                    return None
+                account = apply_result(current)
+                if account is None:
+                    return None
+
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
-                self._delete_account_tokens([access_token])
+                with self._lock:
+                    self._accounts.pop(resolved, None)
+                self._delete_account_tokens([resolved])
                 self._record_icloud_deleted([account])
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(resolved)})
+                self._invalidate_candidate_cache()
                 return None
-            self._accounts[access_token] = account
-            self._save_account(account)
+            with self._lock:
+                self._accounts[resolved] = account
+            if not self._database_features_enabled():
+                self._save_account(account)
+            elif candidate_changed:
+                self._invalidate_candidate_cache()
             return dict(account)
-        return None
 
     def fetch_remote_info(
         self,
@@ -1711,20 +1950,33 @@ class AccountService:
         defer_invalid_removal: bool = True,
         deadline: ImageRequestDeadline | None = None,
         refresh_proxy: str = "",
+        request_proxy: str = "",
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight", refresh_proxy=refresh_proxy) or access_token
+        preflight_started_at = time.monotonic()
+        effective_proxy = ""
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            with OpenAIBackendAPI(active_token, refresh_proxy=refresh_proxy) as backend:
+            with OpenAIBackendAPI(
+                active_token,
+                refresh_proxy=refresh_proxy,
+                request_proxy=request_proxy,
+            ) as backend:
+                effective_proxy = str(getattr(backend, "pool_proxy", "") or "")
                 result = backend.get_user_info(deadline=deadline)
         except InvalidAccessTokenError as exc:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token", refresh_proxy=refresh_proxy)
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    with OpenAIBackendAPI(refreshed_token, refresh_proxy=refresh_proxy) as backend:
+                    with OpenAIBackendAPI(
+                        refreshed_token,
+                        refresh_proxy=refresh_proxy,
+                        request_proxy=request_proxy,
+                    ) as backend:
+                        effective_proxy = str(getattr(backend, "pool_proxy", "") or "")
                         result = backend.get_user_info(deadline=deadline)
                 except InvalidAccessTokenError as retry_exc:
                     if self._record_invalid_token_seen(
@@ -1745,10 +1997,38 @@ class AccountService:
                 ):
                     self.remove_invalid_token(active_token, event)
                 raise
-        self._record_refresh_success(active_token)
+        except ImageDeadlineExpired:
+            # A request deadline belongs to the caller, not to the selected
+            # proxy.  Do not cool a healthy proxy because this request ran out
+            # of its overall budget while waiting in the shared preflight pool.
+            raise
+        except Exception as exc:
+            error_text = str(exc or "")
+            if effective_proxy and any(
+                marker in error_text.lower()
+                for marker in ("proxy", "timeout", "connection", "tls", "curl: (28)", "curl: (35)")
+            ):
+                from services.proxy_service import proxy_settings
+                proxy_settings.report_proxy_failure(
+                    effective_proxy,
+                    error_text,
+                    latency_ms=(time.monotonic() - preflight_started_at) * 1000.0,
+                )
+            raise
+        else:
+            if effective_proxy:
+                from services.proxy_service import proxy_settings
+                proxy_settings.report_proxy_success(
+                    effective_proxy,
+                    latency_ms=(time.monotonic() - preflight_started_at) * 1000.0,
+                )
         result["last_remote_refresh_at"] = datetime.now(timezone.utc).isoformat()
         result["last_remote_refresh_error"] = None
         result["last_remote_refresh_error_at"] = None
+        result["invalid_count"] = 0
+        result["last_invalid_at"] = None
+        result["last_refresh_error"] = None
+        result["last_refresh_error_at"] = None
         return self.update_account(active_token, result, quiet=True)
 
     def record_remote_refresh_failure(self, access_token: str, error: str) -> None:
@@ -1801,9 +2081,9 @@ class AccountService:
                     and last is not None
                     and (now - last).total_seconds() >= self._AUTO_REMOTE_ZERO_QUOTA_STALE_SECONDS
                 )
-                if not (is_unchecked or stale_zero or limited_due):
+                if not (is_unchecked or stale_zero):
                     continue
-                priority = 0 if is_unchecked else 1 if stale_zero else 2
+                priority = 0 if is_unchecked else 1
                 candidates.append((priority, last or self._parse_time(item.get("created_at")) or now, token))
         candidates.sort(key=lambda value: (value[0], value[1], value[2]))
         max_items = max(1, int(limit or self._AUTO_REMOTE_REFRESH_BATCH_SIZE))

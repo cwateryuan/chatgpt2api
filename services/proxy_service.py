@@ -13,7 +13,7 @@ from urllib.parse import quote, urlparse
 
 from curl_cffi.requests import Session
 
-from services.config import config
+from services.config import _mask_proxy_url, config
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
@@ -168,6 +168,10 @@ class ProxySettingsStore:
         self._flight_locks: dict[tuple[str, str, str], threading.Lock] = {}
         self._lock = threading.RLock()
         self._refresh_proxy_index = 0
+        self._upstream_proxy_index = 0
+        self._proxy_failures: dict[str, int] = {}
+        self._proxy_cooldown_until: dict[str, float] = {}
+        self._proxy_last_latency_ms: dict[str, float] = {}
 
     def get_profile(
         self,
@@ -188,10 +192,21 @@ class ProxySettingsStore:
 
         runtime_proxy = ""
         runtime_proxy_source = "runtime"
+        explicit_preferred = bool(explicit_proxy and prefer_explicit_proxy)
         if upstream and runtime_enabled and egress_mode == "single_proxy":
             resource_proxy = _clean(runtime.get("resource_proxy_url")) if resource else ""
             runtime_proxy = resource_proxy or _clean(runtime.get("proxy_url"))
             runtime_proxy_source = "runtime_resource" if resource_proxy else "runtime"
+        elif upstream and runtime_enabled and egress_mode == "proxy_pool" and not account_proxy and not explicit_preferred:
+            runtime_proxy = self.next_upstream_proxy()
+            if runtime_proxy:
+                runtime_proxy_source = "runtime_pool"
+            else:
+                # An empty pool keeps the pre-existing single-proxy setting
+                # usable instead of silently switching traffic to direct.
+                resource_proxy = _clean(runtime.get("resource_proxy_url")) if resource else ""
+                runtime_proxy = resource_proxy or _clean(runtime.get("proxy_url"))
+                runtime_proxy_source = "runtime_resource" if resource_proxy else "runtime"
 
         selected_proxy = ""
         source = "direct"
@@ -229,9 +244,10 @@ class ProxySettingsStore:
         resource: bool = False,
         upstream: bool = False,
         prefer_explicit_proxy: bool = False,
+        profile: ProxyRuntimeProfile | None = None,
         **session_kwargs,
     ) -> dict[str, object]:
-        profile = self.get_profile(
+        profile = profile or self.get_profile(
             account=account, proxy=proxy, resource=resource, upstream=upstream,
             prefer_explicit_proxy=prefer_explicit_proxy,
         )
@@ -254,10 +270,85 @@ class ProxySettingsStore:
             self._refresh_proxy_index = (self._refresh_proxy_index + 1) % len(proxies)
             return proxy
 
+    def next_upstream_proxy(self) -> str:
+        """Select a normal upstream proxy from the configured refresh pool."""
+        runtime = self._get_runtime_settings()
+        if not bool(runtime.get("enabled")) or str(runtime.get("egress_mode") or "").strip().lower() != "proxy_pool":
+            return ""
+        pool = self.account_refresh_proxy_pool()
+        if not pool:
+            return ""
+        now = time.time()
+        with self._lock:
+            available = [proxy for proxy in pool if self._proxy_cooldown_until.get(proxy, 0.0) <= now]
+            if not available:
+                # Keep the service usable during a total outage by retrying
+                # the proxy whose cooldown expires first.
+                choices = [min(pool, key=lambda proxy: self._proxy_cooldown_until.get(proxy, 0.0))]
+            else:
+                choices = available
+            proxy = choices[self._upstream_proxy_index % len(choices)]
+            self._upstream_proxy_index = (self._upstream_proxy_index + 1) % len(choices)
+            return proxy
+
+    def report_proxy_success(self, proxy: str, latency_ms: float | None = None) -> None:
+        candidate = normalize_proxy_url(str(proxy or "").strip())
+        if not candidate:
+            return
+        if candidate not in self.account_refresh_proxy_pool():
+            return
+        with self._lock:
+            self._proxy_failures.pop(candidate, None)
+            self._proxy_cooldown_until.pop(candidate, None)
+            if latency_ms is not None:
+                try:
+                    self._proxy_last_latency_ms[candidate] = max(0.0, float(latency_ms))
+                except (TypeError, ValueError):
+                    pass
+
+    def report_proxy_failure(self, proxy: str, error: str = "", latency_ms: float | None = None) -> None:
+        candidate = normalize_proxy_url(str(proxy or "").strip())
+        if not candidate:
+            return
+        if candidate not in self.account_refresh_proxy_pool():
+            return
+        with self._lock:
+            failures = self._proxy_failures.get(candidate, 0) + 1
+            self._proxy_failures[candidate] = failures
+            if latency_ms is not None:
+                try:
+                    self._proxy_last_latency_ms[candidate] = max(0.0, float(latency_ms))
+                except (TypeError, ValueError):
+                    pass
+            if failures >= 3:
+                self._proxy_cooldown_until[candidate] = time.time() + 30.0
+
+    def proxy_pool_status(self) -> dict[str, object]:
+        pool = self.account_refresh_proxy_pool()
+        now = time.time()
+        with self._lock:
+            return {
+                "size": len(pool),
+                "available": sum(1 for proxy in pool if self._proxy_cooldown_until.get(proxy, 0.0) <= now),
+                "cooling_down": sum(1 for proxy in pool if self._proxy_cooldown_until.get(proxy, 0.0) > now),
+                "failures": {_mask_proxy_url(proxy): self._proxy_failures.get(proxy, 0) for proxy in pool},
+                "last_latency_ms": {
+                    _mask_proxy_url(proxy): self._proxy_last_latency_ms[proxy]
+                    for proxy in pool
+                    if proxy in self._proxy_last_latency_ms
+                },
+            }
+
     def account_refresh_proxy_pool(self) -> list[str]:
         runtime = self._get_runtime_settings()
         pool = runtime.get("account_refresh_proxy_pool")
-        return [normalize_proxy_url(str(item)) for item in pool] if isinstance(pool, list) else []
+        if not isinstance(pool, list):
+            return []
+        return list(dict.fromkeys(
+            normalize_proxy_url(str(item))
+            for item in pool
+            if normalize_proxy_url(str(item))
+        ))
 
     def build_headers(
         self,
@@ -367,11 +458,22 @@ class ProxySettingsStore:
             self._clearance_cache.pop(key, None)
 
     def get_runtime_status(self) -> dict[str, object]:
-        profile = self.get_profile(upstream=True)
+        runtime = self._get_runtime_settings()
+        status_pool = self.account_refresh_proxy_pool()
+        pool_mode = bool(runtime.get("enabled")) and str(runtime.get("egress_mode") or "").strip().lower() == "proxy_pool"
+        if pool_mode:
+            profile = self.get_profile(
+                proxy=status_pool[0] if status_pool else "",
+                upstream=True,
+                prefer_explicit_proxy=bool(status_pool),
+            )
+            profile = replace(profile, proxy_source="runtime_pool")
+        else:
+            profile = self.get_profile(upstream=True)
         with self._lock:
             cached_hosts = [host for _proxy, host, _scope in self._clearance_cache]
             cached_count = len(self._clearance_cache)
-            pool = self.account_refresh_proxy_pool()
+            pool = status_pool
             refresh_index = self._refresh_proxy_index % len(pool) if pool else 0
         return {
             "enabled": profile.runtime_enabled,
@@ -384,6 +486,7 @@ class ProxySettingsStore:
             "cached_clearance_hosts": sorted(set(cached_hosts)),
             "account_refresh_proxy_pool_size": len(pool),
             "account_refresh_proxy_index": refresh_index,
+            "upstream_proxy_pool": self.proxy_pool_status(),
         }
 
     def _get_runtime_settings(self) -> dict[str, object]:

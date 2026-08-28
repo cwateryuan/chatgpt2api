@@ -22,6 +22,7 @@ from services.debug_memory import start_memory_diagnostic_scheduler
 from services.image_service import start_image_cleanup_scheduler
 from services.memory import start_memory_trim_scheduler
 from services.memory_recycle import start_memory_recycle_scheduler
+from services.openai_backend_api import shutdown_preflight_executor
 from services.register_service import register_service
 from services.request_activity import RequestActivityMiddleware
 from services.runtime_config import configure_thread_stack_size, configure_threadpool_tokens
@@ -59,6 +60,7 @@ def create_app() -> FastAPI:
             memory_recycle_thread.join(timeout=1)
             register_service.stop_supervisor(timeout=1)
             backup_service.stop()
+            shutdown_preflight_executor(wait=False)
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)

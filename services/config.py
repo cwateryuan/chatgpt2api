@@ -247,7 +247,7 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     clearance_source = source.get("clearance") if isinstance(source.get("clearance"), dict) else {}
 
     egress_mode = str(source.get("egress_mode") or DEFAULT_PROXY_RUNTIME["egress_mode"]).strip().lower()
-    if egress_mode not in {"direct", "single_proxy"}:
+    if egress_mode not in {"direct", "single_proxy", "proxy_pool"}:
         egress_mode = str(DEFAULT_PROXY_RUNTIME["egress_mode"])
 
     clearance_mode = str(clearance_source.get("mode") or default_clearance["mode"]).strip().lower()

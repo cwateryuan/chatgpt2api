@@ -38,6 +38,39 @@ def make_runtime(**overrides: object) -> dict[str, object]:
 
 
 class ProxyServiceTests(unittest.TestCase):
+    def test_upstream_proxy_pool_round_robin_cooldown_and_full_pool_fallback(self) -> None:
+        runtime = make_runtime(
+            enabled=True,
+            egress_mode="proxy_pool",
+            account_refresh_proxy_pool=["http://warp-1:1080", "http://warp-2:1080"],
+        )
+        store = ProxySettingsStore(FakeConfig(runtime=runtime))
+
+        self.assertEqual(
+            [store.next_upstream_proxy() for _ in range(4)],
+            ["http://warp-1:1080", "http://warp-2:1080", "http://warp-1:1080", "http://warp-2:1080"],
+        )
+        for _ in range(3):
+            store.report_proxy_failure("http://warp-1:1080", "curl: (35)", latency_ms=25)
+        self.assertEqual(store.next_upstream_proxy(), "http://warp-2:1080")
+        for _ in range(3):
+            store.report_proxy_failure("http://warp-2:1080", "curl: (28)", latency_ms=50)
+        self.assertIn(store.next_upstream_proxy(), {"http://warp-1:1080", "http://warp-2:1080"})
+
+        status = store.proxy_pool_status()
+        self.assertEqual(status["available"], 0)
+        self.assertEqual(status["cooling_down"], 2)
+        self.assertEqual(status["last_latency_ms"]["http://warp-1:1080"], 25.0)
+
+    def test_empty_upstream_proxy_pool_falls_back_to_runtime_single_proxy(self) -> None:
+        runtime = make_runtime(
+            enabled=True,
+            egress_mode="proxy_pool",
+            proxy_url="http://runtime.example:8080",
+            account_refresh_proxy_pool=[],
+        )
+        store = ProxySettingsStore(FakeConfig(runtime=runtime))
+        self.assertEqual(store.build_session_kwargs(upstream=True)["proxy"], "http://runtime.example:8080")
     def test_normalize_proxy_url_strips_and_converts_socks_schemes(self) -> None:
         self.assertEqual(normalize_proxy_url("  http://proxy.example:8080  "), "http://proxy.example:8080")
         self.assertEqual(normalize_proxy_url("\thttps://proxy.example:8443\n"), "https://proxy.example:8443")

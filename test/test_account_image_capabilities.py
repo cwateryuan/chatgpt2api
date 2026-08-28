@@ -4,7 +4,9 @@ import os
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
@@ -21,6 +23,41 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_candidate_cache_single_flights_concurrent_database_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            storage = DatabaseStorageBackend(f"sqlite:///{Path(tmp_dir) / 'accounts.db'}")
+            storage.upsert_account({
+                "access_token": "token-a",
+                "status": "正常",
+                "source_type": "web",
+                "type": "Plus",
+                "quota": 3,
+            })
+            service = AccountService(storage)
+            original = storage.list_image_candidate_tokens
+            counter_lock = Lock()
+            query_count = 0
+
+            def slow_query(**kwargs):
+                nonlocal query_count
+                with counter_lock:
+                    query_count += 1
+                time.sleep(0.03)
+                return original(**kwargs)
+
+            try:
+                with patch.object(storage, "list_image_candidate_tokens", side_effect=slow_query):
+                    with ThreadPoolExecutor(max_workers=32) as executor:
+                        results = list(executor.map(
+                            lambda _: service._list_ready_candidate_tokens(plan_type="plus"),
+                            range(100),
+                        ))
+                    excluded = service._list_ready_candidate_tokens({"token-a"}, plan_type="plus")
+                self.assertTrue(all(result == ["token-a"] for result in results))
+                self.assertEqual(excluded, [])
+                self.assertEqual(query_count, 1)
+            finally:
+                storage.engine.dispose()
     def test_remote_refresh_candidates_leave_limited_accounts_to_recovery_watcher(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))

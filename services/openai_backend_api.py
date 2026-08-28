@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
+from threading import Lock
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
@@ -127,6 +128,56 @@ CODEX_RESPONSES_INSTRUCTIONS = (
     "Return the generated image result."
 )
 
+_PREFLIGHT_EXECUTOR: ThreadPoolExecutor | None = None
+_PREFLIGHT_EXECUTOR_LOCK = Lock()
+_PREFLIGHT_ACTIVE = 0
+
+
+def _preflight_worker_limit() -> int:
+    try:
+        return max(3, int(str(os.getenv("APP_IMAGE_PREFLIGHT_WORKERS") or "64").strip()))
+    except (TypeError, ValueError):
+        return 64
+
+
+def _preflight_executor() -> ThreadPoolExecutor:
+    global _PREFLIGHT_EXECUTOR
+    with _PREFLIGHT_EXECUTOR_LOCK:
+        if _PREFLIGHT_EXECUTOR is None:
+            _PREFLIGHT_EXECUTOR = ThreadPoolExecutor(
+                max_workers=_preflight_worker_limit(),
+                thread_name_prefix="image-preflight",
+            )
+        return _PREFLIGHT_EXECUTOR
+
+
+def shutdown_preflight_executor(wait: bool = True) -> None:
+    global _PREFLIGHT_EXECUTOR
+    with _PREFLIGHT_EXECUTOR_LOCK:
+        executor = _PREFLIGHT_EXECUTOR
+        _PREFLIGHT_EXECUTOR = None
+    if executor is not None:
+        executor.shutdown(wait=wait, cancel_futures=True)
+
+
+def _run_preflight_task(fn: Callable[[ImageRequestDeadline | None], Any], deadline: ImageRequestDeadline | None, queued_at: float):
+    """Run one preflight call and return its queue wait for diagnostics."""
+    global _PREFLIGHT_ACTIVE
+    started_at = time.monotonic()
+    with _PREFLIGHT_EXECUTOR_LOCK:
+        _PREFLIGHT_ACTIVE += 1
+        active = _PREFLIGHT_ACTIVE
+    try:
+        return fn(deadline), max(0.0, (started_at - queued_at) * 1000.0), active
+    finally:
+        with _PREFLIGHT_EXECUTOR_LOCK:
+            _PREFLIGHT_ACTIVE = max(0, _PREFLIGHT_ACTIVE - 1)
+
+
+def _preflight_active_count() -> int:
+    with _PREFLIGHT_EXECUTOR_LOCK:
+        return _PREFLIGHT_ACTIVE
+
 # 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
 _CONTENT_POLICY_KEYWORDS = (
     # 明确的内容政策违规
@@ -179,7 +230,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "", refresh_proxy: str = "") -> None:
+    def __init__(self, access_token: str = "", refresh_proxy: str = "", request_proxy: str = "") -> None:
         """初始化后端客户端。
 
         参数：
@@ -190,8 +241,11 @@ class OpenAIBackendAPI:
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
         self.refresh_proxy = str(refresh_proxy or "").strip()
+        self.request_proxy = str(request_proxy or "").strip()
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
+        if not self.request_proxy and not self.refresh_proxy and not str(self.account.get("proxy") or "").strip():
+            self.request_proxy = proxy_settings.next_upstream_proxy()
         self.fp = self._build_fp()
         self.user_agent = self.fp["user_agent"]
         self.device_id = self.fp["device_id"]
@@ -202,12 +256,31 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        session_proxy = self.refresh_proxy or self.request_proxy
+        prefer_explicit_proxy = bool(self.refresh_proxy) or bool(self.request_proxy and not str(self.account.get("proxy") or "").strip())
+        profile = proxy_settings.get_profile(
+            account=self.account,
+            proxy=session_proxy,
+            prefer_explicit_proxy=prefer_explicit_proxy,
+            upstream=True,
+        )
+        self.effective_proxy = profile.proxy_url
+        self.proxy_source = profile.proxy_source
+        self.pool_proxy = (
+            self.request_proxy
+            if profile.egress_mode == "proxy_pool"
+            and profile.proxy_source == "explicit"
+            and not self.refresh_proxy
+            and self.request_proxy in proxy_settings.account_refresh_proxy_pool()
+            else ""
+        )
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
-            proxy=self.refresh_proxy,
-            prefer_explicit_proxy=bool(self.refresh_proxy),
+            proxy=session_proxy,
+            prefer_explicit_proxy=prefer_explicit_proxy,
             impersonate=self.fp["impersonate"],
             upstream=True,
+            profile=profile,
             verify=True,
         ))
         self.session.headers.update({
@@ -385,28 +458,57 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
+        executor = _preflight_executor()
+        queued_at = time.monotonic()
+        me_future = init_future = account_future = None
         try:
-            me_future = executor.submit(self._get_me, deadline)
-            init_future = executor.submit(self._get_conversation_init, deadline)
-            account_future = executor.submit(self._get_default_account, deadline)
+            me_future = executor.submit(_run_preflight_task, self._get_me, deadline, queued_at)
+            init_future = executor.submit(_run_preflight_task, self._get_conversation_init, deadline, queued_at)
+            account_future = executor.submit(_run_preflight_task, self._get_default_account, deadline, queued_at)
+            try:
+                queue_depth = int(executor._work_queue.qsize())  # type: ignore[attr-defined]
+            except Exception:
+                queue_depth = -1
+            logger.debug({
+                "event": "image_preflight_pool",
+                "workers": _preflight_worker_limit(),
+                "queue_depth": queue_depth,
+                "active": _preflight_active_count(),
+                "proxy_source": "pool" if self.request_proxy else "account_or_default",
+            })
             if deadline is not None:
-                me_payload = me_future.result(timeout=deadline.require())
-                init_payload = init_future.result(timeout=deadline.require())
-                default_account = account_future.result(timeout=deadline.require())
+                me_payload, me_wait, _ = me_future.result(timeout=deadline.require())
+                init_payload, init_wait, _ = init_future.result(timeout=deadline.require())
+                default_account, account_wait, _ = account_future.result(timeout=deadline.require())
             else:
-                me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
+                me_payload, me_wait, _ = me_future.result()
+                init_payload, init_wait, _ = init_future.result()
+                default_account, account_wait, _ = account_future.result()
+            logger.debug({
+                "event": "image_preflight_wait",
+                "max_wait_ms": round(max(me_wait, init_wait, account_wait), 1),
+                "wait_ms": {
+                    "me": round(me_wait, 1),
+                    "conversation_init": round(init_wait, 1),
+                    "default_account": round(account_wait, 1),
+                },
+                "active": _preflight_active_count(),
+            })
         except FutureTimeoutError as exc:
-            executor.shutdown(wait=False, cancel_futures=True)
+            for future in (me_future, init_future, account_future):
+                if future is not None:
+                    future.cancel()
             raise ImageDeadlineExpired(str(exc) or "image account lookup timed out") from exc
         except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
+            for future in (me_future, init_future, account_future):
+                if future is not None:
+                    future.cancel()
             raise
         except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
+            for future in (me_future, init_future, account_future):
+                if future is not None:
+                    future.cancel()
             raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
 
         plan_type = str(default_account.get("plan_type") or "free")
 

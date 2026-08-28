@@ -32,6 +32,7 @@ from services.image_storage_service import image_storage_service
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.memory import trim_memory
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.proxy_service import proxy_settings
 from utils.helper import (
     IMAGE_MODELS,
     UpstreamHTTPError,
@@ -1592,6 +1593,9 @@ def _generate_single_image(
             deadline.require()
         except ImageDeadlineExpired as exc:
             raise image_timeout_error(deadline, account_email=account_email) from exc
+        request_proxy = proxy_settings.next_upstream_proxy()
+        proxy_started_at = time.monotonic()
+        selection_started_at = proxy_started_at
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1603,6 +1607,7 @@ def _generate_single_image(
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                 deadline=deadline,
                 excluded_tokens=excluded_tokens,
+                request_proxy=request_proxy,
             )
         except ImageDeadlineExpired as exc:
             raise image_timeout_error(deadline, account_email=account_email) from exc
@@ -1621,8 +1626,16 @@ def _generate_single_image(
         returned_message = False
         returned_result = False
         slot_released = False
+        effective_proxy = ""
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
+        logger.debug({
+            "event": "image_account_selected",
+            "account_email": account_email,
+            "selection_ms": round((time.monotonic() - selection_started_at) * 1000.0, 1),
+            "proxy_pool": bool(request_proxy),
+            "index": index,
+        })
         logger.debug({
             "event": "image_account_lookup",
             "token_prefix": token[:12] + "..." if len(token) > 12 else token,
@@ -1632,7 +1645,9 @@ def _generate_single_image(
         })
         backend: OpenAIBackendAPI | None = None
         try:
-            backend = OpenAIBackendAPI(access_token=token)
+            backend = OpenAIBackendAPI(access_token=token, request_proxy=request_proxy)
+            effective_proxy = str(getattr(backend, "pool_proxy", "") or "")
+            generation_started_at = time.monotonic()
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1682,6 +1697,18 @@ def _generate_single_image(
                     )
                 return outputs
             account_service.mark_image_result(token, True)
+            logger.debug({
+                "event": "image_generation_complete",
+                "account_email": account_email,
+                "generation_ms": round((time.monotonic() - generation_started_at) * 1000.0, 1),
+                "total_ms": round((time.monotonic() - proxy_started_at) * 1000.0, 1),
+                "index": index,
+            })
+            if effective_proxy:
+                proxy_settings.report_proxy_success(
+                    effective_proxy,
+                    latency_ms=(time.monotonic() - proxy_started_at) * 1000.0,
+                )
             slot_released = True
             return outputs
         except ImagePollTimeoutError as exc:
@@ -1695,6 +1722,7 @@ def _generate_single_image(
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
+                    excluded_tokens.add(token)
                     logger.warning({
                         "event": "image_poll_timeout_retry",
                         "request_token": token,
@@ -1737,7 +1765,19 @@ def _generate_single_image(
             ) from exc
         except ImageGenerationError as exc:
             failure = classify_image_exception(exc)
-            if failure.account_failure:
+            error_text = str(exc)
+            proxy_network_failure = (
+                is_tls_connection_error(error_text)
+                or is_connection_timeout_error(error_text)
+                or "proxy" in error_text.lower()
+            )
+            if effective_proxy and proxy_network_failure:
+                proxy_settings.report_proxy_failure(
+                    effective_proxy,
+                    error_text,
+                    latency_ms=(time.monotonic() - proxy_started_at) * 1000.0,
+                )
+            if failure.account_failure and not proxy_network_failure:
                 account_service.mark_image_result(
                     token,
                     False,
@@ -1748,7 +1788,6 @@ def _generate_single_image(
             slot_released = True
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
-            error_text = str(exc)
             # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 if deadline.remaining() <= 0:
@@ -1759,6 +1798,7 @@ def _generate_single_image(
                     ) from exc
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
+                    excluded_tokens.add(token)
                     logger.warning({
                         "event": "image_model_text_reply_retry",
                         "request_token": token,
@@ -1794,7 +1834,19 @@ def _generate_single_image(
             raise
         except ImageFailureError as exc:
             failure = classify_image_exception(exc)
-            if failure.account_failure:
+            error_text = str(exc)
+            proxy_network_failure = (
+                is_tls_connection_error(error_text)
+                or is_connection_timeout_error(error_text)
+                or "proxy" in error_text.lower()
+            )
+            if effective_proxy and proxy_network_failure:
+                proxy_settings.report_proxy_failure(
+                    effective_proxy,
+                    error_text,
+                    latency_ms=(time.monotonic() - proxy_started_at) * 1000.0,
+                )
+            if failure.account_failure and not proxy_network_failure:
                 account_service.mark_image_result(token, False, rate_limit_429=failure.status_code == 429)
             else:
                 account_service.release_image_slot(token)
@@ -1811,6 +1863,18 @@ def _generate_single_image(
             # must be returned to the caller without counting the account as failed
             # or switching accounts.
             failure = classify_image_exception(exc)
+            error_text = str(exc)
+            proxy_network_failure = (
+                is_tls_connection_error(error_text)
+                or is_connection_timeout_error(error_text)
+                or "proxy" in error_text.lower()
+            )
+            if effective_proxy and proxy_network_failure:
+                proxy_settings.report_proxy_failure(
+                    effective_proxy,
+                    error_text,
+                    latency_ms=(time.monotonic() - proxy_started_at) * 1000.0,
+                )
             if failure.status_code == 400:
                 account_service.release_image_slot(token)
                 slot_released = True
@@ -1826,7 +1890,7 @@ def _generate_single_image(
                 account_service.mark_image_result(token, False, rate_limit_429=failure.status_code == 429)
                 slot_released = True
                 raise image_timeout_error(deadline, account_email=account_email) from exc
-            if failure.account_failure or failure.scope != "delivery":
+            if not proxy_network_failure and (failure.account_failure or failure.scope != "delivery"):
                 account_service.mark_image_result(
                     token,
                     False,
@@ -1879,7 +1943,9 @@ def _generate_single_image(
                 ) from exc
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
+                excluded_tokens.add(token)
                 if refreshed_token and refreshed_token != token:
+                    excluded_tokens.add(refreshed_token)
                     token = refreshed_token
                     continue
                 account_service.remove_invalid_token(token, "image_stream")

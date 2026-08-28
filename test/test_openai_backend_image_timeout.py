@@ -5,8 +5,14 @@ from unittest import mock
 
 from curl_cffi import CurlOpt
 
+import services.openai_backend_api as backend_module
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, _curl_deadline_options
+from services.openai_backend_api import (
+    ChatRequirements,
+    OpenAIBackendAPI,
+    _curl_deadline_options,
+    shutdown_preflight_executor,
+)
 
 
 class FakeResponse:
@@ -35,6 +41,25 @@ class FakeSession:
 
 
 class OpenAIBackendImageTimeoutTests(unittest.TestCase):
+    def test_preflight_calls_reuse_shared_executor(self):
+        shutdown_preflight_executor(wait=True)
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.access_token = "token"
+        backend.request_proxy = ""
+        with (
+            mock.patch.object(backend, "_get_me", return_value={"email": "user@example.test", "id": "user"}),
+            mock.patch.object(backend, "_get_conversation_init", return_value={"limits_progress": []}),
+            mock.patch.object(backend, "_get_default_account", return_value={"plan_type": "free"}),
+        ):
+            try:
+                backend.get_user_info()
+                first_executor = backend_module._PREFLIGHT_EXECUTOR
+                backend.get_user_info()
+                second_executor = backend_module._PREFLIGHT_EXECUTOR
+                self.assertIs(first_executor, second_executor)
+            finally:
+                shutdown_preflight_executor(wait=True)
+
     def test_curl_deadline_options_sets_absolute_timeout_ms(self):
         deadline = ImageRequestDeadline(10, started_at=100)
 

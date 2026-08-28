@@ -9,6 +9,7 @@ from starlette.datastructures import Headers
 
 from api.support import resolve_client_ip
 from services.protocol.conversation import build_image_prompt
+from services.runtime_state import RuntimeState
 from services.runtime_config import configure_thread_stack_size, configure_threadpool_tokens
 from services.config import config
 from utils.log import logger
@@ -25,6 +26,30 @@ class _Request:
 
 
 class RuntimeAndLoggingTests(unittest.TestCase):
+    def test_image_slot_probe_is_bounded_and_idle_accounts_are_preferred(self):
+        state = RuntimeState()
+
+        class FakeRedis:
+            def __init__(self):
+                self.args = ()
+
+            def eval(self, *args):
+                self.args = args
+                return ["", ""]
+
+        fake_redis = FakeRedis()
+        state._redis = fake_redis
+        self.assertEqual(state.acquire_image_slot([f"token-{index}" for index in range(300)], 2, 180, probe_limit=128), "")
+        self.assertEqual(len(fake_redis.args) - 5, 128)
+
+        state._redis = None
+        first = state.acquire_image_slot(["a", "b"], 2, 180)
+        second = state.acquire_image_slot(["a", "b"], 2, 180)
+        third = state.acquire_image_slot(["a", "b"], 2, 180)
+        self.assertNotEqual(first, second)
+        self.assertIn(third, {"a", "b"})
+        self.assertLessEqual(state.get_image_inflight("a"), 2)
+        self.assertLessEqual(state.get_image_inflight("b"), 2)
     def test_build_image_prompt_adds_single_image_instruction(self):
         prompt = build_image_prompt("画一只杯子", "1024x1024", "auto")
         self.assertIn("本次只生成一张图片。", prompt)

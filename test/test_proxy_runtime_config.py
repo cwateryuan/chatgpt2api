@@ -13,6 +13,14 @@ from services.config import (
 
 
 class ProxyRuntimeConfigTests(unittest.TestCase):
+    def test_proxy_pool_egress_mode_is_accepted(self) -> None:
+        normalized = _normalize_proxy_runtime_settings({
+            "enabled": True,
+            "egress_mode": "proxy_pool",
+            "account_refresh_proxy_pool": ["http://warp-1:1080"],
+        })
+        self.assertEqual(normalized["egress_mode"], "proxy_pool")
+        self.assertEqual(normalized["account_refresh_proxy_pool"], ["http://warp-1:1080"])
     def _make_store(self, initial: dict[str, object] | None = None) -> tuple[tempfile.TemporaryDirectory[str], ConfigStore]:
         tmp_dir = tempfile.TemporaryDirectory()
         path = Path(tmp_dir.name) / "config.json"

@@ -7,6 +7,8 @@ import uuid
 from threading import RLock
 from typing import Any
 
+from utils.log import logger
+
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
@@ -42,21 +44,42 @@ if n <= 0 then
   return {"", ""}
 end
 local start = redis.call("INCR", rr_key)
+local function claim(token)
+  local inflight_key = "account:image:inflight:" .. token
+  local next_count = redis.call("INCR", inflight_key)
+  redis.call("EXPIRE", inflight_key, ttl)
+  if next_count <= max_slots then
+    local lease_id = redis.call("INCR", "account:image:lease:seq")
+    local lease_key = "account:image:lease:" .. lease_id
+    redis.call("SET", lease_key, token, "EX", ttl)
+    return {token, lease_key}
+  end
+  redis.call("DECR", inflight_key)
+  return nil
+end
+-- Prefer completely idle accounts so max_concurrency=2 does not create
+-- unnecessary duplicate account usage while idle candidates exist.
+for i = 0, n - 1 do
+  local idx = ((start + i - 1) % n) + 1
+  local token = ARGV[idx + 2]
+  local inflight_key = "account:image:inflight:" .. token
+  if tonumber(redis.call("GET", inflight_key) or "0") == 0 then
+    local result = claim(token)
+    if result then
+      return result
+    end
+  end
+end
 for i = 0, n - 1 do
   local idx = ((start + i - 1) % n) + 1
   local token = ARGV[idx + 2]
   local inflight_key = "account:image:inflight:" .. token
   local current = tonumber(redis.call("GET", inflight_key) or "0")
-  if current < max_slots then
-    local next_count = redis.call("INCR", inflight_key)
-    redis.call("EXPIRE", inflight_key, ttl)
-    if next_count <= max_slots then
-      local lease_id = redis.call("INCR", "account:image:lease:seq")
-      local lease_key = "account:image:lease:" .. lease_id
-      redis.call("SET", lease_key, token, "EX", ttl)
-      return {token, lease_key}
+  if current > 0 and current < max_slots then
+    local result = claim(token)
+    if result then
+      return result
     end
-    redis.call("DECR", inflight_key)
   end
 end
 return {"", ""}
@@ -175,31 +198,69 @@ return redis.call("DECR", inflight_key)
                 if old not in cleaned and item[0] not in cleaned
             }
 
-    def acquire_image_slot(self, tokens: list[str], max_concurrency: int, ttl_seconds: int) -> str:
+    def acquire_image_slot(
+        self,
+        tokens: list[str],
+        max_concurrency: int,
+        ttl_seconds: int,
+        probe_limit: int = 128,
+    ) -> str:
         candidates = [_clean(token) for token in tokens if _clean(token)]
         if not candidates:
             return ""
         max_slots = max(1, int(max_concurrency or 1))
         ttl = max(30, int(ttl_seconds or 180))
+        try:
+            requested_limit = int(probe_limit)
+        except (TypeError, ValueError):
+            requested_limit = 128
+        # A non-positive value is an explicit rollback switch for the bounded
+        # probe and restores the legacy full candidate window.
+        limit = len(candidates) if requested_limit <= 0 else max(1, requested_limit)
+        if len(candidates) > limit:
+            with self._lock:
+                total = len(candidates)
+                start = self._memory_rr.get("image_candidates", 0) % total
+                candidates = [candidates[(start + offset) % total] for offset in range(limit)]
+                self._memory_rr["image_candidates"] = (start + limit) % total
         if self._redis is not None:
+            eval_started_at = time.monotonic()
             try:
                 result = self._redis.eval(self._ACQUIRE_IMAGE_SLOT_SCRIPT, 1, "account:rr:image", ttl, max_slots, *candidates)
+                logger.debug({
+                    "event": "image_slot_redis_eval",
+                    "candidate_count": len(candidates),
+                    "probe_limit": limit,
+                    "eval_ms": round((time.monotonic() - eval_started_at) * 1000.0, 1),
+                })
                 if isinstance(result, list) and result:
                     return _clean(result[0])
                 return ""
-            except Exception:
+            except Exception as exc:
+                logger.debug({
+                    "event": "image_slot_redis_eval_failed",
+                    "candidate_count": len(candidates),
+                    "probe_limit": limit,
+                    "eval_ms": round((time.monotonic() - eval_started_at) * 1000.0, 1),
+                    "error": str(exc)[:200],
+                })
                 pass
         with self._lock:
             self._cleanup_memory_locked()
-            start = self._memory_rr.get("image", 0)
+            start = self._memory_rr.get("image", 0) % len(candidates)
             n = len(candidates)
-            for offset in range(n):
-                idx = (start + offset) % n
-                token = candidates[idx]
+            ordered = [candidates[(start + offset) % n] for offset in range(n)]
+            for token in ordered:
                 current, _expires_at = self._memory_inflight.get(token, (0, 0.0))
-                if current < max_slots:
+                if current == 0:
+                    self._memory_inflight[token] = (1, time.time() + ttl)
+                    self._memory_rr["image"] = (start + candidates.index(token) + 1) % n
+                    return token
+            for token in ordered:
+                current, _expires_at = self._memory_inflight.get(token, (0, 0.0))
+                if 0 < current < max_slots:
                     self._memory_inflight[token] = (current + 1, time.time() + ttl)
-                    self._memory_rr["image"] = idx + 1
+                    self._memory_rr["image"] = (start + candidates.index(token) + 1) % n
                     return token
             return ""
 

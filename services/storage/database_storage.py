@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from datetime import datetime
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import (
@@ -24,7 +26,8 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-from services.storage.base import StorageBackend
+from services.storage.base import CandidateToken, StorageBackend
+from utils.log import logger
 
 Base = declarative_base()
 
@@ -279,6 +282,44 @@ class DatabaseStorageBackend(StorageBackend):
         finally:
             session.close()
 
+    def mutate_account(
+        self,
+        access_token: str,
+        mutator: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """Apply one account mutation while holding the database row lock."""
+        token = _string(access_token)
+        if not token:
+            return None
+        session = self.Session()
+        try:
+            if self.engine.dialect.name == "sqlite":
+                # SQLite has no SELECT .. FOR UPDATE.  Start an immediate
+                # write transaction before reading so two worker threads cannot
+                # both read the same counter and then overwrite one another.
+                session.execute(text("BEGIN IMMEDIATE"))
+            query = session.query(AccountModel).filter(AccountModel.access_token_hash == _token_hash(token))
+            # PostgreSQL (and databases that support it) serialize concurrent
+            # counter/quota updates for the same account. SQLite ignores this
+            # clause, but still gets the same transaction boundary.
+            try:
+                query = query.with_for_update()
+            except AttributeError:
+                pass
+            row = query.first()
+            current = self._account_from_row(row)
+            updated = mutator(dict(current) if isinstance(current, dict) else None)
+            if updated is not None:
+                canonical = _string(updated.get("access_token") or token)
+                self._upsert_account_session(session, {**updated, "access_token": canonical})
+            session.commit()
+            return updated
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def list_image_candidate_accounts(self, excluded_tokens: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
         excluded_hashes = {_token_hash(token) for token in (excluded_tokens or []) if _string(token)}
         session = self.Session()
@@ -310,6 +351,66 @@ class DatabaseStorageBackend(StorageBackend):
                     "last_used_at": row.last_used_at,
                     "image_quota_unknown": bool(row.image_quota_unknown),
                 })
+            return items
+        finally:
+            session.close()
+
+    def list_image_candidate_tokens(
+        self,
+        plan_type: str | None = None,
+        source_type: str | None = None,
+        plan_types: set[str] | tuple[str, ...] | None = None,
+    ) -> list[CandidateToken]:
+        """Fetch only indexed candidate columns for the image hot path."""
+        query_started_at = time.monotonic()
+        session = self.Session()
+        try:
+            normal = or_(
+                AccountModel.status == "正常",
+                AccountModel.status.is_(None),
+                AccountModel.status == "",
+                ~AccountModel.status.in_(["禁用", "限流", "异常"]),
+            )
+            available = and_(
+                normal,
+                or_(AccountModel.image_quota_unknown.is_(True), AccountModel.quota > 0),
+            )
+            query = session.query(
+                AccountModel.access_token,
+                AccountModel.status,
+                AccountModel.source_type,
+                AccountModel.type,
+                AccountModel.quota,
+                AccountModel.image_quota_unknown,
+            ).filter(available)
+            if source_type:
+                query = query.filter(func.lower(func.coalesce(AccountModel.source_type, "web")) == str(source_type).strip().lower())
+            if plan_type:
+                query = query.filter(func.lower(func.coalesce(AccountModel.type, "free")) == str(plan_type).strip().lower())
+            if plan_types:
+                normalized = [str(item or "").strip().lower() for item in plan_types if str(item or "").strip()]
+                if normalized:
+                    query = query.filter(func.lower(func.coalesce(AccountModel.type, "free")).in_(normalized))
+            rows = query.order_by(AccountModel.id.asc()).all()
+            items = [
+                {
+                    "access_token": row.access_token,
+                    "status": row.status or "正常",
+                    "source_type": row.source_type or "web",
+                    "type": row.type or "free",
+                    "quota": int(row.quota or 0),
+                    "image_quota_unknown": bool(row.image_quota_unknown),
+                }
+                for row in rows
+            ]
+            logger.debug({
+                "event": "image_candidate_sql",
+                "candidate_count": len(items),
+                "query_ms": round((time.monotonic() - query_started_at) * 1000.0, 1),
+                "plan_type": plan_type or None,
+                "source_type": source_type or None,
+                "plan_types": sorted(str(item) for item in plan_types) if plan_types else None,
+            })
             return items
         finally:
             session.close()
@@ -933,6 +1034,7 @@ class DatabaseStorageBackend(StorageBackend):
                 ("idx_accounts_status", "accounts", "status"),
                 ("idx_accounts_source_type", "accounts", "source_type"),
                 ("idx_accounts_type", "accounts", "type"),
+                ("idx_accounts_image_candidates", "accounts", "status, source_type, type, quota"),
                 ("idx_images_date_created_at", "images", "date, created_at"),
                 ("idx_logs_type_time", "logs", "type, time"),
             ]
