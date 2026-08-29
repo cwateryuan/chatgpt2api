@@ -80,7 +80,10 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
   const clearanceSource = typeof source.clearance === "object" && source.clearance !== null
     ? source.clearance as Partial<ProxyRuntimeSettings["clearance"]>
     : {};
-  const egressMode = source.egress_mode === "single_proxy" ? "single_proxy" : "direct";
+  const egressMode: ProxyRuntimeEgressMode =
+    source.egress_mode === "single_proxy" || source.egress_mode === "proxy_pool"
+      ? source.egress_mode
+      : "direct";
   const clearanceMode: ProxyRuntimeClearanceMode = clearanceSource.mode === "manual" || clearanceSource.mode === "flaresolverr"
     ? clearanceSource.mode
     : "none";
@@ -93,7 +96,7 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
     ...DEFAULT_PROXY_RUNTIME,
     ...source,
     enabled: Boolean(source.enabled),
-    egress_mode: egressMode as ProxyRuntimeEgressMode,
+    egress_mode: egressMode,
     proxy_url: String(source.proxy_url || ""),
     resource_proxy_url: String(source.resource_proxy_url || ""),
     account_refresh_proxy_pool: Array.isArray(source.account_refresh_proxy_pool)

@@ -144,9 +144,12 @@ export function ProxyRuntimeCard() {
               <SelectContent>
                 <SelectItem value="direct">直连</SelectItem>
                 <SelectItem value="single_proxy">单代理/WARP</SelectItem>
+                <SelectItem value="proxy_pool">代理池（生图轮询）</SelectItem>
               </SelectContent>
             </Select>
-            <p className="text-xs text-stone-500">WARP compose 默认使用 single_proxy。</p>
+            <p className="text-xs text-stone-500">
+              生图请求走代理池时选「代理池」；WARP compose 默认仍是单代理。
+            </p>
           </div>
 
           <div className="space-y-2">
@@ -156,10 +159,10 @@ export function ProxyRuntimeCard() {
               onChange={(event) => setProxyRuntimeField("proxy_url", event.target.value)}
               placeholder="http://privoxy:8118"
               className="h-10 rounded-xl border-stone-200 bg-white"
-              disabled={!runtimeEnabled || runtime.egress_mode !== "single_proxy"}
+              disabled={!runtimeEnabled || (runtime.egress_mode !== "single_proxy" && runtime.egress_mode !== "proxy_pool")}
             />
             <p className="text-xs leading-5 text-stone-500">
-              支持 http/https/socks5/socks5h，socks5 会转为 socks5h。带认证格式：协议://账号:密码@主机:端口，也可直接粘贴 主机:端口:账号:密码。
+              支持 http/https/socks5/socks5h，socks5 会转为 socks5h。带认证格式：协议://账号:密码@主机:端口，也可直接粘贴 主机:端口:账号:密码。代理池为空时会回退到此 URL。
             </p>
           </div>
 
@@ -170,12 +173,12 @@ export function ProxyRuntimeCard() {
               onChange={(event) => setProxyRuntimeField("resource_proxy_url", event.target.value)}
               placeholder="留空则复用清障代理"
               className="h-10 rounded-xl border-stone-200 bg-white"
-              disabled={!runtimeEnabled || runtime.egress_mode !== "single_proxy"}
+              disabled={!runtimeEnabled || (runtime.egress_mode !== "single_proxy" && runtime.egress_mode !== "proxy_pool")}
             />
           </div>
 
           <div className="space-y-2 md:col-span-2">
-            <label className="text-sm text-stone-700">账号刷新代理池</label>
+            <label className="text-sm text-stone-700">上游代理池</label>
             <Textarea
               value={runtime.account_refresh_proxy_pool.join("\n")}
               onChange={(event) => setProxyRuntimeField(
@@ -185,7 +188,9 @@ export function ProxyRuntimeCard() {
               placeholder={"http://cf-warp-proxy-01:1080\nhttp://cf-warp-proxy-02:1080"}
               className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
             />
-            <p className="text-xs leading-5 text-stone-500">每行一个代理，仅用于账号刷新，按轮询分配。</p>
+            <p className="text-xs leading-5 text-stone-500">
+              每行一个代理，账号刷新始终按轮询使用。出站模式为「代理池」时，生图请求也走此池；池为空则回退到上面的单代理 URL。
+            </p>
           </div>
 
           <div className="space-y-2">

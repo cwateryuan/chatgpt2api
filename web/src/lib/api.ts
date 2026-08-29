@@ -172,7 +172,7 @@ type AccountUpdateResponse = {
   items: Account[];
 };
 
-export type ProxyRuntimeEgressMode = "direct" | "single_proxy";
+export type ProxyRuntimeEgressMode = "direct" | "single_proxy" | "proxy_pool";
 export type ProxyRuntimeClearanceMode = "none" | "manual" | "flaresolverr";
 
 export type ProxyRuntimeClearanceSettings = {
@@ -212,6 +212,13 @@ export type ProxyRuntimeStatus = {
   cached_clearance_hosts: string[];
   account_refresh_proxy_pool_size?: number;
   account_refresh_proxy_index?: number;
+  upstream_proxy_pool?: {
+    size?: number;
+    available?: number;
+    cooling_down?: number;
+    failures?: Record<string, number>;
+    last_latency_ms?: Record<string, number>;
+  };
 };
 
 export type ProxyRuntimeResponse = {

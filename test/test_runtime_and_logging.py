@@ -39,8 +39,8 @@ class RuntimeAndLoggingTests(unittest.TestCase):
 
         fake_redis = FakeRedis()
         state._redis = fake_redis
-        self.assertEqual(state.acquire_image_slot([f"token-{index}" for index in range(300)], 2, 180, probe_limit=128), "")
-        self.assertEqual(len(fake_redis.args) - 5, 128)
+        self.assertEqual(state.acquire_image_slot([f"token-{index}" for index in range(300)], 2, 180, probe_limit=64), "")
+        self.assertEqual(len(fake_redis.args) - 5, 64)
 
         state._redis = None
         first = state.acquire_image_slot(["a", "b"], 2, 180)

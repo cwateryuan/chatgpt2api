@@ -200,11 +200,13 @@ class DatabaseStorageBackend(StorageBackend):
 
     def __init__(self, database_url: str):
         self.database_url = database_url
-        self.engine = create_engine(
-            database_url,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-        )
+        engine_kwargs: dict[str, Any] = {
+            "pool_pre_ping": True,
+            "pool_recycle": 3600,
+        }
+        if str(database_url).startswith("postgres"):
+            engine_kwargs.update(pool_size=20, max_overflow=40, pool_timeout=30)
+        self.engine = create_engine(database_url, **engine_kwargs)
         Base.metadata.create_all(self.engine)
         self._ensure_legacy_schema()
         self.Session = sessionmaker(bind=self.engine)

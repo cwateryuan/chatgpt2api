@@ -179,6 +179,64 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
+    def test_get_available_access_token_skips_remote_check_for_known_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [{"access_token": "token-ready", "status": "正常", "quota": 4, "image_quota_unknown": False}]
+            )
+            fetch_remote_info = Mock(side_effect=AssertionError("remote check should be skipped"))
+            service.fetch_remote_info = fetch_remote_info
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, "token-ready")
+            fetch_remote_info.assert_not_called()
+
+    def test_get_available_access_token_remote_checks_unknown_quota(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [{"access_token": "token-unknown", "status": "正常", "quota": 0, "image_quota_unknown": True}]
+            )
+            fetch_remote_info = Mock(side_effect=lambda access_token, event="fetch_remote_info", **_kwargs: {
+                "access_token": access_token,
+                "status": "正常",
+                "quota": 2,
+                "image_quota_unknown": False,
+            })
+            service.fetch_remote_info = fetch_remote_info
+            token = service.get_available_access_token()
+            service.release_image_slot(token)
+            self.assertEqual(token, "token-unknown")
+            fetch_remote_info.assert_called_once()
+
+    def test_quota_tick_does_not_invalidate_candidate_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [{"access_token": "token-ready", "status": "正常", "quota": 4, "image_quota_unknown": False}]
+            )
+            first = service._list_ready_candidate_tokens()
+            generation = service._candidate_cache_generation
+            service.mark_image_result("token-ready", success=True)
+            second = service._list_ready_candidate_tokens()
+            self.assertEqual(first, ["token-ready"])
+            self.assertEqual(second, ["token-ready"])
+            self.assertEqual(service._candidate_cache_generation, generation)
+            self.assertEqual(service.get_account("token-ready")["quota"], 3)
+
+    def test_quota_exhaustion_invalidates_candidate_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items(
+                [{"access_token": "token-last", "status": "正常", "quota": 1, "image_quota_unknown": False}]
+            )
+            self.assertEqual(service._list_ready_candidate_tokens(), ["token-last"])
+            generation = service._candidate_cache_generation
+            service.mark_image_result("token-last", success=True)
+            self.assertGreater(service._candidate_cache_generation, generation)
+            self.assertEqual(service._list_ready_candidate_tokens(), [])
+
     def test_get_available_access_token_rechecks_full_account_before_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "accounts.db"

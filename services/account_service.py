@@ -37,7 +37,7 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
-    _ACCOUNT_CACHE_TTL_SECONDS = 2.0
+    _ACCOUNT_CACHE_TTL_SECONDS = 15.0
     _UNKNOWN_RESTORE_RECHECK_SECONDS = 60 * 60
     _UNKNOWN_RESTORE_RECHECK_PREFIX = "account:image:unknown-restore-recheck"
     _AUTO_REMOTE_REFRESH_BATCH_SIZE = 100
@@ -56,7 +56,7 @@ class AccountService:
         self.storage = storage_backend
         self.icloud_stats = stats_service
         self._lock = RLock()
-        self._token_refresh_lock = Lock()
+        self._token_refresh_locks: dict[str, Lock] = {}
         self._image_slot_condition = Condition(Lock())
         self._candidate_cache_lock = Lock()
         self._candidate_cache_refresh_lock = Lock()
@@ -209,15 +209,17 @@ class AccountService:
         self.storage.save_accounts(snapshot)
         self._invalidate_candidate_cache()
 
-    def _save_account(self, account: dict) -> None:
+    def _save_account(self, account: dict, *, previous: dict | None = None, invalidate: bool | None = None) -> None:
         if self._database_features_enabled():
             self.storage.upsert_account(dict(account))
+        else:
+            with self._lock:
+                snapshot = [dict(item) for item in self._accounts.values()]
+            self.storage.save_accounts(snapshot)
+        if invalidate is None:
+            invalidate = previous is None or self._candidate_availability_changed(previous, account)
+        if invalidate:
             self._invalidate_candidate_cache()
-            return
-        with self._lock:
-            snapshot = [dict(item) for item in self._accounts.values()]
-        self.storage.save_accounts(snapshot)
-        self._invalidate_candidate_cache()
 
     def _invalidate_candidate_cache(self) -> None:
         with self._candidate_cache_lock:
@@ -228,10 +230,19 @@ class AccountService:
     def _candidate_fields_changed(before: dict[str, Any] | None, after: dict[str, Any] | None) -> bool:
         if not isinstance(before, dict) or not isinstance(after, dict):
             return True
-        return any(
-            before.get(field) != after.get(field)
-            for field in ("status", "type", "source_type", "quota", "image_quota_unknown")
-        )
+        return AccountService._candidate_availability_changed(before, after)
+
+    @staticmethod
+    def _candidate_availability_changed(before: dict[str, Any] | None, after: dict[str, Any] | None) -> bool:
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return True
+        if (
+            before.get("status") != after.get("status")
+            or before.get("type") != after.get("type")
+            or before.get("source_type") != after.get("source_type")
+        ):
+            return True
+        return AccountService._is_image_account_available(before) != AccountService._is_image_account_available(after)
 
     @staticmethod
     def _candidate_cache_enabled() -> bool:
@@ -242,19 +253,42 @@ class AccountService:
     def _image_slot_probe_limit(candidate_count: int) -> int:
         """Read the bounded Redis probe size; zero restores legacy full probing."""
         try:
-            value = int(str(os.getenv("APP_IMAGE_SLOT_PROBE_LIMIT") or "128").strip())
+            value = int(str(os.getenv("APP_IMAGE_SLOT_PROBE_LIMIT") or "64").strip())
         except (TypeError, ValueError):
-            value = 128
+            value = 64
         return max(0, value) if candidate_count else 0
 
-    def _account_update_lock(self, access_token: str) -> Lock:
+    @staticmethod
+    def _image_select_max_attempts() -> int:
+        try:
+            value = int(str(os.getenv("APP_IMAGE_SELECT_MAX_ATTEMPTS") or "3").strip())
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, value)
+
+    @staticmethod
+    def _needs_selection_remote_check(account: dict) -> bool:
+        force = str(os.getenv("APP_IMAGE_SELECT_REMOTE_CHECK") or "").strip().lower()
+        if force in {"1", "true", "yes", "on"}:
+            return True
+        if force in {"0", "false", "no", "off"}:
+            return False
+        return bool(account.get("image_quota_unknown"))
+
+    def _named_lock(self, locks: dict[str, Lock], access_token: str) -> Lock:
         token = str(access_token or "").strip()
         with self._lock:
-            lock = self._account_update_locks.get(token)
+            lock = locks.get(token)
             if lock is None:
                 lock = Lock()
-                self._account_update_locks[token] = lock
+                locks[token] = lock
             return lock
+
+    def _account_update_lock(self, access_token: str) -> Lock:
+        return self._named_lock(self._account_update_locks, access_token)
+
+    def _token_refresh_lock_for(self, access_token: str) -> Lock:
+        return self._named_lock(self._token_refresh_locks, access_token)
 
     def _delete_account_tokens(self, tokens: list[str] | set[str]) -> int:
         cleaned = [str(token or "").strip() for token in tokens if str(token or "").strip()]
@@ -642,7 +676,7 @@ class AccountService:
                 self.storage.delete_account_tokens([old_token])
         with self._lock:
             self._accounts[new_token] = account
-        self._save_account(account)
+        self._save_account(account, previous=current, invalidate=rotated)
         with self._image_slot_condition:
             self._image_slot_condition.notify_all()
 
@@ -656,7 +690,7 @@ class AccountService:
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token", refresh_proxy: str = "") -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        with self._token_refresh_lock_for(access_token):
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
@@ -1377,15 +1411,17 @@ class AccountService:
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
-        基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
-        限制最大尝试次数防止 token rotation 导致无限循环。
+        本地号池已标明可用时直接占槽返回，不再在选号热路径上同步打上游预检。
+        额度未知或本地记录不可信时才走 fetch_remote_info。失败后最多换号几次，
+        避免 200 并发把选号放大成串行远程排队。
         """
-        max_attempts = 20  # 防止无限循环
+        max_attempts = self._image_select_max_attempts()
         attempted_tokens = {
             str(token or "").strip()
             for token in (excluded_tokens or set())
             if str(token or "").strip()
         }
+        remote_failures = 0
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1398,7 +1434,7 @@ class AccountService:
             # Candidate selection uses indexed database columns. Re-check the
             # complete record before any upstream request in case legacy data
             # or another worker left those columns out of sync with row.data.
-            stored_account = self.get_account(access_token)
+            stored_account = self.get_account(access_token, fresh=False)
             if (
                     not self._is_image_account_available(stored_account or {})
                     or not self._account_matches_plan_type(stored_account or {}, plan_type)
@@ -1407,6 +1443,13 @@ class AccountService:
             ):
                 self.release_image_slot(access_token)
                 continue
+            if not self._needs_selection_remote_check(stored_account or {}):
+                logger.debug({
+                    "event": "image_account_local_select",
+                    "remote_failures": remote_failures,
+                    "attempted": len(attempted_tokens),
+                })
+                return access_token
             try:
                 account = self.fetch_remote_info(
                     access_token,
@@ -1415,6 +1458,7 @@ class AccountService:
                     request_proxy=request_proxy,
                 )
             except Exception:
+                remote_failures += 1
                 self.release_image_slot(access_token)
                 continue
             # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
@@ -1429,6 +1473,7 @@ class AccountService:
                     and self._account_matches_source_type(account or {}, source_type)
             ):
                 return str((account or {}).get("access_token") or access_token)
+            remote_failures += 1
             self.release_image_slot(access_token)
         raise RuntimeError(
             f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
@@ -1464,7 +1509,7 @@ class AccountService:
             if account is None:
                 return
             self._accounts[access_token] = account
-            self._save_account(account)
+            self._save_account(account, previous=current)
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
@@ -1478,7 +1523,7 @@ class AccountService:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
         return removed
 
-    def get_account(self, access_token: str) -> dict | None:
+    def get_account(self, access_token: str, *, fresh: bool = True) -> dict | None:
         if not access_token:
             return None
         raw_token = str(access_token).strip()
@@ -1494,6 +1539,8 @@ class AccountService:
             cached = dict(cached_item) if isinstance(cached_item, dict) else None
 
         if not self._database_features_enabled():
+            return cached
+        if not fresh and cached:
             return cached
 
         had_error = False
@@ -1762,6 +1809,7 @@ class AccountService:
                 account = self._normalize_account({**current, **updates, "access_token": resolved})
                 if account is None:
                     return None
+                candidate_changed = self._candidate_fields_changed(current, account)
 
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 with self._lock:
@@ -1774,8 +1822,8 @@ class AccountService:
             with self._lock:
                 self._accounts[resolved] = account
             if not self._database_features_enabled():
-                self._save_account(account)
-            elif candidate_changed:
+                self._save_account(account, previous=current, invalidate=False)
+            if candidate_changed:
                 self._invalidate_candidate_cache()
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
@@ -1852,7 +1900,7 @@ class AccountService:
                 if account is not None:
                     with self._lock:
                         self._accounts[resolved] = account
-                    self._save_account(account)
+                    self._save_account(account, previous=current)
             if account is not None:
                 with self._lock:
                     self._accounts[resolved] = account
@@ -1926,6 +1974,7 @@ class AccountService:
                 account = apply_result(current)
                 if account is None:
                     return None
+                candidate_changed = self._candidate_fields_changed(current, account)
 
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 with self._lock:
@@ -1938,8 +1987,8 @@ class AccountService:
             with self._lock:
                 self._accounts[resolved] = account
             if not self._database_features_enabled():
-                self._save_account(account)
-            elif candidate_changed:
+                self._save_account(account, previous=current, invalidate=False)
+            if candidate_changed:
                 self._invalidate_candidate_cache()
             return dict(account)
 

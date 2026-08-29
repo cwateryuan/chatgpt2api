@@ -135,9 +135,9 @@ _PREFLIGHT_ACTIVE = 0
 
 def _preflight_worker_limit() -> int:
     try:
-        return max(3, int(str(os.getenv("APP_IMAGE_PREFLIGHT_WORKERS") or "64").strip()))
+        return max(3, int(str(os.getenv("APP_IMAGE_PREFLIGHT_WORKERS") or "128").strip()))
     except (TypeError, ValueError):
-        return 64
+        return 128
 
 
 def _preflight_executor() -> ThreadPoolExecutor:
