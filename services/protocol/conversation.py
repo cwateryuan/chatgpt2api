@@ -25,6 +25,7 @@ from services.image_failure import (
     classify_task_failure,
     image_failure,
     image_failure_priority,
+    is_auth_invalid_error,
     merge_message_failure,
     public_image_error_message,
 )
@@ -46,13 +47,7 @@ from utils.log import logger
 
 
 def is_token_invalid_error(message: str) -> bool:
-    text = str(message or "").lower()
-    return (
-        "token_invalidated" in text
-        or "token_revoked" in text
-        or "authentication token has been invalidated" in text
-        or "invalidated oauth token" in text
-    )
+    return is_auth_invalid_error(message)
 
 
 def is_tls_connection_error(message: str) -> bool:
@@ -1577,12 +1572,15 @@ def _generate_single_image(
     MAX_POLL_TIMEOUT_RETRIES = 4
     # 文件上传额度耗尽时换账号重试次数（首次账号不计入）。
     MAX_FILE_UPLOAD_THROTTLE_RETRIES = 4
+    # 过期 token / 免费额度耗尽时换账号重试次数（首次账号不计入）。
+    MAX_ACCOUNT_SWITCH_RETRIES = 4
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     file_upload_throttle_retry_count = 0
+    account_switch_retry_count = 0
     excluded_tokens: set[str] = set()
     last_file_upload_throttle: UpstreamHTTPError | None = None
     account_email = ""
@@ -1781,13 +1779,41 @@ def _generate_single_image(
                 account_service.mark_image_result(
                     token,
                     False,
-                    rate_limit_429=failure.status_code == 429,
+                    rate_limit_429=failure.status_code == 429 and failure.code != "image_quota_exhausted",
+                    quota_exhausted=failure.code == "image_quota_exhausted",
                 )
             else:
                 account_service.release_image_slot(token)
             slot_released = True
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
+            if not emitted_for_token and failure.code in {"auth_invalid", "image_quota_exhausted"}:
+                if deadline.remaining() <= 0:
+                    raise image_timeout_error(
+                        deadline,
+                        account_email=account_email,
+                        conversation_id=getattr(exc, "conversation_id", ""),
+                    ) from exc
+                excluded_tokens.add(token)
+                if failure.code == "auth_invalid":
+                    refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
+                    if refreshed_token and refreshed_token != token:
+                        excluded_tokens.add(refreshed_token)
+                        token = refreshed_token
+                        continue
+                    account_service.remove_invalid_token(token, "image_stream")
+                    continue
+                account_switch_retry_count += 1
+                if account_switch_retry_count <= MAX_ACCOUNT_SWITCH_RETRIES:
+                    logger.warning({
+                        "event": "image_quota_exhausted_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": account_switch_retry_count,
+                        "index": index,
+                        "error": error_text[:200],
+                    })
+                    continue
             # 如果是模型返回文本而非图片，尝试换账号重试
             if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
                 if deadline.remaining() <= 0:
@@ -1847,7 +1873,12 @@ def _generate_single_image(
                     latency_ms=(time.monotonic() - proxy_started_at) * 1000.0,
                 )
             if failure.account_failure and not proxy_network_failure:
-                account_service.mark_image_result(token, False, rate_limit_429=failure.status_code == 429)
+                account_service.mark_image_result(
+                    token,
+                    False,
+                    rate_limit_429=failure.status_code == 429 and failure.code != "image_quota_exhausted",
+                    quota_exhausted=failure.code == "image_quota_exhausted",
+                )
             else:
                 account_service.release_image_slot(token)
             slot_released = True
@@ -1887,14 +1918,20 @@ def _generate_single_image(
                     raw_upstream_message=failure.public_detail,
                 ) from exc
             if deadline.remaining() <= 0:
-                account_service.mark_image_result(token, False, rate_limit_429=failure.status_code == 429)
+                account_service.mark_image_result(
+                    token,
+                    False,
+                    rate_limit_429=failure.status_code == 429 and failure.code != "image_quota_exhausted",
+                    quota_exhausted=failure.code == "image_quota_exhausted",
+                )
                 slot_released = True
                 raise image_timeout_error(deadline, account_email=account_email) from exc
             if not proxy_network_failure and (failure.account_failure or failure.scope != "delivery"):
                 account_service.mark_image_result(
                     token,
                     False,
-                    rate_limit_429=failure.status_code == 429,
+                    rate_limit_429=failure.status_code == 429 and failure.code != "image_quota_exhausted",
+                    quota_exhausted=failure.code == "image_quota_exhausted",
                 )
             else:
                 account_service.release_image_slot(token)
@@ -1907,6 +1944,19 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if not emitted_for_token and failure.code == "image_quota_exhausted":
+                excluded_tokens.add(token)
+                account_switch_retry_count += 1
+                if account_switch_retry_count <= MAX_ACCOUNT_SWITCH_RETRIES:
+                    logger.warning({
+                        "event": "image_quota_exhausted_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": account_switch_retry_count,
+                        "index": index,
+                        "error": last_error[:200],
+                    })
+                    continue
             if not emitted_for_token and is_file_upload_throttled_error(exc):
                 last_file_upload_throttle = exc
                 excluded_tokens.add(token)

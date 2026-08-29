@@ -13,6 +13,7 @@ from services.protocol.conversation import (
     format_image_result,
     is_http2_stream_error,
 )
+from services.image_failure import classify_image_exception
 from services.image_timeout import ImageRequestDeadline
 from utils.helper import UpstreamHTTPError
 
@@ -46,11 +47,20 @@ class FakeAccountService:
     def release_image_slot(self, token):
         self.released.append(token)
 
-    def mark_image_result(self, token, success, *, rate_limit_429=False):
+    def mark_image_result(self, token, success, *, rate_limit_429=False, quota_exhausted=False):
         self.marked.append((token, success))
         if rate_limit_429:
             self.rate_limited.append(token)
+        if quota_exhausted:
+            self.rate_limited.append(token)
         self.release_image_slot(token)
+
+    def refresh_access_token(self, token, force=False, event=""):
+        return ""
+
+    def remove_invalid_token(self, token, event, quiet=False):
+        self.released.append(token)
+        return True
 
 
 class ExpiringAfterStartDeadline:
@@ -207,6 +217,90 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(raised.exception.code, "image_generation_timeout")
+
+    def test_expired_token_retries_with_another_account(self):
+        service = FakeAccountService()
+        calls = {"count": 0}
+
+        def fake_stream(_backend, _request, index, total):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise UpstreamHTTPError(
+                    "/backend-api/files",
+                    401,
+                    {
+                        "error": {
+                            "message": "Provided authentication token is expired. Please try signing in again.",
+                            "code": "token_expired",
+                        },
+                        "status": 401,
+                        "detail": {
+                            "code": "token_expired",
+                            "message": "Provided authentication token is expired. Please try signing in again.",
+                        },
+                    },
+                )
+            yield ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=index,
+                total=total,
+                data=[{"url": "http://app.test/image.png"}],
+            )
+
+        with (
+            mock.patch("services.protocol.conversation.account_service", service),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend_class,
+            mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            mock.patch("services.protocol.conversation.trim_memory", lambda *_args, **_kwargs: None),
+        ):
+            backend_class.return_value.close.return_value = None
+            outputs = _generate_single_image(ConversationRequest(prompt="edit", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual(outputs[0].data[0]["url"], "http://app.test/image.png")
+        self.assertEqual(calls["count"], 2)
+        self.assertIn(("token-1", False), service.marked)
+        self.assertIn(("token-2", True), service.marked)
+        self.assertEqual(service.excluded_snapshots, [set(), {"token-1"}])
+
+    def test_free_plan_limit_retries_with_another_account(self):
+        service = FakeAccountService()
+        calls = {"count": 0}
+        limit_message = (
+            "You've hit the Free plan limit for image generations requests. "
+            "You can create more images when the limit resets in 5 hours and 5 minutes."
+        )
+
+        def fake_stream(_backend, _request, index, total):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise ImageGenerationError(
+                    limit_message,
+                    failure=classify_image_exception(RuntimeError(limit_message)),
+                )
+            yield ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=index,
+                total=total,
+                data=[{"url": "http://app.test/image.png"}],
+            )
+
+        with (
+            mock.patch("services.protocol.conversation.account_service", service),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend_class,
+            mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            mock.patch("services.protocol.conversation.trim_memory", lambda *_args, **_kwargs: None),
+        ):
+            backend_class.return_value.close.return_value = None
+            outputs = _generate_single_image(ConversationRequest(prompt="draw", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual(outputs[0].data[0]["url"], "http://app.test/image.png")
+        self.assertEqual(calls["count"], 2)
+        self.assertIn(("token-1", False), service.marked)
+        self.assertIn(("token-2", True), service.marked)
+        self.assertEqual(service.rate_limited, ["token-1"])
+        self.assertEqual(service.excluded_snapshots, [set(), {"token-1"}])
 
     def test_http2_stream_error_is_not_retried(self):
         service = FakeAccountService()

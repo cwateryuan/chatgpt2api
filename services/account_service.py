@@ -1920,6 +1920,7 @@ class AccountService:
         success: bool,
         *,
         rate_limit_429: bool = False,
+        quota_exhausted: bool = False,
     ) -> dict | None:
         if not access_token:
             return None
@@ -1948,6 +1949,10 @@ class AccountService:
                     next_item["fail"] = int(next_item.get("fail") or 0) + 1
                     if rate_limit_429:
                         next_item["rate_limit_429"] = int(next_item.get("rate_limit_429") or 0) + 1
+                    if quota_exhausted:
+                        next_item["quota"] = 0
+                        next_item["image_quota_unknown"] = False
+                        next_item["status"] = "限流"
                 return self._normalize_account(next_item)
 
             if self._database_features_enabled():

@@ -52,6 +52,33 @@ class ImageFailureTests(unittest.TestCase):
         self.assertTrue(rate_failure.account_failure)
         self.assertTrue(server_failure.switch_account)
 
+    def test_expired_upload_token_is_auth_invalid(self) -> None:
+        exc = UpstreamHTTPError(
+            "/backend-api/files",
+            401,
+            {
+                "error": {
+                    "message": "Provided authentication token is expired. Please try signing in again.",
+                    "code": "token_expired",
+                }
+            },
+        )
+        failure = classify_image_exception(exc)
+        self.assertEqual(failure.code, "auth_invalid")
+        self.assertTrue(failure.switch_account)
+        self.assertTrue(failure.account_failure)
+
+    def test_free_plan_limit_text_is_quota_exhausted(self) -> None:
+        message = (
+            "You've hit the Free plan limit for image generations requests. "
+            "You can create more images when the limit resets in 5 hours and 5 minutes."
+        )
+        failure = classify_image_exception(RuntimeError(message))
+        self.assertEqual(failure.code, "image_quota_exhausted")
+        self.assertTrue(failure.switch_account)
+        self.assertTrue(failure.account_failure)
+        self.assertEqual(failure.status_code, 429)
+
     def test_assistant_terminal_text_and_tool_parameter_are_distinct(self) -> None:
         assistant = classify_message_facts(
             role="assistant",

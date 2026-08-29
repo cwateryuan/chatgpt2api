@@ -117,6 +117,7 @@ FAILURE_CODE_ALIASES = {
     "token_invalid": "auth_invalid",
     "token_invalidated": "auth_invalid",
     "token_revoked": "auth_invalid",
+    "token_expired": "auth_invalid",
     "unsupported_image_model": "unsupported_model",
     "upstream_timeout": "image_poll_timeout",
     "throttled": "file_upload_throttled",
@@ -138,6 +139,25 @@ _REFERENCE_TERMS = (
     "需要参考图片",
     "没有收到参考图",
     "请求没有收到参考图",
+)
+_QUOTA_EXHAUSTED_TERMS = (
+    "you've hit the free plan limit",
+    "you have hit the free plan limit",
+    "hit the free plan limit",
+    "free plan limit for image generations",
+    "limit for image generations requests",
+)
+_AUTH_INVALID_TERMS = (
+    "token_expired",
+    "token expired",
+    "token_invalidated",
+    "token invalidated",
+    "token_revoked",
+    "token revoked",
+    "authentication token is expired",
+    "authentication token has been invalidated",
+    "provided authentication token is expired",
+    "invalidated oauth token",
 )
 
 
@@ -260,6 +280,16 @@ def _message_text(message: Mapping[str, Any]) -> str:
     return "\n".join(values)
 
 
+def _quota_exhausted_text(text: Any) -> bool:
+    normalized = str(text or "").strip().lower()
+    return bool(normalized) and any(term in normalized for term in _QUOTA_EXHAUSTED_TERMS)
+
+
+def is_auth_invalid_error(text: Any) -> bool:
+    normalized = str(text or "").strip().lower()
+    return bool(normalized) and any(term in normalized for term in _AUTH_INVALID_TERMS)
+
+
 def _reference_required(text: Any, codes: Any = ()) -> bool:
     candidates = {str(code or "").strip().lower() for code in codes}
     if "reference_image_required" in candidates:
@@ -274,7 +304,7 @@ def _failure_from_codes(codes: Any, *, raw_detail: Any = None, param: str | None
         return image_failure("invalid_image_input", raw_detail=raw_detail, response_code="reference_image_required", param=param or "image")
     if normalized.intersection({"content_policy_violation", "moderation_blocked", "safety_blocked"}):
         return image_failure("content_policy_violation", raw_detail=raw_detail)
-    if normalized.intersection({"invalid_access_token", "token_invalid", "token_invalidated", "token_revoked"}):
+    if normalized.intersection({"invalid_access_token", "token_invalid", "token_invalidated", "token_revoked", "token_expired"}):
         return image_failure("auth_invalid", raw_detail=raw_detail)
     if normalized.intersection({"insufficient_quota", "quota_exhausted", "image_quota_exhausted"}):
         return image_failure("image_quota_exhausted", raw_detail=raw_detail)
@@ -305,8 +335,10 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
         if failure is None or failure.status_code != 400:
             failure = image_failure("invalid_image_input", raw_detail=body, param=param)
         return failure.with_public_detail(raw_message)
-    if status == 401:
+    if status == 401 or is_auth_invalid_error(raw_message):
         return image_failure("auth_invalid", raw_detail=body)
+    if _quota_exhausted_text(raw_message):
+        return image_failure("image_quota_exhausted", raw_detail=body)
     if status == 429:
         code = "file_upload_throttled" if "file" in context and "upload" in context else "upstream_rate_limited"
         return image_failure(code, retry_after=getattr(exc, "retry_after", None), raw_detail=body)
@@ -336,6 +368,10 @@ def classify_message_facts(
     text = str(raw_detail or "")
     if _reference_required(text, codes):
         return image_failure("invalid_image_input", raw_detail=raw_detail, response_code="reference_image_required", param=param or "image").with_public_detail(raw_detail)
+    if _quota_exhausted_text(text):
+        return image_failure("image_quota_exhausted", raw_detail=raw_detail).with_public_detail(raw_detail)
+    if is_auth_invalid_error(text):
+        return image_failure("auth_invalid", raw_detail=raw_detail)
     if blocked:
         return image_failure("content_policy_violation", raw_detail=raw_detail)
     structured = _failure_from_codes(codes, raw_detail=raw_detail, param=param)
@@ -459,6 +495,10 @@ def classify_image_exception(exc: BaseException, *, code: str | None = None) -> 
             failure = image_failure("upstream_connection_timeout", raw_detail=str(exc))
         elif isinstance(exc, (ConnectionError, curl_requests.exceptions.RequestException)):
             failure = image_failure("upstream_connection_failed", raw_detail=str(exc))
+        elif _quota_exhausted_text(exc):
+            failure = image_failure("image_quota_exhausted", raw_detail=str(exc)).with_public_detail(str(exc))
+        elif is_auth_invalid_error(exc):
+            failure = image_failure("auth_invalid", raw_detail=str(exc))
         else:
             failure = image_failure("internal_error", raw_detail=str(exc))
     try:
