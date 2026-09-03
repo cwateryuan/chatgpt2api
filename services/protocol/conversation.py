@@ -1787,7 +1787,7 @@ def _generate_single_image(
             slot_released = True
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
-            if not emitted_for_token and failure.code in {"auth_invalid", "image_quota_exhausted"}:
+            if not returned_result and not returned_message and failure.code in {"auth_invalid", "image_quota_exhausted"}:
                 if deadline.remaining() <= 0:
                     raise image_timeout_error(
                         deadline,
@@ -1882,7 +1882,7 @@ def _generate_single_image(
             else:
                 account_service.release_image_slot(token)
             slot_released = True
-            if not emitted_for_token and failure.code == "image_quota_exhausted":
+            if not returned_result and not returned_message and failure.code == "image_quota_exhausted":
                 if deadline.remaining() <= 0:
                     raise image_timeout_error(
                         deadline,
@@ -1963,7 +1963,7 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
-            if not emitted_for_token and failure.code == "image_quota_exhausted":
+            if not returned_result and not returned_message and failure.code == "image_quota_exhausted":
                 excluded_tokens.add(token)
                 account_switch_retry_count += 1
                 if account_switch_retry_count <= MAX_ACCOUNT_SWITCH_RETRIES:

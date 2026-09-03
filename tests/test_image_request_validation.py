@@ -86,6 +86,12 @@ class ImageRequestConcurrencyTests(unittest.TestCase):
             nonlocal stream_calls
             stream_calls += 1
             if stream_calls == 1:
+                yield conversation.ImageOutput(
+                    kind="progress",
+                    model="gpt-image-2",
+                    index=1,
+                    total=1,
+                )
                 raise ImageFailureError(
                     "free plan exhausted",
                     failure=image_failure("image_quota_exhausted", raw_detail="free plan exhausted"),
