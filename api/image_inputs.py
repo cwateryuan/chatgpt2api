@@ -23,6 +23,7 @@ from services.protocol.error_response import error_message_from_detail
 ImageInput = tuple[bytes, str, str]
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_COUNT = 10
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
@@ -82,8 +83,11 @@ def _parse_count(value: object) -> int:
         count = int(value or 1)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if count < 1 or count > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
+    if count < 1 or count > MAX_IMAGE_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"n must be between 1 and {MAX_IMAGE_COUNT}"},
+        )
     return count
 
 

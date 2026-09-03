@@ -5,7 +5,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.image_inputs import ImageInputError, parse_image_edit_request, read_image_sources_with_diagnostics
+from api.image_inputs import (
+    MAX_IMAGE_COUNT,
+    ImageInputError,
+    parse_image_edit_request,
+    read_image_sources_with_diagnostics,
+)
 from api.support import require_identity, resolve_client_ip, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
 from services.editable_file_task_service import editable_file_task_service
@@ -25,7 +30,7 @@ from services.protocol import (
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
-    n: int = Field(default=1, ge=1, le=4)
+    n: int = Field(default=1, ge=1, le=MAX_IMAGE_COUNT)
     size: str | None = None
     quality: str = "auto"
     response_format: str = "b64_json"
