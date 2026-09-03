@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from api.ai import ImageGenerationRequest
 from api.image_inputs import MAX_IMAGE_COUNT, _parse_count
 from services.protocol import conversation
+from services.image_failure import ImageFailureError, image_failure
 
 
 class ImageRequestValidationTests(unittest.TestCase):
@@ -71,6 +72,49 @@ class ImageRequestConcurrencyTests(unittest.TestCase):
         self.assertEqual(sorted(index for index, _total in calls), list(range(1, 11)))
         self.assertEqual({total for _index, total in calls}, {10})
         self.assertEqual(sorted(output.index for output in outputs), list(range(1, 11)))
+
+    def test_quota_failure_from_poll_switches_account_before_returning_429(self) -> None:
+        selected_tokens: list[str] = []
+        stream_calls = 0
+
+        def select_account(*args, **kwargs):
+            token = ("token-1", "token-2")[len(selected_tokens)]
+            selected_tokens.append(token)
+            return token
+
+        def stream_images(*args, **kwargs):
+            nonlocal stream_calls
+            stream_calls += 1
+            if stream_calls == 1:
+                raise ImageFailureError(
+                    "free plan exhausted",
+                    failure=image_failure("image_quota_exhausted", raw_detail="free plan exhausted"),
+                )
+            yield conversation.ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                data=[{"b64_json": "image"}],
+            )
+
+        request = conversation.ConversationRequest(model="gpt-image-2", prompt="test", n=1)
+        with (
+            patch.object(conversation.proxy_settings, "next_upstream_proxy", return_value=""),
+            patch.object(conversation.account_service, "get_available_access_token", side_effect=select_account),
+            patch.object(conversation.account_service, "get_account", return_value={"email": "test@example.com"}),
+            patch.object(conversation.account_service, "mark_image_result"),
+            patch.object(conversation.account_service, "release_image_slot"),
+            patch.object(conversation, "OpenAIBackendAPI"),
+            patch.object(conversation, "stream_image_outputs", side_effect=stream_images),
+            patch.object(conversation, "is_supported_image_model", return_value=True),
+        ):
+            outputs = conversation._generate_single_image(request, 1, 1)
+
+        self.assertEqual(selected_tokens, ["token-1", "token-2"])
+        self.assertEqual(stream_calls, 2)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0].kind, "result")
 
 
 if __name__ == "__main__":

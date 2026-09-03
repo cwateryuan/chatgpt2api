@@ -1882,6 +1882,25 @@ def _generate_single_image(
             else:
                 account_service.release_image_slot(token)
             slot_released = True
+            if not emitted_for_token and failure.code == "image_quota_exhausted":
+                if deadline.remaining() <= 0:
+                    raise image_timeout_error(
+                        deadline,
+                        account_email=account_email,
+                        conversation_id=getattr(exc, "conversation_id", ""),
+                    ) from exc
+                excluded_tokens.add(token)
+                account_switch_retry_count += 1
+                if account_switch_retry_count <= MAX_ACCOUNT_SWITCH_RETRIES:
+                    logger.warning({
+                        "event": "image_quota_exhausted_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": account_switch_retry_count,
+                        "index": index,
+                        "error": error_text[:200],
+                    })
+                    continue
             raise ImageGenerationError(
                 str(exc) or public_image_error_message(failure, exc),
                 failure=failure,
