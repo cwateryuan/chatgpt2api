@@ -17,8 +17,10 @@ from utils.log import logger
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 WEB_IMAGE_MODEL_SLUGS = {
     "gpt-image-2": "gpt-5-3",
+    "gpt-image-2.5": "gpt-image-2.5",
     "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare": "gpt-image-2.5-flare",
+    "gpt-image-3.0": "gpt-image-3.0",
 }
 WEB_IMAGE_MODELS = set(WEB_IMAGE_MODEL_SLUGS)
 BASE_IMAGE_MODELS = WEB_IMAGE_MODELS | {CODEX_IMAGE_MODEL}
