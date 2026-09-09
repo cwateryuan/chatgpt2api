@@ -35,7 +35,14 @@ from services.image_failure import (
 )
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import (
+    UpstreamHTTPError,
+    WEB_IMAGE_MODEL_SLUGS,
+    ensure_ok,
+    iter_sse_payloads,
+    new_uuid,
+    split_image_model,
+)
 from utils.log import logger
 from utils.pow import (
     build_legacy_requirements_token,
@@ -718,8 +725,8 @@ class OpenAIBackendAPI:
         _, base_model = split_image_model(model)
         if not base_model:
             return "auto"
-        if base_model == "gpt-image-2":
-            return "gpt-5-3"
+        if base_model in WEB_IMAGE_MODEL_SLUGS:
+            return WEB_IMAGE_MODEL_SLUGS[base_model]
         if base_model == CODEX_IMAGE_MODEL:
             return base_model
         return "auto"

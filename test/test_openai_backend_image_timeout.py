@@ -147,6 +147,14 @@ class OpenAIBackendImageTimeoutTests(unittest.TestCase):
         self.assertEqual(backend.session.headers["OAI-Device-Id"], "browser-device-id")
         self.assertEqual(backend.session.headers["User-Agent"], "Registered Chrome UA")
 
+    def test_image_model_slug_maps_web_image_models(self):
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-3")
+        self.assertEqual(backend._image_model_slug("gpt-image-2.5-sunburst"), "gpt-image-2.5-sunburst")
+        self.assertEqual(backend._image_model_slug("gpt-image-2.5-flare"), "gpt-image-2.5-flare")
+        self.assertEqual(backend._image_model_slug("codex-gpt-image-2"), "codex-gpt-image-2")
+        self.assertEqual(backend._image_model_slug("unknown"), "auto")
+
 
 if __name__ == "__main__":
     unittest.main()

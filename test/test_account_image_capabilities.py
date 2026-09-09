@@ -153,6 +153,8 @@ class AccountCapabilityTests(unittest.TestCase):
 
     def test_split_image_model_supports_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))
+        self.assertEqual(split_image_model("gpt-image-2.5-sunburst"), (None, "gpt-image-2.5-sunburst"))
+        self.assertEqual(split_image_model("gpt-image-2.5-flare"), (None, "gpt-image-2.5-flare"))
         self.assertEqual(split_image_model("plus-codex-gpt-image-2"), ("plus", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("team-codex-gpt-image-2"), ("team", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("pro-codex-gpt-image-2"), ("pro", "codex-gpt-image-2"))
