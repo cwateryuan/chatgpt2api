@@ -537,7 +537,7 @@ class ConfigStore:
             latest_value = _normalize_bool(latest_data.get("image_stream_recovery_enabled"), True)
             return incoming_value == previous_value and incoming_value != latest_value
         if key == "image_account_cooldown_minutes":
-            return int(value) == int(previous_data.get(key, 60)) and int(value) != int(latest_data.get(key, 60))
+            return int(value) == int(previous_data.get(key, 30)) and int(value) != int(latest_data.get(key, 30))
         return previous_data.get(key) == value and latest_data.get(key) != previous_data.get(key)
 
     def _drop_stale_update_values(
@@ -637,9 +637,9 @@ class ConfigStore:
     @property
     def image_account_cooldown_minutes(self) -> int:
         try:
-            return max(0, int(self.data.get("image_account_cooldown_minutes", 60)))
+            return max(0, int(self.data.get("image_account_cooldown_minutes", 30)))
         except (TypeError, ValueError, OverflowError):
-            return 60
+            return 30
 
     @property
     def image_parallel_generation(self) -> bool:

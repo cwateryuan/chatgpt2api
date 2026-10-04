@@ -308,8 +308,9 @@ class ImageCooldownTests(unittest.TestCase):
         path = self.root / "config.json"
         path.write_text("{}", encoding="utf-8")
         a, b = ConfigStore(path), ConfigStore(path)
-        self.assertEqual(a.image_account_cooldown_minutes, 60)
+        self.assertEqual(a.image_account_cooldown_minutes, 30)
         a.update({"image_account_cooldown_minutes": 30})
+        b.data["image_account_cooldown_minutes"] = 60  # 模拟升级前仍缓存旧默认值的工作进程
         b.update({"image_account_cooldown_minutes": 60, "base_url": "https://example.com"})
         self.assertEqual(json.loads(path.read_text())["image_account_cooldown_minutes"], 30)
         for value in (-1, 1.5, True, None, "abc"):

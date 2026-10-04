@@ -302,7 +302,7 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
         self.assertEqual(service.rate_limited, ["token-1"])
         self.assertEqual(service.excluded_snapshots, [set(), {"token-1"}])
 
-    def test_http2_stream_error_is_not_retried(self):
+    def test_http2_stream_error_retries_with_another_account(self):
         service = FakeAccountService()
         calls = {"count": 0}
 
@@ -321,11 +321,40 @@ class ImageMemoryOptimizationTests(unittest.TestCase):
             with self.assertRaises(ImageGenerationError) as raised:
                 _generate_single_image(ConversationRequest(prompt="draw", model="gpt-image-2"), 1, 1)
 
-        self.assertEqual(calls["count"], 1)
+        self.assertEqual(calls["count"], 2)
         self.assertIn(("token-1", False), service.marked)
+        self.assertIn(("token-2", False), service.marked)
         self.assertIn("token-1", service.released)
         self.assertIn("upstream image stream failed", str(raised.exception))
         self.assertTrue(is_http2_stream_error(str(raised.exception.__cause__)))
+
+    def test_http_400_is_returned_without_retry(self):
+        service = FakeAccountService()
+        calls = {"count": 0}
+
+        def fake_stream(_backend, _request, _index, _total):
+            calls["count"] += 1
+            raise UpstreamHTTPError(
+                "/backend-api/f/conversation",
+                400,
+                {"error": {"message": "invalid image request"}},
+            )
+            yield
+
+        with (
+            mock.patch("services.protocol.conversation.account_service", service),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend_class,
+            mock.patch("services.protocol.conversation.stream_image_outputs", fake_stream),
+            mock.patch("services.protocol.conversation.trim_memory", lambda *_args, **_kwargs: None),
+        ):
+            backend_class.return_value.close.return_value = None
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_single_image(ConversationRequest(prompt="draw", model="gpt-image-2"), 1, 1)
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(service.marked, [])
+        self.assertIn("token-1", service.released)
 
     def test_expired_deadline_converts_curl_timeout_to_image_generation_timeout(self):
         service = FakeAccountService()
