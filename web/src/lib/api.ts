@@ -91,6 +91,7 @@ export type ImageCooldownMetrics = {
   cooling_accounts: number;
   thawing_within_hour: number;
   next_thaw_at: number | null;
+  cooldown_minutes: number;
   as_of: number;
 };
 
@@ -486,6 +487,12 @@ export async function fetchAccounts() {
 
 export async function fetchImageCooldownMetrics() {
   return httpRequest<ImageCooldownMetrics>("/api/accounts/image-cooldown-metrics");
+}
+
+export async function clearImageCooldown() {
+  return httpRequest<ImageCooldownMetrics & { cleared: number }>("/api/accounts/image-cooldown/clear", {
+    method: "POST",
+  });
 }
 
 export type AccountAutoRefreshSettings = {

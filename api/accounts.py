@@ -235,6 +235,14 @@ def create_router() -> APIRouter:
         except ImageSchedulingUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "1"}) from exc
 
+    @router.post("/api/accounts/image-cooldown/clear")
+    async def clear_image_cooldowns(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(account_service.clear_image_cooldowns)
+        except ImageSchedulingUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "1"}) from exc
+
     @router.get("/api/accounts/auto-refresh")
     async def get_account_auto_refresh(authorization: str | None = Header(default=None)):
         require_admin(authorization)

@@ -137,7 +137,7 @@ class ImageCooldownTests(unittest.TestCase):
             payload = client.get("/health?format=json").json()
             self.assertNotIn("cooling_accounts", payload["accounts"])
             html = client.get("/health").text
-            self.assertIn("未来 1 小时内冷却结束", html)
+            self.assertIn("60分钟内解冻", html)
             self.assertIn("document.hidden", html)
 
     def test_success_is_persisted_before_release_and_survives_restart(self):
@@ -198,6 +198,46 @@ class ImageCooldownTests(unittest.TestCase):
         with self.assertRaises(ImageSchedulingUnavailable):
             service.get_available_access_token()
 
+    def test_cooldown_recalculation_uses_success_time_for_both_backends(self):
+        for database in (True, False):
+            with self.subTest(database=database), patch.dict(config.data, {"image_account_cooldown_minutes": 10}):
+                service = self.build([account("a", 25)], database, f"recalculate-{database}")
+                with patch("time.time", return_value=1000):
+                    result = service.mark_image_result("a", True)
+                self.assertEqual(result["image_cooldown_started_at"], 1000)
+                self.assertEqual(result["image_cooldown_until"], 1600)
+                with patch("time.time", return_value=1001):
+                    self.assertEqual(service.on_image_cooldown_config_changed(10, 20, 1001), 1)
+                updated = service.get_account("a")
+                self.assertEqual(updated["image_cooldown_started_at"], 1000)
+                self.assertEqual(updated["image_cooldown_until"], 2200)
+                self.assertEqual(updated["quota"], 24)
+                self.assertEqual(updated["success"], 1)
+
+    def test_clear_cooldowns_does_not_restore_after_reenabling(self):
+        for database in (True, False):
+            with self.subTest(database=database), patch.dict(config.data, {"image_account_cooldown_minutes": 10}):
+                service = self.build([account("a", 25)], database, f"clear-{database}")
+                with patch("time.time", return_value=1000):
+                    service.mark_image_result("a", True)
+                cleared = service.clear_image_cooldowns()
+                self.assertEqual(cleared["cleared"], 1)
+                self.assertEqual(service.get_account("a")["image_cooldown_until"], 0)
+                self.assertEqual(service.get_account("a")["image_cooldown_started_at"], 0)
+                with patch.dict(config.data, {"image_account_cooldown_minutes": 20}):
+                    service.on_image_cooldown_config_changed(10, 20, time.time())
+                self.assertEqual(service.get_account("a")["image_cooldown_until"], 0)
+
+    def test_legacy_cooldown_without_started_time_is_inferred(self):
+        for database in (True, False):
+            with self.subTest(database=database), patch.dict(config.data, {"image_account_cooldown_minutes": 10}):
+                service = self.build([account("a", image_cooldown_until=1600)], database, f"legacy-{database}")
+                with patch("time.time", return_value=1001):
+                    self.assertEqual(service.on_image_cooldown_config_changed(10, 20, 1001), 1)
+                updated = service.get_account("a")
+                self.assertEqual(updated["image_cooldown_started_at"], 1000)
+                self.assertEqual(updated["image_cooldown_until"], 2200)
+
     def test_metrics_boundaries_and_account_eligibility(self):
         now = time.time()
         items = [account("due", image_cooldown_until=now),
@@ -212,7 +252,7 @@ class ImageCooldownTests(unittest.TestCase):
             with patch("time.time", return_value=now):
                 metrics = service.get_image_cooldown_metrics()
             self.assertEqual(metrics, {"cooling_accounts": 4, "thawing_within_hour": 3,
-                                       "next_thaw_at": now + 1, "as_of": now})
+                                       "next_thaw_at": now + 1, "cooldown_minutes": 60, "as_of": now})
 
     def test_token_rotation_keeps_cooldown_and_removes_old_memory_reference(self):
         for database in (True, False):

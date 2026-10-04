@@ -29,7 +29,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 from services.storage.base import CandidateToken, StorageBackend
-from services.image_cooldown import cooldown_until
+from services.image_cooldown import cooldown_started_at, cooldown_until
 from utils.log import logger
 
 Base = declarative_base()
@@ -102,6 +102,7 @@ class AccountModel(Base):
     image_quota_unknown = Column(Boolean, default=False, nullable=False)
     last_used_at = Column(String(64), nullable=True)
     image_cooldown_until = Column(Float, nullable=False, default=0, server_default="0")
+    image_cooldown_started_at = Column(Float, nullable=False, default=0, server_default="0")
     refresh_token = Column(Text, nullable=True)
     data = Column(Text, nullable=False)
     updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
@@ -881,13 +882,72 @@ class DatabaseStorageBackend(StorageBackend):
                      "cursor_hash": row.access_token_hash}
                     for row in query.order_by(until, key).limit(min(128, max(1, limit))).all()]
 
-    def get_image_cooldown_metrics(self, now: float) -> dict:
+    def get_image_cooldown_metrics(self, now: float, cooldown_minutes: int = 60) -> dict:
+        if cooldown_minutes <= 0:
+            return {"cooling_accounts": 0, "thawing_within_hour": 0,
+                    "next_thaw_at": None, "cooldown_minutes": 0, "as_of": now}
         with self.Session() as session:
             until = AccountModel.image_cooldown_until
-            row = session.query(func.count(), func.sum(case((until <= now + 3600, 1), else_=0)),
+            row = session.query(func.count(), func.sum(case((until <= now + cooldown_minutes * 60, 1), else_=0)),
                                 func.min(until)).filter(self._image_eligible_filter(), until > now).one()
             return {"cooling_accounts": int(row[0]), "thawing_within_hour": int(row[1] or 0),
-                    "next_thaw_at": row[2], "as_of": now}
+                    "next_thaw_at": row[2], "cooldown_minutes": cooldown_minutes, "as_of": now}
+
+    def recalculate_image_cooldowns(
+        self, *, old_minutes: int, new_minutes: int, changed_at: float,
+    ) -> int:
+        if new_minutes <= 0:
+            return 0
+        session = self.Session()
+        try:
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            cutoff = float(changed_at)
+            fallback_started = cutoff if old_minutes <= 0 else None
+            if fallback_started is None:
+                started_expr = case(
+                    (AccountModel.image_cooldown_started_at > 0, AccountModel.image_cooldown_started_at),
+                    else_=AccountModel.image_cooldown_until - old_minutes * 60,
+                )
+            else:
+                started_expr = case(
+                    (AccountModel.image_cooldown_started_at > 0, AccountModel.image_cooldown_started_at),
+                    else_=fallback_started,
+                )
+            updated_until = started_expr + new_minutes * 60
+            count = session.query(AccountModel).filter(
+                AccountModel.image_cooldown_until > cutoff,
+            ).update({
+                AccountModel.image_cooldown_started_at: started_expr,
+                AccountModel.image_cooldown_until: updated_until,
+            }, synchronize_session=False)
+            session.commit()
+            return count
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def clear_image_cooldowns(self) -> int:
+        session = self.Session()
+        try:
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            count = session.query(AccountModel).filter(or_(
+                AccountModel.image_cooldown_until > 0,
+                AccountModel.image_cooldown_started_at > 0,
+            )).update({
+                AccountModel.image_cooldown_until: 0,
+                AccountModel.image_cooldown_started_at: 0,
+            }, synchronize_session=False)
+            session.commit()
+            return count
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def _account_from_row(self, row: AccountModel | None) -> dict[str, Any] | None:
         if row is None:
@@ -897,6 +957,7 @@ class DatabaseStorageBackend(StorageBackend):
             item = {}
         item["access_token"] = row.access_token
         item["image_cooldown_until"] = float(row.image_cooldown_until or 0)
+        item["image_cooldown_started_at"] = float(row.image_cooldown_started_at or 0)
         for key in ("status", "source_type", "type", "last_used_at", "refresh_token"):
             value = getattr(row, key)
             if value is not None and item.get(key) in {None, ""}:
@@ -926,11 +987,16 @@ class DatabaseStorageBackend(StorageBackend):
         row.image_quota_unknown = bool(account.get("image_quota_unknown"))
         row.last_used_at = _string(account.get("last_used_at")) or None
         proposed_cooldown = cooldown_until(account)
+        proposed_started = cooldown_started_at(account)
         # Compare in SQL, so a stale metadata writer cannot shorten a cooldown
         # committed by another worker between its SELECT and UPDATE.
         row.image_cooldown_until = proposed_cooldown if is_new else case(
             (AccountModel.image_cooldown_until < proposed_cooldown, proposed_cooldown),
             else_=AccountModel.image_cooldown_until,
+        )
+        row.image_cooldown_started_at = proposed_started if is_new else case(
+            (and_(proposed_started > 0, AccountModel.image_cooldown_until <= proposed_cooldown), proposed_started),
+            else_=AccountModel.image_cooldown_started_at,
         )
         row.refresh_token = _string(account.get("refresh_token")) or None
         row.data = _json_dumps(account)
@@ -1037,6 +1103,7 @@ class DatabaseStorageBackend(StorageBackend):
                 "image_quota_unknown": "BOOLEAN",
                 "last_used_at": "VARCHAR(64)",
                 "image_cooldown_until": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+                "image_cooldown_started_at": "DOUBLE PRECISION NOT NULL DEFAULT 0",
                 "refresh_token": "TEXT",
                 "updated_at": timestamp_type,
             },

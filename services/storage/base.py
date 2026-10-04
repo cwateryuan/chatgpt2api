@@ -94,9 +94,47 @@ class StorageBackend(ABC):
         """Database-only bounded candidate page, ordered by cooldown and token hash."""
         raise NotImplementedError
 
-    def get_image_cooldown_metrics(self, now: float) -> dict[str, Any]:
+    def get_image_cooldown_metrics(self, now: float, cooldown_minutes: int = 60) -> dict[str, Any]:
         """Database-only aggregate; legacy pool metrics keep their original meaning."""
         raise NotImplementedError
+
+    def recalculate_image_cooldowns(
+        self, *, old_minutes: int, new_minutes: int, changed_at: float,
+    ) -> int:
+        """Recalculate active image cooldowns in one backend operation."""
+        if new_minutes <= 0:
+            return 0
+        from services.image_cooldown import cooldown_started_at, cooldown_until
+        accounts = self.load_accounts()
+        changed = 0
+        for account in accounts:
+            until = cooldown_until(account)
+            if until <= changed_at:
+                continue
+            started = cooldown_started_at(account)
+            if not started:
+                started = until - old_minutes * 60 if old_minutes > 0 else changed_at
+            account["image_cooldown_started_at"] = started
+            account["image_cooldown_until"] = started + new_minutes * 60
+            changed += 1
+        if changed:
+            self.save_accounts(accounts)
+        return changed
+
+    def clear_image_cooldowns(self) -> int:
+        """Clear all persisted image cooldown timestamps in one backend operation."""
+        from services.image_cooldown import cooldown_started_at, cooldown_until
+        accounts = self.load_accounts()
+        changed = 0
+        for account in accounts:
+            if cooldown_until(account) <= 0 and cooldown_started_at(account) <= 0:
+                continue
+            account["image_cooldown_until"] = 0
+            account["image_cooldown_started_at"] = 0
+            changed += 1
+        if changed:
+            self.save_accounts(accounts)
+        return changed
 
     def list_image_candidate_accounts(self, excluded_tokens: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
         excluded = {str(token or "").strip() for token in (excluded_tokens or []) if str(token or "").strip()}

@@ -846,6 +846,9 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
+        cooldown_changed = False
+        previous_cooldown_minutes = self.image_account_cooldown_minutes
+        cooldown_changed_at = time.time()
         if "image_account_cooldown_minutes" in data:
             value = data["image_account_cooldown_minutes"]
             try:
@@ -860,6 +863,10 @@ class ConfigStore:
             latest_data = self._load()
             self._data = latest_data
             self._file_signature = self._stat_signature()
+            try:
+                previous_cooldown_minutes = max(0, int(latest_data.get("image_account_cooldown_minutes", 30)))
+            except (TypeError, ValueError, OverflowError):
+                previous_cooldown_minutes = 30
 
             incoming = self._drop_stale_update_values(dict(data or {}), previous_data, latest_data)
             if "image_retention_minutes" in incoming:
@@ -880,6 +887,11 @@ class ConfigStore:
                 incoming.pop("image_retention_days", None)
             next_data = dict(latest_data)
             next_data.update(incoming)
+            try:
+                next_cooldown_minutes = max(0, int(next_data.get("image_account_cooldown_minutes", 30)))
+            except (TypeError, ValueError, OverflowError):
+                next_cooldown_minutes = 30
+            cooldown_changed = previous_cooldown_minutes != next_cooldown_minutes
             if "image_retention_minutes" in next_data:
                 next_data.pop("image_retention_days", None)
             if "backup" in next_data:
@@ -899,8 +911,23 @@ class ConfigStore:
                     latest_data,
                 )
             next_data.pop("backup_state", None)
+            if cooldown_changed:
+                cooldown_changed_at = time.time()
             self._save(next_data)
-            return self.get()
+            result = self.get()
+        if cooldown_changed and self is config:
+            try:
+                from services.account_service import account_service
+                account_service.on_image_cooldown_config_changed(
+                    previous_cooldown_minutes,
+                    next_cooldown_minutes,
+                    cooldown_changed_at,
+                )
+            except Exception as exc:
+                # Configuration remains saved even if a storage refresh is temporarily unavailable.
+                from utils.log import logger
+                logger.warning({"event": "image_cooldown_recalculate_failed", "error": str(exc)})
+        return result
 
     def get_backup_settings(self) -> dict[str, object]:
         return _normalize_backup_settings(self.data.get("backup"))

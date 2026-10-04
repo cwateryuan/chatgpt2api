@@ -16,7 +16,13 @@ from typing import Any
 from urllib.parse import urlencode
 
 from services.config import config
-from services.image_cooldown import ImageSchedulingUnavailable, MemoryImageCandidateIndex, cooldown_until, public_account
+from services.image_cooldown import (
+    ImageSchedulingUnavailable,
+    MemoryImageCandidateIndex,
+    cooldown_started_at,
+    cooldown_until,
+    public_account,
+)
 from services.browser_fingerprint import account_fingerprint
 from services.icloud_stats_service import ICloudStatsService, icloud_stats_service
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
@@ -498,6 +504,12 @@ class AccountService:
         normalized["last_chat_keepalive_at"] = normalized.get("last_chat_keepalive_at") or None
         normalized["last_chat_keepalive_error"] = normalized.get("last_chat_keepalive_error") or None
         normalized["last_chat_keepalive_prompt_id"] = normalized.get("last_chat_keepalive_prompt_id") or None
+        for cooldown_field in ("image_cooldown_until", "image_cooldown_started_at"):
+            try:
+                value = float(normalized.get(cooldown_field) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            normalized[cooldown_field] = value if value > 0 else 0.0
         try:
             normalized["last_chat_keepalive_turns"] = int(normalized.get("last_chat_keepalive_turns") or 0)
         except (TypeError, ValueError):
@@ -2059,7 +2071,6 @@ class AccountService:
         if not access_token:
             return None
         completed_at = time.time()
-        cooldown_minutes = config.image_account_cooldown_minutes
         update_lock = self._account_update_lock(access_token)
         with update_lock:
             with self._lock:
@@ -2069,10 +2080,12 @@ class AccountService:
                 if current is None:
                     return None
                 next_item = dict(current)
+                cooldown_minutes = config.image_account_cooldown_minutes
                 next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
                     if cooldown_minutes > 0:
+                        next_item["image_cooldown_started_at"] = completed_at
                         next_item["image_cooldown_until"] = max(cooldown_until(next_item), completed_at + cooldown_minutes * 60)
                     next_item["success"] = int(next_item.get("success") or 0) + 1
                     if not image_quota_unknown:
@@ -2111,12 +2124,12 @@ class AccountService:
             else:
                 with self._lock:
                     resolved, current = self._load_account_for_token_locked(access_token, fresh=False)
-                if current is None:
-                    return None
-                account = apply_result(current)
-                if account is None:
-                    return None
-                candidate_changed = self._candidate_fields_changed(current, account)
+                    if current is None:
+                        return None
+                    account = apply_result(current)
+                    if account is None:
+                        return None
+                    candidate_changed = self._candidate_fields_changed(current, account)
 
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 with self._lock:
@@ -2129,7 +2142,8 @@ class AccountService:
             with self._lock:
                 self._accounts[resolved] = account
             if not self._database_features_enabled():
-                self._save_account(account, previous=current, invalidate=False)
+                with self._lock:
+                    self._save_account(account, previous=current, invalidate=False)
             if candidate_changed:
                 self._invalidate_candidate_cache()
             return dict(account)
@@ -2603,21 +2617,105 @@ class AccountService:
             "by_type": by_type,
         }
 
+    def _invalidate_cooldown_metrics_cache(self) -> None:
+        with self._cooldown_metrics_lock:
+            self._cooldown_metrics_cache = None
+        runtime_state.delete_flag("account:image:cooldown:metrics:v2")
+
+    def _reload_after_cooldown_mutation(self) -> None:
+        with self._lock:
+            self._accounts = self._load_accounts()
+            self._last_full_reload_at = time.monotonic()
+            if not self._database_features_enabled():
+                self._rebuild_memory_image_index()
+        self._invalidate_candidate_cache()
+        self._invalidate_cooldown_metrics_cache()
+
+    def _mutate_memory_cooldowns(self, *, clear: bool = False, old_minutes: int = 0,
+                                 new_minutes: int = 0, changed_at: float = 0.0) -> int:
+        changed = 0
+        with self._lock:
+            for account in self._accounts.values():
+                if clear:
+                    if cooldown_until(account) <= 0 and cooldown_started_at(account) <= 0:
+                        continue
+                    account["image_cooldown_until"] = 0.0
+                    account["image_cooldown_started_at"] = 0.0
+                    changed += 1
+                    continue
+                until = cooldown_until(account)
+                if until <= changed_at:
+                    continue
+                started = cooldown_started_at(account)
+                if not started:
+                    started = until - old_minutes * 60 if old_minutes > 0 else changed_at
+                account["image_cooldown_started_at"] = started
+                account["image_cooldown_until"] = started + new_minutes * 60
+                changed += 1
+            if changed:
+                self.storage.save_accounts([dict(item) for item in self._accounts.values()])
+                self._rebuild_memory_image_index()
+        return changed
+
+    def on_image_cooldown_config_changed(self, old_minutes: int, new_minutes: int, changed_at: float) -> int:
+        recalculated = 0
+        if new_minutes > 0:
+            if self._database_features_enabled():
+                recalculated = self.storage.recalculate_image_cooldowns(
+                    old_minutes=max(0, int(old_minutes)),
+                    new_minutes=int(new_minutes),
+                    changed_at=float(changed_at),
+                )
+            else:
+                recalculated = self._mutate_memory_cooldowns(
+                    old_minutes=max(0, int(old_minutes)),
+                    new_minutes=int(new_minutes),
+                    changed_at=float(changed_at),
+                )
+            if self._database_features_enabled():
+                self._reload_after_cooldown_mutation()
+            else:
+                self._invalidate_candidate_cache()
+                self._invalidate_cooldown_metrics_cache()
+        else:
+            self._invalidate_candidate_cache()
+            self._invalidate_cooldown_metrics_cache()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "更新生图冷却配置",
+            {"old_minutes": int(old_minutes), "new_minutes": int(new_minutes), "recalculated": recalculated},
+        )
+        return recalculated
+
+    def clear_image_cooldowns(self) -> dict:
+        if self._database_features_enabled():
+            cleared = self.storage.clear_image_cooldowns()
+            self._reload_after_cooldown_mutation()
+        else:
+            cleared = self._mutate_memory_cooldowns(clear=True)
+            self._invalidate_candidate_cache()
+            self._invalidate_cooldown_metrics_cache()
+        metrics = self.get_image_cooldown_metrics()
+        log_service.add(LOG_TYPE_ACCOUNT, f"手动解冻 {cleared} 个生图冷却账号", {"cleared": cleared})
+        return {"cleared": cleared, **metrics}
+
     def get_image_cooldown_metrics(self) -> dict:
         now = time.time()
-        if config.image_account_cooldown_minutes == 0:
-            return {"cooling_accounts": 0, "thawing_within_hour": 0, "next_thaw_at": None, "as_of": now}
+        cooldown_minutes = config.image_account_cooldown_minutes
+        if cooldown_minutes == 0:
+            return {"cooling_accounts": 0, "thawing_within_hour": 0, "next_thaw_at": None,
+                    "cooldown_minutes": 0, "as_of": now}
         with self._cooldown_metrics_lock:
             cached = self._cooldown_metrics_cache
-            if cached and now - cached["as_of"] < 15:
+            if cached and cached.get("cooldown_minutes") == cooldown_minutes and now - cached["as_of"] < 15:
                 return dict(cached)
-            cache_key = "account:image:cooldown:metrics:v1"
+            cache_key = "account:image:cooldown:metrics:v2"
             lock_key = cache_key + ":lock"
             owner = ""
             if runtime_state.redis_enabled:
                 raw = runtime_state.get_flag(cache_key)
                 shared = json.loads(raw) if raw else None
-                if shared and now - shared["as_of"] < 15:
+                if shared and shared.get("cooldown_minutes") == cooldown_minutes and now - shared["as_of"] < 15:
                     self._cooldown_metrics_cache = shared
                     return dict(shared)
                 owner = runtime_state.acquire_lock(lock_key, 5, allow_memory_fallback=False)
@@ -2629,11 +2727,13 @@ class AccountService:
                         time.sleep(0.02)
                         raw = runtime_state.get_flag(cache_key)
                         if raw:
-                            return json.loads(raw)
+                            waited = json.loads(raw)
+                            if waited.get("cooldown_minutes") == cooldown_minutes:
+                                return waited
                     raise ImageSchedulingUnavailable("Cooldown statistics are temporarily unavailable.")
             try:
-                metrics = (self.storage.get_image_cooldown_metrics(now) if self._database_features_enabled()
-                           else self._memory_image_index.metrics(now))
+                metrics = (self.storage.get_image_cooldown_metrics(now, cooldown_minutes) if self._database_features_enabled()
+                           else self._memory_image_index.metrics(now, cooldown_minutes))
                 self._cooldown_metrics_cache = metrics
                 if owner:
                     runtime_state.set_flag(cache_key, json.dumps(metrics), ttl_seconds=30)

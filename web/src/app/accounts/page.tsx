@@ -47,6 +47,7 @@ import {
 import {
   deleteAccounts,
   cancelBulkJob,
+  clearImageCooldown,
   fetchAccountAutoRefresh,
   fetchAccounts,
   fetchImageCooldownMetrics,
@@ -103,7 +104,7 @@ const metricCards = [
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
-  { key: "thawingWithinHour", label: "1小时内解冻", color: "text-sky-600", icon: CalendarDays },
+  { key: "thawingWithinHour", label: "解冻统计", color: "text-sky-600", icon: CalendarDays },
 ] as const;
 
 const icloudMetricCards = [
@@ -251,6 +252,7 @@ function AccountsPageContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isRelogining, setIsRelogining] = useState(false);
+  const [isClearingCooldown, setIsClearingCooldown] = useState(false);
   const [progress, setProgress] = useState<{
     visible: boolean;
     current: number;
@@ -333,6 +335,27 @@ function AccountsPageContent() {
       toast.error(message);
     } finally {
       setIsLoadingAutoRefresh(false);
+    }
+  };
+
+  const handleClearImageCooldown = async () => {
+    const cooling = cooldownMetrics?.cooling_accounts ?? 0;
+    if (typeof cooling !== "number" || cooling <= 0 || isClearingCooldown) {
+      return;
+    }
+    if (!window.confirm(`确定解冻全部 ${cooling} 个生图冷却账号吗？`)) {
+      return;
+    }
+    setIsClearingCooldown(true);
+    try {
+      const result = await clearImageCooldown();
+      setCooldownMetrics(result);
+      await loadAccounts(true);
+      toast.success(`已解冻 ${result.cleared} 个生图冷却账号`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "解冻冷却账号失败");
+    } finally {
+      setIsClearingCooldown(false);
     }
   };
 
@@ -836,6 +859,15 @@ function AccountsPageContent() {
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
             一键刷新所有账号信息和额度
           </Button>
+          <Button
+            variant="outline"
+            className="h-10 rounded-xl border-amber-200 bg-amber-50/80 px-4 text-amber-700 hover:bg-amber-100"
+            onClick={() => void handleClearImageCooldown()}
+            disabled={isClearingCooldown || typeof summary.cooling !== "number" || summary.cooling <= 0}
+          >
+            {isClearingCooldown ? <LoaderCircle className="size-4 animate-spin" /> : <CalendarDays className="size-4" />}
+            解冻全部冷却账号
+          </Button>
           <AccountImportDialog
             disabled={isLoading || isDeleting}
             onImported={(items) => {
@@ -971,11 +1003,16 @@ function AccountsPageContent() {
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = (refreshSummary ?? summary)[item.key];
+            const label = item.key === "thawingWithinHour" && cooldownMetrics
+              ? cooldownMetrics.cooldown_minutes
+                ? `${cooldownMetrics.cooldown_minutes}分钟内解冻`
+                : "冷却已关闭"
+              : item.label;
             return (
               <Card key={item.key} className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
                 <CardContent className="p-4">
                   <div className="mb-4 flex items-start justify-between">
-                    <span className="text-xs font-medium text-stone-400">{item.label}</span>
+                    <span className="text-xs font-medium text-stone-400">{label}</span>
                     <Icon className="size-4 text-stone-400" />
                   </div>
                   <div className={cn("text-[1.75rem] font-semibold tracking-tight", item.color)}>

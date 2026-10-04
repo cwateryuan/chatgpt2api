@@ -22,8 +22,20 @@ def cooldown_until(account: dict) -> float:
         return 0.0
 
 
+def cooldown_started_at(account: dict) -> float:
+    try:
+        value = float(account.get("image_cooldown_started_at") or 0)
+        return value if 0 < value < float("inf") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def public_account(account: dict) -> dict:
-    return {key: value for key, value in account.items() if key != "image_cooldown_until"}
+    return {
+        key: value
+        for key, value in account.items()
+        if key not in {"image_cooldown_until", "image_cooldown_started_at"}
+    }
 
 
 class MemoryImageCandidateIndex:
@@ -76,17 +88,20 @@ class MemoryImageCandidateIndex:
             return [{"access_token": self._entries[key][2], "image_cooldown_until": until,
                      "cursor_hash": key} for until, key in islice(merge(*windows), limit)]
 
-    def metrics(self, now: float) -> dict:
+    def metrics(self, now: float, cooldown_minutes: int = 60) -> dict:
+        if cooldown_minutes <= 0:
+            return {"cooling_accounts": 0, "thawing_within_hour": 0,
+                    "next_thaw_at": None, "cooldown_minutes": 0, "as_of": now}
         cooling = thawing = 0
         next_thaw = None
         with self._lock:
             for items in self._groups.values():
                 start = bisect_right(items, (now, "f" * 64))
-                stop = bisect_right(items, (now + 3600, "f" * 64))
+                stop = bisect_right(items, (now + cooldown_minutes * 60, "f" * 64))
                 cooling += len(items) - start
                 thawing += stop - start
                 if start < len(items):
                     until = items[start][0]
                     next_thaw = until if next_thaw is None else min(next_thaw, until)
         return {"cooling_accounts": cooling, "thawing_within_hour": thawing,
-                "next_thaw_at": next_thaw, "as_of": now}
+                "next_thaw_at": next_thaw, "cooldown_minutes": cooldown_minutes, "as_of": now}
