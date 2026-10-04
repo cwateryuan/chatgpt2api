@@ -217,7 +217,9 @@ def _image_error_response(exc: Exception) -> JSONResponse:
             429,
         )
     if hasattr(exc, "to_openai_error") and hasattr(exc, "status_code"):
-        return JSONResponse(status_code=int(exc.status_code), content=exc.to_openai_error())
+        headers = ({"Retry-After": str(failure.retry_after)}
+                   if failure.code == "image_pool_unavailable" and failure.retry_after is not None else None)
+        return JSONResponse(status_code=int(exc.status_code), content=exc.to_openai_error(), headers=headers)
     generated = ImageGenerationError(message, failure=failure)
     return JSONResponse(status_code=int(generated.status_code), content=generated.to_openai_error())
 

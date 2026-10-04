@@ -536,6 +536,8 @@ class ConfigStore:
             previous_value = _normalize_bool(previous_data.get("image_stream_recovery_enabled"), True)
             latest_value = _normalize_bool(latest_data.get("image_stream_recovery_enabled"), True)
             return incoming_value == previous_value and incoming_value != latest_value
+        if key == "image_account_cooldown_minutes":
+            return int(value) == int(previous_data.get(key, 60)) and int(value) != int(latest_data.get(key, 60))
         return previous_data.get(key) == value and latest_data.get(key) != previous_data.get(key)
 
     def _drop_stale_update_values(
@@ -544,7 +546,7 @@ class ConfigStore:
         previous_data: dict[str, object],
         latest_data: dict[str, object],
     ) -> dict[str, object]:
-        protected_keys = {"proxy_runtime", "log_levels", "image_poll_timeout_secs", "image_stream_timeout_secs", "image_stream_recovery_enabled"}
+        protected_keys = {"proxy_runtime", "log_levels", "image_poll_timeout_secs", "image_stream_timeout_secs", "image_stream_recovery_enabled", "image_account_cooldown_minutes"}
         result = dict(incoming)
         for key in protected_keys.intersection(result):
             if self._is_stale_update_value(key, result[key], previous_data, latest_data):
@@ -631,6 +633,13 @@ class ConfigStore:
             return max(1, int(self.data.get("image_account_concurrency", 3)))
         except (TypeError, ValueError):
             return 3
+
+    @property
+    def image_account_cooldown_minutes(self) -> int:
+        try:
+            return max(0, int(self.data.get("image_account_cooldown_minutes", 60)))
+        except (TypeError, ValueError, OverflowError):
+            return 60
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -795,6 +804,7 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_account_cooldown_minutes"] = self.image_account_cooldown_minutes
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
@@ -836,6 +846,15 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
+        if "image_account_cooldown_minutes" in data:
+            value = data["image_account_cooldown_minutes"]
+            try:
+                minutes = int(str(value))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("生图成功后冷却时间必须是非负整数（分钟）") from exc
+            if minutes < 0:
+                raise ValueError("生图成功后冷却时间必须是非负整数（分钟）")
+            data = {**data, "image_account_cooldown_minutes": minutes}
         with self._lock:
             previous_data = copy.deepcopy(self._data)
             latest_data = self._load()

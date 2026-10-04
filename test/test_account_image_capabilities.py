@@ -269,7 +269,7 @@ class AccountCapabilityTests(unittest.TestCase):
             service.fetch_remote_info = fetch_remote_info
             try:
                 self.assertEqual(storage.get_image_pool_metrics()["current_available"], 1)
-                with self.assertRaisesRegex(RuntimeError, "no available image quota"):
+                with self.assertRaisesRegex(RuntimeError, "No schedulable image account"):
                     service.get_available_access_token()
                 self.assertEqual(storage.get_image_pool_metrics()["current_available"], 1)
                 fetch_remote_info.assert_not_called()
@@ -383,6 +383,10 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertTrue(remaining["normal-due"]["restore_due"])
 
     def test_image_slot_wait_respects_deadline_when_all_slots_are_full(self) -> None:
+        # This remains the legacy behavior when success cooldown is disabled.
+        cooldown_patch = patch.dict(config.data, {"image_account_cooldown_minutes": 0})
+        cooldown_patch.start()
+        self.addCleanup(cooldown_patch.stop)
         original_concurrency = config.data.get("image_account_concurrency")
         config.data["image_account_concurrency"] = 1
         try:

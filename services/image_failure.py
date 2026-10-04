@@ -81,6 +81,7 @@ class ImageFailure:
 
 
 FAILURE_POLICIES: dict[str, FailurePolicy] = {
+    "image_pool_unavailable": FailurePolicy("transient", None, True, 503, "server_error"),
     "upstream_error": FailurePolicy("transient", None, True, 502, "server_error", True),
     "upstream_unavailable": FailurePolicy("transient", None, True, 502, "server_error", True),
     "upstream_connection_failed": FailurePolicy("transient", None, True, 502, "server_error", True),

@@ -28,6 +28,7 @@ export function ConfigCard() {
   const setImageStreamTimeoutSecs = useSettingsStore((state) => state.setImageStreamTimeoutSecs);
   const setImageStreamRecoveryEnabled = useSettingsStore((state) => state.setImageStreamRecoveryEnabled);
   const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
+  const setImageAccountCooldownMinutes = useSettingsStore((state) => state.setImageAccountCooldownMinutes);
   const setImageSettleEnabled = useSettingsStore((state) => state.setImageSettleEnabled);
   const setImageSettleSecs = useSettingsStore((state) => state.setImageSettleSecs);
   const setImageTimeoutRetrySecs = useSettingsStore((state) => state.setImageTimeoutRetrySecs);
@@ -191,7 +192,19 @@ export function ConfigCard() {
               placeholder="1"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+            <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。启用成功后冷却时，有效并发固定为 1。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">生图成功后冷却时间</label>
+            <Input
+              type="number"
+              min={0}
+              step={1}
+              value={String(config?.image_account_cooldown_minutes ?? 60)}
+              onChange={(event) => setImageAccountCooldownMinutes(event.target.value)}
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">单位分钟，默认 60；0 为关闭。成功后即使仍有额度也会冷却。修改仅影响后续成功的任务，已有冷却时间不重算。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">

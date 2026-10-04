@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Any
 
 from utils.log import logger
+from services.image_cooldown import ImageSchedulingUnavailable
 
 
 def _clean(value: object) -> str:
@@ -35,6 +36,19 @@ def is_multi_worker_runtime() -> bool:
 
 
 class RuntimeState:
+    _ACQUIRE_COOLDOWN_SLOT_SCRIPT = """
+local ttl = tonumber(ARGV[1])
+for i = 2, #ARGV do
+  local token = ARGV[i]
+  local key = "account:image:inflight:" .. token
+  if tonumber(redis.call("GET", key) or "0") == 0 then
+    redis.call("SET", key, 1, "EX", ttl)
+    return {token, ""}
+  end
+end
+return {"", ""}
+"""
+
     _ACQUIRE_IMAGE_SLOT_SCRIPT = """
 local rr_key = KEYS[1]
 local ttl = tonumber(ARGV[1])
@@ -204,8 +218,11 @@ return redis.call("DECR", inflight_key)
         max_concurrency: int,
         ttl_seconds: int,
         probe_limit: int = 128,
+        strict: bool = False,
     ) -> str:
         candidates = [_clean(token) for token in tokens if _clean(token)]
+        if strict and self._redis is None and (self.redis_url or is_multi_worker_runtime()):
+            raise ImageSchedulingUnavailable("Image scheduling unavailable: shared Redis is required.")
         if not candidates:
             return ""
         max_slots = max(1, int(max_concurrency or 1))
@@ -226,7 +243,11 @@ return redis.call("DECR", inflight_key)
         if self._redis is not None:
             eval_started_at = time.monotonic()
             try:
-                result = self._redis.eval(self._ACQUIRE_IMAGE_SLOT_SCRIPT, 1, "account:rr:image", ttl, max_slots, *candidates)
+                if strict:
+                    # No unused per-request lease keys lasting the cooling window.
+                    result = self._redis.eval(self._ACQUIRE_COOLDOWN_SLOT_SCRIPT, 0, ttl, *candidates)
+                else:
+                    result = self._redis.eval(self._ACQUIRE_IMAGE_SLOT_SCRIPT, 1, "account:rr:image", ttl, max_slots, *candidates)
                 logger.debug({
                     "event": "image_slot_redis_eval",
                     "candidate_count": len(candidates),
@@ -237,6 +258,8 @@ return redis.call("DECR", inflight_key)
                     return _clean(result[0])
                 return ""
             except Exception as exc:
+                if strict:
+                    raise ImageSchedulingUnavailable("Image scheduling unavailable: Redis could not be reached.") from exc
                 logger.debug({
                     "event": "image_slot_redis_eval_failed",
                     "candidate_count": len(candidates),
@@ -282,11 +305,13 @@ return redis.call("DECR", inflight_key)
             else:
                 self._memory_inflight[token] = (current - 1, expires_at)
 
-    def transfer_image_slot(self, old_token: str, new_token: str, ttl_seconds: int) -> None:
+    def transfer_image_slot(self, old_token: str, new_token: str, ttl_seconds: int, *, strict: bool = False) -> None:
         old = _clean(old_token)
         new = _clean(new_token)
         if not old or not new or old == new:
             return
+        if strict and self._redis is None and (self.redis_url or is_multi_worker_runtime()):
+            raise ImageSchedulingUnavailable("Image slot transfer requires shared Redis.")
         ttl = max(30, int(ttl_seconds or 180))
         if self._redis is not None:
             try:
@@ -297,6 +322,7 @@ local ttl = tonumber(ARGV[3])
 local old_key = "account:image:inflight:" .. old_token
 local new_key = "account:image:inflight:" .. new_token
 local current = tonumber(redis.call("GET", old_key) or "0")
+ttl = math.max(ttl, tonumber(redis.call("TTL", old_key) or "0"))
 if current <= 0 then
   return 0
 end
@@ -307,16 +333,18 @@ return current
 """
                 self._redis.eval(script, 0, old, new, ttl)
                 return
-            except Exception:
+            except Exception as exc:
+                if strict:
+                    raise ImageSchedulingUnavailable("Image slot transfer failed: Redis unavailable.") from exc
                 pass
         with self._lock:
             self._cleanup_memory_locked()
-            current, _old_expires_at = self._memory_inflight.get(old, (0, 0.0))
+            current, old_expires_at = self._memory_inflight.get(old, (0, 0.0))
             if current <= 0:
                 return
             self._memory_inflight.pop(old, None)
             new_current, _new_expires_at = self._memory_inflight.get(new, (0, 0.0))
-            self._memory_inflight[new] = (new_current + current, time.time() + ttl)
+            self._memory_inflight[new] = (new_current + current, max(old_expires_at, time.time() + ttl))
 
     def clear_image_slots(self, tokens: set[str] | list[str]) -> None:
         cleaned = [_clean(token) for token in tokens if _clean(token)]

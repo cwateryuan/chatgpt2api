@@ -13,6 +13,7 @@ from curl_cffi import requests as curl_requests
 
 from services.account_service import account_service
 from services.config import config
+from services.image_cooldown import ImageSchedulingUnavailable
 from services.image_failure import (
     ImageFailure,
     ImageFailureError,
@@ -1610,6 +1611,9 @@ def _generate_single_image(
         except ImageDeadlineExpired as exc:
             raise image_timeout_error(deadline, account_email=account_email) from exc
         except RuntimeError as exc:
+            if isinstance(exc, ImageSchedulingUnavailable):
+                raise ImageGenerationError(str(exc), failure=image_failure(
+                    "image_pool_unavailable", retry_after=exc.retry_after), account_email=account_email) from exc
             if last_file_upload_throttle is not None:
                 raise ImageGenerationError(
                     "All available accounts have reached the file upload limit. Please try again later.",
@@ -2139,6 +2143,10 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 })
 
     if not emitted:
+        pool_errors = [error for error in errors.values()
+                       if getattr(getattr(error, "failure", None), "code", None) == "image_pool_unavailable"]
+        if pool_errors and len(pool_errors) == len(errors):
+            raise min(pool_errors, key=lambda error: error.failure.retry_after or 1)
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")

@@ -373,6 +373,10 @@ def create_router(app_version: str) -> APIRouter:
         }
         if format == "json":
             return stats_json
+        try:
+            cooldown = await run_in_threadpool(acct_svc.get_image_cooldown_metrics)
+        except Exception:
+            cooldown = {"cooling_accounts": "—", "thawing_within_hour": "—"}
         return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="zh">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -397,7 +401,7 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 .api-url{{font-family:monospace;font-size:12px;color:#6c63ff}}
 .refresh{{font-size:12px;color:#64748b;text-align:center;margin-top:24px}}
 </style>
-<meta http-equiv="refresh" content="30">
+<script>setInterval(() => {{ if (!document.hidden) location.reload(); }}, 30000);</script>
 </head>
 <body>
 <div class="header">
@@ -408,6 +412,8 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 <div class="cards">
 <div class="card"><div class="label">号池状态</div><div class="value {'green' if healthy else 'yellow'}">{'正常' if healthy else '异常'}</div></div>
 <div class="card"><div class="label">当前账号</div><div class="value blue">{stats['total']}</div></div>
+<div class="card"><div class="label">冷却中账号</div><div class="value yellow">{cooldown['cooling_accounts']}</div></div>
+<div class="card"><div class="label">未来 1 小时内冷却结束</div><div class="value blue">{cooldown['thawing_within_hour']}</div></div>
 <div class="card"><div class="label">累计入库</div><div class="value">{stats['cumulative_total']}</div></div>
 <div class="card"><div class="label">可用账号</div><div class="value green">{stats['active']}</div></div>
 <div class="card"><div class="label">无限额</div><div class="value">{stats['unlimited_quota_count']}</div></div>

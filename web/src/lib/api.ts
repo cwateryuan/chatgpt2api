@@ -258,6 +258,7 @@ export type SettingsConfig = {
   image_stream_timeout_secs?: number | string;
   image_stream_recovery_enabled?: boolean;
   image_account_concurrency?: number | string;
+  image_account_cooldown_minutes?: number | string;
   image_parallel_generation?: boolean;
   image_settle_enabled?: boolean;
   image_check_before_hit_enabled?: boolean;

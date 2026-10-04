@@ -15,6 +15,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
+from services.image_cooldown import ImageSchedulingUnavailable, public_account
 from services.config import config
 
 from api.support import (
@@ -226,6 +227,14 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return account_service.get_image_pool_metrics()
 
+    @router.get("/api/accounts/image-cooldown-metrics")
+    async def get_image_cooldown_metrics(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(account_service.get_image_cooldown_metrics)
+        except ImageSchedulingUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "1"}) from exc
+
     @router.get("/api/accounts/auto-refresh")
     async def get_account_auto_refresh(authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -387,7 +396,7 @@ def create_router() -> APIRouter:
         account = account_service.update_account(access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return {"item": public_account(account), "items": account_service.list_accounts()}
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(

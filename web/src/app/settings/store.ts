@@ -194,6 +194,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     image_stream_timeout_secs: Number(config.image_stream_timeout_secs || 80),
     image_stream_recovery_enabled: Boolean(config.image_stream_recovery_enabled !== false),
     image_account_concurrency: Number(config.image_account_concurrency || 3),
+    image_account_cooldown_minutes: Number(config.image_account_cooldown_minutes ?? 60),
     image_settle_enabled: Boolean(config.image_settle_enabled !== false),
     image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
     image_settle_secs: Number(config.image_settle_secs || 2.0),
@@ -387,6 +388,7 @@ type SettingsStore = {
   setImageStreamTimeoutSecs: (value: string) => void;
   setImageStreamRecoveryEnabled: (value: boolean) => void;
   setImageAccountConcurrency: (value: string) => void;
+  setImageAccountCooldownMinutes: (value: string) => void;
   setImageSettleEnabled: (value: boolean) => void;
   setImageCheckBeforeHitEnabled: (value: boolean) => void;
   setImageSettleSecs: (value: string) => void;
@@ -541,6 +543,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         image_stream_timeout_secs: Math.max(1, Number(config.image_stream_timeout_secs) || 80),
         image_stream_recovery_enabled: Boolean(config.image_stream_recovery_enabled !== false),
         image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
+        image_account_cooldown_minutes: Number(config.image_account_cooldown_minutes ?? 60),
         image_settle_enabled: Boolean(config.image_settle_enabled !== false),
         image_check_before_hit_enabled: Boolean(config.image_check_before_hit_enabled !== false),
         image_settle_secs: Math.max(0.5, Number(config.image_settle_secs) || 2.0),
@@ -655,6 +658,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageAccountConcurrency: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_account_concurrency: value } } : {});
+  },
+  setImageAccountCooldownMinutes: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_account_cooldown_minutes: value } } : {});
   },
 
   setImageSettleEnabled: (value) => {

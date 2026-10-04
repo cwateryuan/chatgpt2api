@@ -88,6 +88,16 @@ class StorageBackend(ABC):
             self.upsert_account(updated)
         return updated
 
+    def list_image_cooldown_candidates(self, *, now: float, after: tuple[float, str],
+                                       limit: int = 128, source_type: str = "",
+                                       plan_type: str = "", plan_types: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+        """Database-only bounded candidate page, ordered by cooldown and token hash."""
+        raise NotImplementedError
+
+    def get_image_cooldown_metrics(self, now: float) -> dict[str, Any]:
+        """Database-only aggregate; legacy pool metrics keep their original meaning."""
+        raise NotImplementedError
+
     def list_image_candidate_accounts(self, excluded_tokens: list[str] | set[str] | None = None) -> list[dict[str, Any]]:
         excluded = {str(token or "").strip() for token in (excluded_tokens or []) if str(token or "").strip()}
         return [

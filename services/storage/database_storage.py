@@ -12,6 +12,7 @@ from sqlalchemy import (
     case,
     Column,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -22,11 +23,13 @@ from sqlalchemy import (
     inspect,
     or_,
     text,
+    tuple_,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 from services.storage.base import CandidateToken, StorageBackend
+from services.image_cooldown import cooldown_until
 from utils.log import logger
 
 Base = declarative_base()
@@ -98,6 +101,7 @@ class AccountModel(Base):
     fail = Column(Integer, nullable=True)
     image_quota_unknown = Column(Boolean, default=False, nullable=False)
     last_used_at = Column(String(64), nullable=True)
+    image_cooldown_until = Column(Float, nullable=False, default=0, server_default="0")
     refresh_token = Column(Text, nullable=True)
     data = Column(Text, nullable=False)
     updated_at = Column(DateTime, default=_now, onupdate=_now, nullable=False)
@@ -849,6 +853,42 @@ class DatabaseStorageBackend(StorageBackend):
             "database_url": self._mask_password(self.database_url),
         }
 
+    @staticmethod
+    def _image_eligible_filter():
+        return and_(
+            or_(AccountModel.status.is_(None), ~AccountModel.status.in_(["禁用", "限流", "异常"])),
+            or_(AccountModel.image_quota_unknown.is_(True), AccountModel.quota > 0),
+        )
+
+    def list_image_cooldown_candidates(self, *, now: float, after: tuple[float, str],
+                                       limit: int = 128, source_type: str = "",
+                                       plan_type: str = "", plan_types: tuple[str, ...] = ()) -> list[dict]:
+        # Keyset pagination is bounded even with thousands of cooling accounts.
+        with self.Session() as session:
+            until = AccountModel.image_cooldown_until
+            key = AccountModel.access_token_hash
+            query = session.query(AccountModel.access_token, until, key).filter(
+                self._image_eligible_filter(), until <= now,
+                tuple_(until, key) > after,
+            )
+            if source_type:
+                query = query.filter(func.lower(func.coalesce(AccountModel.source_type, "web")) == source_type)
+            if plan_type:
+                query = query.filter(func.lower(func.coalesce(AccountModel.type, "free")) == plan_type)
+            if plan_types:
+                query = query.filter(func.lower(func.coalesce(AccountModel.type, "free")).in_(plan_types))
+            return [{"access_token": row.access_token, "image_cooldown_until": row.image_cooldown_until,
+                     "cursor_hash": row.access_token_hash}
+                    for row in query.order_by(until, key).limit(min(128, max(1, limit))).all()]
+
+    def get_image_cooldown_metrics(self, now: float) -> dict:
+        with self.Session() as session:
+            until = AccountModel.image_cooldown_until
+            row = session.query(func.count(), func.sum(case((until <= now + 3600, 1), else_=0)),
+                                func.min(until)).filter(self._image_eligible_filter(), until > now).one()
+            return {"cooling_accounts": int(row[0]), "thawing_within_hour": int(row[1] or 0),
+                    "next_thaw_at": row[2], "as_of": now}
+
     def _account_from_row(self, row: AccountModel | None) -> dict[str, Any] | None:
         if row is None:
             return None
@@ -856,6 +896,7 @@ class DatabaseStorageBackend(StorageBackend):
         if not item:
             item = {}
         item["access_token"] = row.access_token
+        item["image_cooldown_until"] = float(row.image_cooldown_until or 0)
         for key in ("status", "source_type", "type", "last_used_at", "refresh_token"):
             value = getattr(row, key)
             if value is not None and item.get(key) in {None, ""}:
@@ -870,6 +911,7 @@ class DatabaseStorageBackend(StorageBackend):
         token = _string(account.get("access_token"))
         token_hash = _token_hash(token)
         row = session.query(AccountModel).filter(AccountModel.access_token_hash == token_hash).first()
+        is_new = row is None
         if row is None:
             row = AccountModel(access_token=token, access_token_hash=token_hash)
             session.add(row)
@@ -883,6 +925,13 @@ class DatabaseStorageBackend(StorageBackend):
         row.fail = _int_or_none(account.get("fail"))
         row.image_quota_unknown = bool(account.get("image_quota_unknown"))
         row.last_used_at = _string(account.get("last_used_at")) or None
+        proposed_cooldown = cooldown_until(account)
+        # Compare in SQL, so a stale metadata writer cannot shorten a cooldown
+        # committed by another worker between its SELECT and UPDATE.
+        row.image_cooldown_until = proposed_cooldown if is_new else case(
+            (AccountModel.image_cooldown_until < proposed_cooldown, proposed_cooldown),
+            else_=AccountModel.image_cooldown_until,
+        )
         row.refresh_token = _string(account.get("refresh_token")) or None
         row.data = _json_dumps(account)
 
@@ -987,6 +1036,7 @@ class DatabaseStorageBackend(StorageBackend):
                 "fail": "INTEGER",
                 "image_quota_unknown": "BOOLEAN",
                 "last_used_at": "VARCHAR(64)",
+                "image_cooldown_until": "DOUBLE PRECISION NOT NULL DEFAULT 0",
                 "refresh_token": "TEXT",
                 "updated_at": timestamp_type,
             },
@@ -1037,6 +1087,7 @@ class DatabaseStorageBackend(StorageBackend):
                 ("idx_accounts_source_type", "accounts", "source_type"),
                 ("idx_accounts_type", "accounts", "type"),
                 ("idx_accounts_image_candidates", "accounts", "status, source_type, type, quota"),
+                ("idx_accounts_image_cooldown", "accounts", "image_cooldown_until, access_token_hash"),
                 ("idx_images_date_created_at", "images", "date, created_at"),
                 ("idx_logs_type_time", "logs", "type, time"),
             ]

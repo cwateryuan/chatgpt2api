@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import secrets
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +16,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from services.config import config
+from services.image_cooldown import ImageSchedulingUnavailable, MemoryImageCandidateIndex, cooldown_until, public_account
 from services.browser_fingerprint import account_fingerprint
 from services.icloud_stats_service import ICloudStatsService, icloud_stats_service
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
@@ -21,7 +24,7 @@ from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
-from services.runtime_state import runtime_state
+from services.runtime_state import is_multi_worker_runtime, runtime_state
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 from utils.log import logger
@@ -64,6 +67,14 @@ class AccountService:
         self._candidate_cache: dict[tuple[str, str, tuple[str, ...]], tuple[float, list[dict[str, Any]]]] = {}
         self._account_update_locks: dict[str, Lock] = {}
         self._accounts = self._load_accounts()
+        self._cooldown_candidates_lock = Lock()
+        self._cooldown_batches: dict[tuple, tuple[deque, tuple[float, str]]] = {}
+        self._cooldown_empty_until: dict[tuple, float] = {}
+        self._cooldown_metrics_lock = Lock()
+        self._cooldown_metrics_cache: dict | None = None
+        self._memory_image_index = None
+        if not self._database_features_enabled():
+            self._rebuild_memory_image_index()
         self._last_full_reload_at = time.monotonic()
         self._cumulative_total = self._load_cumulative_total()
 
@@ -207,6 +218,7 @@ class AccountService:
             self._invalidate_candidate_cache()
             return
         self.storage.save_accounts(snapshot)
+        self._rebuild_memory_image_index()
         self._invalidate_candidate_cache()
 
     def _save_account(self, account: dict, *, previous: dict | None = None, invalidate: bool | None = None) -> None:
@@ -216,6 +228,8 @@ class AccountService:
             with self._lock:
                 snapshot = [dict(item) for item in self._accounts.values()]
             self.storage.save_accounts(snapshot)
+            self._memory_image_index.update(account, self._is_image_account_available(account),
+                                            plan_type=self._normalize_account_type(account.get("type")))
         if invalidate is None:
             invalidate = previous is None or self._candidate_availability_changed(previous, account)
         if invalidate:
@@ -225,6 +239,10 @@ class AccountService:
         with self._candidate_cache_lock:
             self._candidate_cache.clear()
             self._candidate_cache_generation += 1
+        if hasattr(self, "_cooldown_candidates_lock"):
+            with self._cooldown_candidates_lock:
+                self._cooldown_batches.clear()
+                self._cooldown_empty_until.clear()
 
     @staticmethod
     def _candidate_fields_changed(before: dict[str, Any] | None, after: dict[str, Any] | None) -> bool:
@@ -294,6 +312,9 @@ class AccountService:
         cleaned = [str(token or "").strip() for token in tokens if str(token or "").strip()]
         if not cleaned:
             return 0
+        if self._memory_image_index is not None:
+            for token in cleaned:
+                self._memory_image_index.remove(token)
         if self._database_features_enabled():
             return int(self.storage.delete_account_tokens(cleaned))
         self._save_accounts()
@@ -642,6 +663,8 @@ class AccountService:
         with self._lock:
             old_token = self._resolve_access_token_locked(old_access_token)
             current = dict(self._accounts.get(old_token) or {})
+        if self._database_features_enabled():
+            current = self.storage.get_account(old_token) or current
         if not current:
             return old_token
         new_token = str(token_data.get("access_token") or old_token).strip()
@@ -668,10 +691,13 @@ class AccountService:
 
         rotated = new_token != old_token
         if rotated:
+            runtime_state.transfer_image_slot(old_token, new_token, self._image_slot_ttl_seconds(),
+                                              strict=config.image_account_cooldown_minutes > 0)
             with self._lock:
                 self._accounts.pop(old_token, None)
+            if self._memory_image_index is not None:
+                self._memory_image_index.remove(old_token)
             runtime_state.set_alias(old_token, new_token)
-            runtime_state.transfer_image_slot(old_token, new_token, self._image_slot_ttl_seconds())
             if self._database_features_enabled():
                 self.storage.delete_account_tokens([old_token])
         with self._lock:
@@ -1338,6 +1364,92 @@ class AccountService:
             "plan_types": sorted(str(item) for item in plan_types) if plan_types else None,
         }
 
+    def _rebuild_memory_image_index(self) -> None:
+        index = MemoryImageCandidateIndex()
+        with self._lock:
+            for account in self._accounts.values():
+                index.update(account, self._is_image_account_available(account),
+                             plan_type=self._normalize_account_type(account.get("type")))
+            self._memory_image_index = index
+
+    def _next_cooldown_candidate(self, plan_type=None, source_type=None, plan_types=None) -> str | None:
+        plan = str(self._normalize_account_type(plan_type) or "").lower() if plan_type else ""
+        source = self._normalize_source_type(source_type) if source_type else ""
+        plans = tuple(sorted({str(self._normalize_account_type(item) or "").lower() for item in (plan_types or ())}))
+        key = (plan, source, plans)
+        with self._cooldown_candidates_lock:
+            now = time.time()
+            if self._cooldown_empty_until.get(key, 0) > now:
+                return None
+            batch, cursor = self._cooldown_batches.get(key, (deque(), (-1.0, "")))
+            if not batch:
+                for _ in range(2):
+                    kwargs = dict(now=now, after=cursor, limit=128, plan_type=plan,
+                                  source_type=source, plan_types=plans)
+                    if self._database_features_enabled():
+                        rows = self.storage.list_image_cooldown_candidates(**kwargs)
+                    else:
+                        rows = self._memory_image_index.page(**kwargs)
+                    if rows:
+                        batch.extend(row["access_token"] for row in rows)
+                        cursor = (float(rows[-1]["image_cooldown_until"]), rows[-1]["cursor_hash"])
+                        break
+                    if cursor == (-1.0, ""):
+                        # Coalesce a burst when the entire eligible pool is cooling.
+                        self._cooldown_empty_until[key] = now + 0.25
+                        break
+                    cursor = (-1.0, "")
+                self._cooldown_batches[key] = (batch, cursor)
+            return batch.popleft() if batch else None
+
+    def _acquire_cooldown_candidate(self, excluded_tokens=None, plan_type=None, source_type=None,
+                                    plan_types=None, deadline=None) -> str:
+        if is_multi_worker_runtime() and not self._database_features_enabled():
+            raise ImageSchedulingUnavailable("Multi-worker cooldown scheduling requires database storage and shared Redis.")
+        excluded = excluded_tokens or set()
+        seen = set()
+        # Each request traverses at most one pool cycle, without sleeping or spinning.
+        while True:
+            if deadline is not None:
+                deadline.require()
+            try:
+                token = self._next_cooldown_candidate(plan_type, source_type, plan_types)
+            except Exception as exc:
+                raise ImageSchedulingUnavailable("Image scheduling unavailable: candidate storage failed.") from exc
+            if not token or token in seen:
+                break
+            seen.add(token)
+            if token in excluded:
+                continue
+            claimed = runtime_state.acquire_image_slot(
+                [token], max_concurrency=1, strict=True,
+                # A crashed request remains isolated for a full cooling window.
+                ttl_seconds=self._image_slot_ttl_seconds() + config.image_account_cooldown_minutes * 60,
+            )
+            if not claimed:
+                continue
+            try:
+                # Do not use get_account's stale-on-storage-error fallback here.
+                account = (self.storage.get_account(token) if self._database_features_enabled()
+                           else self.get_account(token, fresh=False))
+                if (self._is_image_account_available(account)
+                        and cooldown_until(account) <= time.time()
+                        and self._account_matches_plan_type(account, plan_type)
+                        and self._account_matches_source_type(account, source_type)
+                        and self._account_matches_any_plan_type(account, plan_types)):
+                    with self._lock:
+                        self._accounts[token] = self._normalize_account(account)
+                    return token
+            except Exception as exc:
+                runtime_state.release_image_slot(token)
+                raise ImageSchedulingUnavailable("Image scheduling unavailable: account verification failed.") from exc
+            runtime_state.release_image_slot(token)
+        metrics = self.get_image_cooldown_metrics()
+        until = metrics.get("next_thaw_at")
+        retry_after = max(1, math.ceil(until - time.time())) if until else 1
+        detail = f" Earliest pool cooldown ends at {datetime.fromtimestamp(until, timezone.utc).isoformat()}." if until else ""
+        raise ImageSchedulingUnavailable("No schedulable image account; accounts may be cooling, busy or out of quota." + detail, retry_after)
+
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -1346,6 +1458,8 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: ImageRequestDeadline | None = None,
     ) -> str:
+        if config.image_account_cooldown_minutes > 0:
+            return self._acquire_cooldown_candidate(excluded_tokens, plan_type, source_type, plan_types, deadline)
         wait_started_at = time.monotonic()
         wait_attempts = 0
         while True:
@@ -1573,7 +1687,7 @@ class AccountService:
             inflight = runtime_state.image_inflight_snapshot(tokens)
             result = []
             for item in self._accounts.values():
-                account = dict(item)
+                account = public_account(item)
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(inflight.get(token, 0))
                 account["restore_due"] = self._is_image_restore_due(account)
@@ -1747,7 +1861,7 @@ class AccountService:
             else:
                 self._save_accounts()
             self._record_icloud_registered(registered_accounts)
-            items = [dict(item) for item in self._accounts.values()]
+            items = [public_account(item) for item in self._accounts.values()]
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})
         return {"added": added, "skipped": skipped, "items": items}
@@ -1922,9 +2036,30 @@ class AccountService:
         rate_limit_429: bool = False,
         quota_exhausted: bool = False,
     ) -> dict | None:
-        if not access_token:
+        try:
+            result = self._persist_image_result(access_token, success,
+                                               rate_limit_429=rate_limit_429,
+                                               quota_exhausted=quota_exhausted)
+        except Exception as exc:
+            if not success:
+                self.release_image_slot(access_token)
+                raise
+            # The upstream image already exists. Keep the conservative slot expiry
+            # and deliver it, instead of retrying generation after a storage error.
+            logger.error({"event": "image_success_bookkeeping_failed",
+                          "token": anonymize_token(access_token), "error": str(exc)})
             return None
         self.release_image_slot(access_token)
+        return result
+
+    def _persist_image_result(
+        self, access_token: str, success: bool, *, rate_limit_429: bool = False,
+        quota_exhausted: bool = False,
+    ) -> dict | None:
+        if not access_token:
+            return None
+        completed_at = time.time()
+        cooldown_minutes = config.image_account_cooldown_minutes
         update_lock = self._account_update_lock(access_token)
         with update_lock:
             with self._lock:
@@ -1937,6 +2072,8 @@ class AccountService:
                 next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
+                    if cooldown_minutes > 0:
+                        next_item["image_cooldown_until"] = max(cooldown_until(next_item), completed_at + cooldown_minutes * 60)
                     next_item["success"] = int(next_item.get("success") or 0) + 1
                     if not image_quota_unknown:
                         next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
@@ -2465,6 +2602,47 @@ class AccountService:
             "total_fail": total_fail,
             "by_type": by_type,
         }
+
+    def get_image_cooldown_metrics(self) -> dict:
+        now = time.time()
+        if config.image_account_cooldown_minutes == 0:
+            return {"cooling_accounts": 0, "thawing_within_hour": 0, "next_thaw_at": None, "as_of": now}
+        with self._cooldown_metrics_lock:
+            cached = self._cooldown_metrics_cache
+            if cached and now - cached["as_of"] < 15:
+                return dict(cached)
+            cache_key = "account:image:cooldown:metrics:v1"
+            lock_key = cache_key + ":lock"
+            owner = ""
+            if runtime_state.redis_enabled:
+                raw = runtime_state.get_flag(cache_key)
+                shared = json.loads(raw) if raw else None
+                if shared and now - shared["as_of"] < 15:
+                    self._cooldown_metrics_cache = shared
+                    return dict(shared)
+                owner = runtime_state.acquire_lock(lock_key, 5, allow_memory_fallback=False)
+                if not owner:
+                    if shared:
+                        return dict(shared)
+                    # Only dashboard requests wait here, never successful selection.
+                    for _ in range(10):
+                        time.sleep(0.02)
+                        raw = runtime_state.get_flag(cache_key)
+                        if raw:
+                            return json.loads(raw)
+                    raise ImageSchedulingUnavailable("Cooldown statistics are temporarily unavailable.")
+            try:
+                metrics = (self.storage.get_image_cooldown_metrics(now) if self._database_features_enabled()
+                           else self._memory_image_index.metrics(now))
+                self._cooldown_metrics_cache = metrics
+                if owner:
+                    runtime_state.set_flag(cache_key, json.dumps(metrics), ttl_seconds=30)
+                return dict(metrics)
+            except Exception as exc:
+                raise ImageSchedulingUnavailable("Cooldown statistics are temporarily unavailable.") from exc
+            finally:
+                if owner:
+                    runtime_state.release_lock(lock_key, owner)
 
     def get_image_pool_metrics(self) -> dict[str, int]:
         if self._database_features_enabled():
