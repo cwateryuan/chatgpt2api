@@ -49,6 +49,7 @@ import {
   cancelBulkJob,
   fetchAccountAutoRefresh,
   fetchAccounts,
+  fetchImageCooldownMetrics,
   fetchModels,
   fetchRefreshProgress,
   fetchReLoginProgress,
@@ -60,6 +61,7 @@ import {
   type Account,
   type AccountStatus,
   type ICloudAccountStats,
+  type ImageCooldownMetrics,
   type Model,
   type RefreshProgressResponse,
 } from "@/lib/api";
@@ -95,10 +97,13 @@ const statusMeta: Record<
 const metricCards = [
   { key: "total", label: "账户总数", color: "text-stone-900", icon: UserRound },
   { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
+  { key: "cooling", label: "冷却中账号", color: "text-amber-600", icon: LoaderCircle },
+  { key: "schedulable", label: "可调度账号", color: "text-teal-600", icon: CheckCircle2 },
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
+  { key: "thawingWithinHour", label: "1小时内解冻", color: "text-sky-600", icon: CalendarDays },
 ] as const;
 
 const icloudMetricCards = [
@@ -221,6 +226,7 @@ function AccountsPageContent() {
   const didLoadRef = useRef(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [icloudStats, setIcloudStats] = useState<ICloudAccountStats | null>(null);
+  const [cooldownMetrics, setCooldownMetrics] = useState<ImageCooldownMetrics | null>(null);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
@@ -261,15 +267,39 @@ function AccountsPageContent() {
   const refreshPollingCancelledRef = useRef(false);
   const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
 
+  const loadCooldownMetrics = async (notify = false) => {
+    try {
+      setCooldownMetrics(await fetchImageCooldownMetrics());
+    } catch (error) {
+      if (notify) {
+        const message = error instanceof Error ? error.message : "加载冷却统计失败";
+        toast.error(message);
+      }
+    }
+  };
+
   const loadAccounts = async (silent = false) => {
     if (!silent) {
       setIsLoading(true);
     }
     try {
-      const data = await fetchAccounts();
+      const [accountsResult, cooldownResult] = await Promise.allSettled([
+        fetchAccounts(),
+        fetchImageCooldownMetrics(),
+      ]);
+      if (accountsResult.status === "rejected") {
+        throw accountsResult.reason;
+      }
+      const data = accountsResult.value;
       setAccounts(data.items);
       setIcloudStats(data.icloud_stats);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      if (cooldownResult.status === "fulfilled") {
+        setCooldownMetrics(cooldownResult.value);
+      } else if (!silent) {
+        const message = cooldownResult.reason instanceof Error ? cooldownResult.reason.message : "加载冷却统计失败";
+        toast.error(message);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "加载账户失败";
       toast.error(message);
@@ -335,9 +365,11 @@ function AccountsPageContent() {
     void loadAccounts();
     void loadModels();
     void loadAutoRefresh();
+    const cooldownTimer = window.setInterval(() => void loadCooldownMetrics(), 60_000);
 
     return () => {
       refreshPollingCancelledRef.current = true;
+      window.clearInterval(cooldownTimer);
     };
   }, []);
 
@@ -377,9 +409,12 @@ function AccountsPageContent() {
     const abnormal = accounts.filter((item) => item.status === "异常").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
     const quota = formatQuotaSummary(accounts);
+    const cooling = cooldownMetrics?.cooling_accounts ?? "—";
+    const schedulable = typeof cooling === "number" ? Math.max(active - cooling, 0) : "—";
+    const thawingWithinHour = cooldownMetrics?.thawing_within_hour ?? "—";
 
-    return { total, active, limited, abnormal, disabled, quota };
-  }, [accounts]);
+    return { total, active, cooling, schedulable, limited, abnormal, disabled, quota, thawingWithinHour };
+  }, [accounts, cooldownMetrics]);
 
   const accountTypeOptions = useMemo(
     () => [
@@ -425,6 +460,7 @@ function AccountsPageContent() {
       if (data.icloud_stats) {
         setIcloudStats(data.icloud_stats);
       }
+      void loadCooldownMetrics();
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
@@ -501,7 +537,17 @@ function AccountsPageContent() {
         const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
         const runningQuota: string | number = baseHasUnlimited ? "∞" : baseHasUnknown
           ? "未知" : formatCompact(baseQuotaNum + (p.total_quota ?? 0));
-        setRefreshSummary({ total: accounts.length, active: runningActive, limited: runningLimited, abnormal: runningAbnormal, disabled: runningDisabled, quota: runningQuota });
+        setRefreshSummary({
+          total: accounts.length,
+          active: runningActive,
+          cooling: summary.cooling,
+          schedulable: typeof summary.cooling === "number" ? Math.max(runningActive - summary.cooling, 0) : "—",
+          limited: runningLimited,
+          abnormal: runningAbnormal,
+          disabled: runningDisabled,
+          quota: runningQuota,
+          thawingWithinHour: summary.thawingWithinHour,
+        });
         if (p.done) {
           data = p;
           break;
@@ -637,10 +683,13 @@ function AccountsPageContent() {
               setRefreshSummary({
                 total: accounts.length,
                 active: runningActive,
+                cooling: summary.cooling,
+                schedulable: typeof summary.cooling === "number" ? Math.max(runningActive - summary.cooling, 0) : "—",
                 limited: baseLimited,
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
                 quota: summary.quota,
+                thawingWithinHour: summary.thawingWithinHour,
               });
             }
           } catch (err) {
@@ -656,6 +705,7 @@ function AccountsPageContent() {
         const freshData = await fetchAccounts();
         setAccounts(freshData.items);
         setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => item.access_token === id)));
+        void loadCooldownMetrics();
       } catch { /* 静默失败 */ }
 
       setProgress({
@@ -715,6 +765,7 @@ function AccountsPageContent() {
         proxy: editProxy.trim(),
       });
       setAccounts(data.items);
+      void loadCooldownMetrics();
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       setEditingAccount(null);
       toast.success("账号信息已更新");
@@ -790,6 +841,7 @@ function AccountsPageContent() {
             onImported={(items) => {
               if (items) {
                 setAccounts(items);
+                void loadCooldownMetrics();
               } else {
                 void loadAccounts();
               }
@@ -915,7 +967,7 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-9">
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = (refreshSummary ?? summary)[item.key];

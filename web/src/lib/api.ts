@@ -87,6 +87,13 @@ type AccountListResponse = {
   icloud_stats: ICloudAccountStats;
 };
 
+export type ImageCooldownMetrics = {
+  cooling_accounts: number;
+  thawing_within_hour: number;
+  next_thaw_at: number | null;
+  as_of: number;
+};
+
 type ModelListResponse = {
   object: string;
   data: Model[];
@@ -475,6 +482,10 @@ export async function login(authKey: string) {
 
 export async function fetchAccounts() {
   return httpRequest<AccountListResponse>("/api/accounts");
+}
+
+export async function fetchImageCooldownMetrics() {
+  return httpRequest<ImageCooldownMetrics>("/api/accounts/image-cooldown-metrics");
 }
 
 export type AccountAutoRefreshSettings = {
