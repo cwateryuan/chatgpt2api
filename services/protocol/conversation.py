@@ -1811,6 +1811,9 @@ def _generate_single_image(
             ) from exc
         except ImageGenerationError as exc:
             last_stream_error = exc
+            # Attach the selected account before any early return, including 400s.
+            if account_email and not getattr(exc, "account_email", ""):
+                exc.account_email = account_email
             failure = classify_image_exception(exc)
             error_text = str(exc)
             proxy_network_failure = (
@@ -1838,8 +1841,6 @@ def _generate_single_image(
             else:
                 account_service.release_image_slot(token)
             slot_released = True
-            if account_email and not getattr(exc, "account_email", ""):
-                exc.account_email = account_email
             if not returned_result and not returned_message and failure.code in {"auth_invalid", "image_quota_exhausted"}:
                 if deadline.remaining() <= 0:
                     raise image_timeout_error(
@@ -1950,7 +1951,13 @@ def _generate_single_image(
             if failure.status_code == 400:
                 account_service.release_image_slot(token)
                 slot_released = True
-                raise
+                raise ImageGenerationError(
+                    str(exc) or public_image_error_message(failure, exc),
+                    failure=failure,
+                    account_email=getattr(exc, "account_email", "") or account_email,
+                    conversation_id=getattr(exc, "conversation_id", ""),
+                    raw_error=str(exc),
+                ) from exc
             if failure.account_failure and not proxy_network_failure:
                 account_service.mark_image_result(
                     token,
@@ -2259,6 +2266,18 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                        if getattr(getattr(error, "failure", None), "code", None) == "image_pool_unavailable"]
         if pool_errors and len(pool_errors) == len(errors):
             raise min(pool_errors, key=lambda error: error.failure.retry_after or 1)
+        if errors:
+            # Keep the error associated with the last failed image, including
+            # its account and status, instead of reducing it to a message.
+            last_exception = errors[max(errors)]
+            if isinstance(last_exception, ImageGenerationError):
+                raise last_exception
+            raise ImageGenerationError(
+                image_stream_error_message(str(last_exception)),
+                failure=classify_image_exception(last_exception),
+                account_email=getattr(last_exception, "account_email", ""),
+                conversation_id=getattr(last_exception, "conversation_id", ""),
+            ) from last_exception
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")
