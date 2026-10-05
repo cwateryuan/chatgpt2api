@@ -10,6 +10,23 @@
 
 冷却设置为 0 时不启用此特殊错误冷却和换号。未进入特殊换号分支的非 400 错误保留原有 20 秒重试规则，其他 400 直接返回。已经收到图片结果后不重复提交生成，避免产生重复图片。
 
+## 最终无图回复的限流归零规则
+
+以下规则属于账号限流，独立于冷却配置，即使 `image_account_cooldown_minutes=0` 也生效。仅在本张图片最终没有结果时检查上游回复，不检查用户输入或中间工具参数；已有图片优先，现有图片轮询和恢复流程继续保留。
+
+- 工具参数文本：去除首尾空白和完整 Markdown 代码块/加粗包裹后，以 `{` 开头、以 `}` 结尾，同时包含 `"size":`、`"n":`、`"prompt":` 三个字段标记。字段顺序、冒号周围空白、字段值和其他字段不限，不要求完整 JSON 解析成功；缺少闭合 `}` 不匹配。参数里的 `referenced_image_ids` 是输入参考图，不作为生成结果。
+- 英文提示：合并空白后，精确等于 `It looks like image creation is temporarily unavailable. Do you want to try something else?`、`Generate this image later`、`Schedule this image for free, or upgrade to create it now.`，或后两句按标题、说明顺序合并的内容。
+
+命中后复用额度耗尽记账：`status=限流`、`quota=0`、`image_quota_unknown=false`、`fail` 增加一次，`success` 和 `rate_limit_429` 不变；不新增、延长或清除冷却时间。账号退出调度和可用额度统计。“全部解冻”只清理冷却记录，不能恢复此限流状态或零额度。开启“自动移除限流账号”时沿用现有移除流程，否则保留账号，使用现有恢复检查及上游资料刷新，不按冷却分钟数自动恢复。
+
+换号沿用每张图片从首次选号起的 20 秒窗口，等待、选号和提交前复核时间，已启动的替代请求可在原请求总超时内完成。若已经处于指定错误冷却后的第二次尝试，命中限流后结束，不再额外换号。没有替代账号或窗口结束时保留最后一次限流错误及其邮箱、会话信息。
+
+对外返回 `429`、`code=image_quota_exhausted`、`type=insufficient_quota`。英文提示保留原文；参数 JSON 返回“当前账号生图受限，请更换账号或稍后重试。”。调用日志的 `error` 使用可读说明，原始参数放在同一条日志的 `raw_upstream_message` 中，不重复写入长文本，也不记录全量 SSE。原来显示 `upstream_text_reply / 400` 的匹配回复会改为该限流分类。
+
+不新增数据库字段、管理接口、定时器、全量账号扫描或上游探测。数据库复用单账号事务，JSON 沿用一次完整文件保存成本；普通、流式、后台任务及多图请求共用同一记账入口。
+
+## 冷却配置调整
+
 修改正数会按账号原触发时间（生图成功或指定错误）重算仍在冷却的截止时间；没有开始时间的旧记录按旧配置推算，无法推算时以修改时刻为起点。关闭时忽略冷却限制但保留记录，重新启用后仍未到期的记录继续生效。管理员可使用“解冻全部冷却账号”清除历史记录；应用重启不会清空冷却。
 
 不统一隔离或探测老账号；上线后自然请求，成功后开始冷却。外部系统直接拿账号调用上游不受本项目内部调度约束。
@@ -56,6 +73,7 @@
 
 ```powershell
 uv run --with 'fakeredis[lua]' python -m unittest test.test_image_cooldown
+uv run --no-sync python -m unittest test.test_final_image_reply_limit
 uv run --with psutil python -m scripts.benchmark_image_cooldown
 ```
 

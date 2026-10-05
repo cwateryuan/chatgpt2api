@@ -20,6 +20,8 @@ from services.image_failure import (
     ImageGenerationError,
     ImageGenerationTimeoutError,
     classify_conversation_failure,
+    classify_final_image_exception,
+    classify_final_image_reply,
     classify_image_exception,
     classify_message_facts,
     classify_upstream_message,
@@ -27,6 +29,7 @@ from services.image_failure import (
     image_failure,
     image_failure_priority,
     is_auth_invalid_error,
+    is_image_parameter_text,
     merge_message_failure,
     public_image_error_message,
 )
@@ -174,10 +177,11 @@ class _ImageAttemptFailure(Exception):
     """Carry a terminal attempt past the legacy retry handlers exactly once."""
 
     def __init__(self, error: ImageGenerationError, *, cooldown: bool,
-                 outputs: list[ImageOutput] | None = None):
+                 outputs: list[ImageOutput] | None = None, limited_reply: bool = False):
         super().__init__(str(error))
         self.error = error
         self.cooldown = cooldown
+        self.limited_reply = limited_reply
         self.outputs = outputs
         self.received_at = time.time()
 
@@ -740,6 +744,16 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
         or (state.tool_invoked is True and not is_user_msg)
         or (is_patch_event and not is_user_msg and ("asset_pointer" in payload or "file-service://" in payload))
     )
+    if isinstance(event, dict):
+        value = event.get("v")
+        message = event.get("message") or (value.get("message") if isinstance(value, dict) else None)
+        text = assistant_message_text(message) if isinstance(message, dict) else value
+        text_patch = (message is None and state.message_role in {"assistant", "user"}
+                      and state.content_type in {"text", "code"}
+                      and (isinstance(value, str) or is_patch_event))
+        if (is_image_parameter_text(text) or text_patch) and '"asset_pointer"' not in payload:
+            # References inside full or incrementally streamed tool arguments are inputs.
+            image_context = False
     if image_context:
         add_unique(state.file_ids, file_ids)
         add_unique(state.sediment_ids, sediment_ids)
@@ -1648,11 +1662,13 @@ def _generate_single_image(
     deadline = _deadline_from_request(request)
     retry_started_at = time.monotonic()
     cooldown_retry: _ImageAttemptFailure | None = None
+    limited_reply_retry: _ImageAttemptFailure | None = None
     retry_selection_deadline = _ImageRetrySelectionDeadline(deadline, retry_started_at)
 
     while True:
-        if cooldown_retry is not None and retry_selection_deadline.remaining() <= 0:
-            return cooldown_retry.finish()
+        selection_failure = cooldown_retry or limited_reply_retry
+        if selection_failure is not None and retry_selection_deadline.remaining() <= 0:
+            return selection_failure.finish()
         try:
             deadline.require()
         except ImageDeadlineExpired as exc:
@@ -1669,17 +1685,17 @@ def _generate_single_image(
                 plan_type=plan_type,
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
-                deadline=retry_selection_deadline if cooldown_retry is not None else deadline,
+                deadline=retry_selection_deadline if selection_failure is not None else deadline,
                 excluded_tokens=excluded_tokens,
                 request_proxy=request_proxy,
             )
         except ImageDeadlineExpired as exc:
-            if cooldown_retry is not None:
-                return cooldown_retry.finish()
+            if selection_failure is not None:
+                return selection_failure.finish()
             raise image_timeout_error(deadline, account_email=account_email) from exc
         except RuntimeError as exc:
-            if cooldown_retry is not None:
-                return cooldown_retry.finish()
+            if selection_failure is not None:
+                return selection_failure.finish()
             if isinstance(exc, ImageSchedulingUnavailable):
                 retry_count += 1
                 retry_after = float(exc.retry_after)
@@ -1718,9 +1734,9 @@ def _generate_single_image(
                 ) from last_stream_error
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
-        if cooldown_retry is not None and (token in excluded_tokens or retry_selection_deadline.remaining() <= 0):
+        if selection_failure is not None and (token in excluded_tokens or retry_selection_deadline.remaining() <= 0):
             account_service.release_image_slot(token)
-            return cooldown_retry.finish()
+            return selection_failure.finish()
 
         emitted_for_token = False
         returned_message = False
@@ -1745,21 +1761,32 @@ def _generate_single_image(
         })
         backend: OpenAIBackendAPI | None = None
         outputs: list[ImageOutput] = []
+        pending_limit: ImageGenerationError | None = None
         try:
             try:
-                if cooldown_retry is not None and retry_selection_deadline.remaining() <= 0:
-                    raise cooldown_retry
+                if selection_failure is not None and retry_selection_deadline.remaining() <= 0:
+                    raise selection_failure
                 backend = OpenAIBackendAPI(access_token=token, request_proxy=request_proxy)
                 effective_proxy = str(getattr(backend, "pool_proxy", "") or "")
                 generation_started_at = time.monotonic()
                 if request.progress_callback:
                     backend.progress_callback = request.progress_callback
                 stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
-                if cooldown_retry is not None and retry_selection_deadline.remaining() <= 0:
-                    raise cooldown_retry
+                if selection_failure is not None and retry_selection_deadline.remaining() <= 0:
+                    raise selection_failure
+                limited_reply_retry = None
                 for output in stream_fn(backend, request, index, total):
                     if account_email and not output.account_email:
                         output.account_email = account_email
+                    limit_failure = classify_final_image_reply(output.text) if output.kind == "message" else None
+                    if limit_failure is not None:
+                        # Wait for the iterator to finish: a following image takes precedence.
+                        pending_limit = ImageGenerationError(
+                            limit_failure.public_detail, failure=limit_failure,
+                            account_email=account_email, conversation_id=output.conversation_id,
+                            raw_upstream_message=output.text,
+                        )
+                        continue
                     cooldown_reply = output.kind == "message" and _matches_image_error_cooldown(output.text)
                     if cooldown_reply and returned_result:
                         # A delivered image wins over a trailing error message.
@@ -1782,10 +1809,21 @@ def _generate_single_image(
                     returned_message = output.kind == "message"
                     returned_result = returned_result or output.kind == "result"
                     outputs.append(output)
+                if pending_limit is not None and not returned_result:
+                    raise _ImageAttemptFailure(pending_limit, cooldown=False, limited_reply=True)
             except _ImageAttemptFailure:
                 raise
             except Exception as exc:
                 failure = classify_image_exception(exc)
+                limit_failure = classify_final_image_exception(exc, failure)
+                if limit_failure is not None:
+                    error = ImageGenerationError(
+                        limit_failure.public_detail, failure=limit_failure,
+                        account_email=getattr(exc, "account_email", "") or account_email,
+                        conversation_id=getattr(exc, "conversation_id", ""),
+                        raw_upstream_message=limit_failure.raw_detail,
+                    )
+                    raise _ImageAttemptFailure(error, cooldown=False, limited_reply=True) from exc
                 message = public_image_error_message(failure, exc)
                 cooldown_reply = _matches_image_error_cooldown(message)
                 if cooldown_reply or cooldown_retry is not None:
@@ -1839,10 +1877,24 @@ def _generate_single_image(
             slot_released = True
             return outputs
         except _ImageAttemptFailure as stopped:
-            if stopped is cooldown_retry:
+            if stopped is selection_failure:
                 # The window closed during replacement setup; no request was sent.
                 account_service.release_image_slot(token)
                 slot_released = True
+                return stopped.finish()
+            if stopped.limited_reply:
+                if returned_result:
+                    account_service.mark_image_result(token, True)
+                    slot_released = True
+                    return outputs
+                account_service.mark_image_result(token, False, quota_exhausted=True)
+                slot_released = True
+                excluded_tokens.add(token)
+                if cooldown_retry is None:
+                    retry_count += 1
+                    if _retry_image_attempt(request, retry_started_at, retry_count):
+                        limited_reply_retry = stopped
+                        continue
                 return stopped.finish()
             if stopped.cooldown:
                 if returned_result:

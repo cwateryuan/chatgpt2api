@@ -15,6 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
+from services.image_failure import image_failure_log_fields
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
 
@@ -251,21 +252,21 @@ class LoggedCall:
     extra_detail: dict[str, Any] = field(default_factory=dict)
 
     async def run(self, handler, *args, sse: str = "openai"):
-        from services.image_failure import ImageGenerationError, classify_image_exception
+        from services.image_failure import ImageGenerationError
 
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""),
-                     extra_detail=classify_image_exception(exc).diagnostic_fields())
+                     extra_detail=image_failure_log_fields(exc))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     extra_detail=classify_image_exception(exc).diagnostic_fields())
+                     extra_detail=image_failure_log_fields(exc))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
@@ -282,14 +283,14 @@ class LoggedCall:
         except ImageGenerationError as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""),
-                     extra_detail=classify_image_exception(exc).diagnostic_fields())
+                     extra_detail=image_failure_log_fields(exc))
             return _image_error_response(exc)
         except HTTPException as exc:
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
-                     extra_detail=classify_image_exception(exc).diagnostic_fields())
+                     extra_detail=image_failure_log_fields(exc))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
@@ -311,16 +312,14 @@ class LoggedCall:
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
-            from services.image_failure import classify_image_exception
-            failure = classify_image_exception(exc)
             self.log(
                 "流式调用失败",
                 status="failed",
                 error=str(exc),
                 urls=urls,
-                account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
-                conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
-                extra_detail=failure.diagnostic_fields(),
+                account_email=getattr(exc, "account_email", "") or (account_emails[0] if account_emails else ""),
+                conversation_id=getattr(exc, "conversation_id", "") or (conversation_ids[0] if conversation_ids else ""),
+                extra_detail=image_failure_log_fields(exc),
             )
             if self.endpoint.startswith("/v1/images") and not hasattr(exc, "to_openai_error"):
                 from services.image_failure import ImageGenerationError, classify_image_exception, public_image_error_message

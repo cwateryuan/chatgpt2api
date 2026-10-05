@@ -31,6 +31,7 @@ from services.image_failure import (
     classify_image_exception,
     classify_task_failure,
     image_failure,
+    is_image_parameter_text,
     merge_message_failure,
 )
 from services.image_timeout import ImageDeadlineExpired, ImageRequestDeadline
@@ -2184,14 +2185,18 @@ class OpenAIBackendAPI:
 
         def walk(value: Any) -> None:
             if isinstance(value, str):
+                # Tool arguments reference input files, not generated output assets.
+                if is_image_parameter_text(value):
+                    return
                 # 只提取真正的图片文件 ID（file_00000000... 格式）和 file-service:// URI
                 cls._add_unique(file_ids, FILE_SERVICE_ID_RE.findall(value))
                 cls._add_unique(file_ids, REAL_IMAGE_FILE_ID_RE.findall(value))
                 cls._add_unique(sediment_ids, SEDIMENT_ID_RE.findall(value))
                 return
             if isinstance(value, dict):
-                for item in value.values():
-                    walk(item)
+                for key, item in value.items():
+                    if key != "referenced_image_ids":
+                        walk(item)
                 return
             if isinstance(value, list):
                 for item in value:
@@ -2426,7 +2431,9 @@ class OpenAIBackendAPI:
                         "failure_code": pending_failure.code,
                         "error_msg": str(raw_detail)[:200],
                     })
-                    raise ImageFailureError(str(raw_detail or "image generation failed"), failure=pending_failure)
+                    error = ImageFailureError(str(raw_detail or "image generation failed"), failure=pending_failure)
+                    error.conversation_id = conversation_id
+                    raise error
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})

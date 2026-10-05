@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -284,6 +285,75 @@ def _message_text(message: Mapping[str, Any]) -> str:
 def _quota_exhausted_text(text: Any) -> bool:
     normalized = str(text or "").strip().lower()
     return bool(normalized) and any(term in normalized for term in _QUOTA_EXHAUSTED_TERMS)
+
+
+FINAL_IMAGE_LIMIT_MESSAGE = "当前账号生图受限，请更换账号或稍后重试。"
+_FINAL_IMAGE_LIMIT_TEXTS = frozenset({
+    "It looks like image creation is temporarily unavailable. Do you want to try something else?",
+    "Generate this image later",
+    "Schedule this image for free, or upgrade to create it now.",
+    "Generate this image later Schedule this image for free, or upgrade to create it now.",
+})
+_IMAGE_PARAMETER_KEYS = tuple(re.compile(r'"' + key + r'"\s*:') for key in ("size", "n", "prompt"))
+_WHOLE_JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```", re.IGNORECASE)
+
+
+def _unwrap_image_reply(message: Any) -> str:
+    if not isinstance(message, str):
+        return ""
+    text = message.strip()
+    while text:
+        fence = _WHOLE_JSON_FENCE.fullmatch(text)
+        if fence:
+            text = fence.group(1).strip()
+        elif text.startswith("**") and text.endswith("**") and len(text) >= 4:
+            text = text[2:-2].strip()
+        else:
+            break
+    return text
+
+
+def is_image_parameter_text(message: Any) -> bool:
+    """Recognize tool arguments; this alone does not imply a final failure."""
+    text = _unwrap_image_reply(message)
+    return (text.startswith("{") and text.endswith("}")
+            and all(pattern.search(text) for pattern in _IMAGE_PARAMETER_KEYS))
+
+
+def classify_final_image_reply(message: Any) -> ImageFailure | None:
+    """Only call on a final no-image reply, never on input or intermediate tool events."""
+    text = _unwrap_image_reply(message)
+    parameters = is_image_parameter_text(text)
+    if parameters or " ".join(text.split()) in _FINAL_IMAGE_LIMIT_TEXTS:
+        return image_failure("image_quota_exhausted", raw_detail=message).with_public_detail(
+            FINAL_IMAGE_LIMIT_MESSAGE if parameters else text)
+    return None
+
+
+def classify_final_image_exception(exc: BaseException, failure: ImageFailure) -> ImageFailure | None:
+    # A timeout or transport failure carrying progress text is not a terminal reply.
+    if failure.code in {"image_generation_timeout", "image_poll_timeout", "image_stream_timeout",
+                        "image_stream_interrupted", "upstream_connection_timeout", "upstream_connection_failed"}:
+        return None
+    candidates = [getattr(exc, "raw_upstream_message", None), getattr(exc, "upstream_error", None),
+                  failure.public_detail, failure.raw_detail, getattr(exc, "raw_error", None), str(exc)]
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            candidate = _text_from_mapping(candidate)
+        matched = classify_final_image_reply(candidate)
+        if matched is not None:
+            return matched
+    return None
+
+
+def image_failure_log_fields(exc: BaseException) -> dict[str, Any]:
+    failure = classify_image_exception(exc)
+    fields = failure.diagnostic_fields()
+    raw = getattr(exc, "raw_upstream_message", "")
+    if (failure.code == "image_quota_exhausted" and raw and raw != str(exc)
+            and classify_final_image_reply(raw) is not None):
+        fields["raw_upstream_message"] = raw
+    return fields
 
 
 def is_auth_invalid_error(text: Any) -> bool:

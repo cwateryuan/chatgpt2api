@@ -13,7 +13,7 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.image_timeout import ImageRequestDeadline
-from services.image_failure import classify_image_exception
+from services.image_failure import classify_image_exception, image_failure_log_fields
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
@@ -386,7 +386,8 @@ class ImageTaskService:
                 status="failed",
                 error=error_message,
                 account_email=account_email,
-                extra_detail={**log_detail, **failure.diagnostic_fields()},
+                extra_detail={**log_detail, **image_failure_log_fields(exc),
+                              **({"conversation_id": conversation_id} if conversation_id else {})},
             )
 
     def _log_call(
