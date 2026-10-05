@@ -2040,6 +2040,53 @@ class AccountService:
             return False
         return True
 
+    def cooldown_image_account(self, access_token: str, *, started_at: float) -> dict | None:
+        """Persist an error cooldown without changing quota/counters, then release the slot."""
+        if not access_token:
+            return None
+        try:
+            with self._account_update_lock(access_token):
+                with self._lock:
+                    resolved = self._resolve_access_token_locked(access_token) or access_token
+
+                def apply_cooldown(current: dict | None) -> dict | None:
+                    if current is None:
+                        return None
+                    updated = dict(current)
+                    minutes = config.image_account_cooldown_minutes
+                    until = started_at + minutes * 60
+                    if minutes > 0 and until >= cooldown_until(current):
+                        updated["image_cooldown_started_at"] = started_at
+                        updated["image_cooldown_until"] = until
+                    return updated
+
+                if config.image_account_cooldown_minutes <= 0:
+                    account = None
+                elif self._database_features_enabled():
+                    account = self.storage.mutate_account(resolved, apply_cooldown)
+                    if account is None and resolved != access_token:
+                        account = self.storage.mutate_account(access_token, apply_cooldown)
+                    if account is not None:
+                        account = self._normalize_account(account)
+                    if account is not None:
+                        with self._lock:
+                            self._accounts[account["access_token"]] = account
+                else:
+                    with self._lock:
+                        resolved, current = self._load_account_for_token_locked(access_token, fresh=False)
+                        account = apply_cooldown(current)
+                        if account is not None:
+                            self._accounts[resolved] = account
+                            self._save_account(account, previous=current, invalidate=False)
+        except Exception as exc:
+            # Keep the conservative lease if persistence fails. The caller must
+            # not release it again or replace the original upstream error.
+            logger.error({"event": "image_error_cooldown_bookkeeping_failed",
+                          "token": anonymize_token(access_token), "error": str(exc)})
+            return None
+        self.release_image_slot(access_token)
+        return dict(account) if account is not None else None
+
     def mark_image_result(
         self,
         access_token: str,

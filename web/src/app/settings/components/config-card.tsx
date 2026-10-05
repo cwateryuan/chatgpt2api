@@ -192,10 +192,10 @@ export function ConfigCard() {
               placeholder="1"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。启用成功后冷却时，有效并发固定为 1。</p>
+            <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。启用账号冷却时，有效并发固定为 1。</p>
           </div>
           <div className="space-y-2">
-            <label className="text-sm text-stone-700">生图成功后冷却时间</label>
+            <label className="text-sm text-stone-700">生图账号冷却时间</label>
             <Input
               type="number"
               min={0}
@@ -204,7 +204,7 @@ export function ConfigCard() {
               onChange={(event) => setImageAccountCooldownMinutes(event.target.value)}
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位分钟，默认 30；0 为关闭。成功后即使仍有额度也会冷却。修改仅影响后续成功的任务，已有冷却时间不重算。</p>
+            <p className="text-xs text-stone-500">单位分钟，默认 30；0 为关闭。生图成功，或上游消息完全等于“I wasn&apos;t able to generate the image due to an error on my side.”时，账号进入冷却。指定错误在本张图片的 20 秒重试窗口内最多换号一次；换号后的生成仍使用原请求总超时。修改分钟数会按原触发时间重算尚未结束的冷却。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
