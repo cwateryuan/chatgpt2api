@@ -287,7 +287,7 @@ def _quota_exhausted_text(text: Any) -> bool:
     return bool(normalized) and any(term in normalized for term in _QUOTA_EXHAUSTED_TERMS)
 
 
-FINAL_IMAGE_LIMIT_MESSAGE = "当前账号生图受限，请更换账号或稍后重试。"
+FINAL_IMAGE_LIMIT_MESSAGE = "临时生成错误，请重试"
 _FINAL_IMAGE_LIMIT_TEXTS = frozenset({
     "It looks like image creation is temporarily unavailable. Do you want to try something else?",
     "Generate this image later",
