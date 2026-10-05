@@ -6,6 +6,7 @@ import json
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from api.support import require_admin
 from services.register_service import register_service
@@ -33,6 +34,11 @@ class MailHealthResetRequest(BaseModel):
     domain: str | None = None
 
 
+class ApplePoolResetRequest(BaseModel):
+    provider_id: str
+    scope: str = "failed"
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -44,7 +50,10 @@ def create_router() -> APIRouter:
     @router.post("/api/register")
     async def update_register_config(body: RegisterConfigRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"register": register_service.update(body.model_dump(exclude_none=True))}
+        try:
+            return {"register": await run_in_threadpool(register_service.update, body.model_dump(exclude_none=True))}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail={"error": str(error)}) from error
 
     @router.post("/api/register/start")
     async def start_register(authorization: str | None = Header(default=None)):
@@ -78,6 +87,16 @@ def create_router() -> APIRouter:
     async def reset_mail_health(body: MailHealthResetRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"register": register_service.reset_mail_health(body.provider_id or "", body.domain or "")}
+
+    @router.post("/api/register/apple-pool/reset")
+    async def reset_apple_pool(body: ApplePoolResetRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return {"register": await run_in_threadpool(register_service.reset_apple_pool, body.provider_id, body.scope)}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail={"error": str(error)}) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail={"error": str(error)}) from error
 
     @router.get("/api/register/events")
     async def register_events(token: str = ""):

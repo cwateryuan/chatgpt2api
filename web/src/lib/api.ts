@@ -22,6 +22,7 @@ export type Account = {
   type: AccountType;
   source_type?: string | null;
   registration_token_mode?: RegistrationTokenMode | null;
+  registration_engine?: string | null;
   status: AccountStatus;
   quota: number;
   image_quota_unknown?: boolean;
@@ -929,6 +930,13 @@ export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all
   return httpRequest<{ register: RegisterConfig }>("/api/register/outlook-pool/reset", {
     method: "POST",
     body: { scope },
+  });
+}
+
+export async function resetApplePool(providerId: string, scope: "all" | "failed") {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/apple-pool/reset", {
+    method: "POST",
+    body: { provider_id: providerId, scope },
   });
 }
 

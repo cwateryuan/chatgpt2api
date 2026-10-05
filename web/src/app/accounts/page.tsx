@@ -201,7 +201,11 @@ function displayAccountType(account: Account) {
   return account.type || "Free";
 }
 
-function displayAccountSource(account: Account) {
+function isLocalAccount(account: Account) {
+  return Boolean(String(account.registration_engine || "").trim());
+}
+
+function displayAccountSourceName(account: Account) {
   const tokenMode = String(account.registration_token_mode || "").trim().toLowerCase();
   if (tokenMode === "oauth") {
     return "OAuth";
@@ -221,6 +225,11 @@ function displayAccountSource(account: Account) {
     return "web";
   }
   return source;
+}
+
+function displayAccountSource(account: Account) {
+  const source = displayAccountSourceName(account);
+  return isLocalAccount(account) ? `本地 ${source}` : source;
 }
 
 function AccountsPageContent() {
@@ -401,7 +410,7 @@ function AccountsPageContent() {
     return accounts.filter((account) => {
       const searchMatched =
         normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
-      const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
+      const typeMatched = typeFilter === "all" || (typeFilter === "origin:local" ? isLocalAccount(account) : displayAccountType(account) === typeFilter);
       const statusMatched =
         statusFilter === "all" ||
         (statusFilter === "restore_due" ? Boolean(account.restore_due) : account.status === statusFilter);
@@ -442,6 +451,7 @@ function AccountsPageContent() {
   const accountTypeOptions = useMemo(
     () => [
       { label: "全部类型", value: "all" },
+      { label: "本地", value: "origin:local" },
       ...Array.from(new Set(accounts.map(displayAccountType))).map((type) => ({ label: type, value: type })),
     ],
     [accounts],
@@ -1238,7 +1248,7 @@ function AccountsPageContent() {
                     </th>
                     <th className="w-56 px-4 py-3">token</th>
                     <th className="w-28 px-4 py-3">类型</th>
-                    <th className="w-24 px-4 py-3">来源</th>
+                    <th className="w-40 px-4 py-3">来源</th>
                     <th className="w-24 px-4 py-3">状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
@@ -1295,14 +1305,14 @@ function AccountsPageContent() {
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant="outline" className="rounded-md border-stone-200 text-stone-600">
+                          <Badge variant="outline" className="max-w-40 whitespace-normal break-words rounded-md border-stone-200 text-stone-600">
                             {displayAccountSource(account)}
                           </Badge>
                         </td>
                         <td className="px-4 py-3">
                           <Badge
                             variant={status.badge}
-                            className="inline-flex items-center gap-1 rounded-md px-2 py-1"
+                            className="inline-flex items-center gap-1 whitespace-nowrap rounded-md px-2 py-1"
                           >
                             <StatusIcon className="size-3.5" />
                             {account.status}

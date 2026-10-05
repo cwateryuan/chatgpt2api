@@ -7,7 +7,7 @@ import random
 import re
 import string
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, message_from_string, policy
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -21,6 +21,7 @@ from curl_cffi import requests
 from services.config import DATA_DIR
 from services.proxy_service import normalize_proxy_url
 from services.register.mail_health import mail_health_store
+from services.register import apple_mailbox
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -498,6 +499,108 @@ class BaseMailProvider:
 
     def close(self) -> None:
         pass
+
+
+class AppleMailProvider(BaseMailProvider):
+    name = "apple"
+
+    def __init__(self, entry: dict, conf: dict):
+        super().__init__(conf, str(entry.get("provider_ref") or entry.get("id") or ""))
+        self.entry = entry
+        self.label = str(entry.get("label") or self.provider_ref)
+        self.session = _create_session(conf)
+
+    def create_mailbox(self, username: str | None = None) -> dict:
+        credential = apple_mailbox.claim(apple_mailbox.parse_credentials(str(self.entry.get("mailboxes") or "")), self.provider_ref)
+        return {**credential, "provider": self.name, "provider_ref": self.provider_ref, "address": credential["email"], "label": self.label}
+
+    def fetch_recent_messages(self, mailbox: dict, *, deadline: float | None = None) -> list[dict]:
+        url = str(mailbox.get("mail_api_url") or "")
+        if not url:
+            raise apple_mailbox.AppleMailboxError("API URL missing")
+        apple_mailbox.check_cancelled()
+        timeout = self.conf["request_timeout"]
+        if deadline is not None:
+            timeout = min(timeout, max(0.01, deadline - time.monotonic()))
+        try:
+            response = self.session.get(url, timeout=timeout, headers={"Accept": "application/json, text/html", "User-Agent": self.conf["user_agent"]})
+        except Exception:
+            raise apple_mailbox.AppleMailboxError("network request failed") from None
+        try:
+            return apple_mailbox.parse_response(response, mailbox, _parse_received_at)
+        except apple_mailbox.AppleMailboxError as error:
+            if 400 <= error.status_code < 500:
+                mailbox["_apple_credential_error"] = error.status_code
+            raise
+
+    def _pause(self, deadline: float) -> None:
+        end = min(deadline, time.monotonic() + self.conf["wait_interval"])
+        while time.monotonic() < end:
+            apple_mailbox.check_cancelled()
+            time.sleep(min(0.2, max(0, end - time.monotonic())))
+
+    def prepare_code_request(self, mailbox: dict) -> None:
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        failures = 0
+        while time.monotonic() < deadline:
+            try:
+                messages = self.fetch_recent_messages(mailbox, deadline=deadline)
+                mailbox["_apple_baseline_refs"] = [apple_mailbox.message_ref(message) for message in messages]
+                mailbox["_code_requested_at"] = datetime.now(timezone.utc).isoformat()
+                return
+            except apple_mailbox.AppleMailboxError as error:
+                failures += 1
+                if 400 <= error.status_code < 500 or failures >= 3:
+                    raise
+                self._pause(deadline)
+        raise apple_mailbox.AppleMailboxError("baseline timeout")
+
+    def wait_for_code(self, mailbox: dict) -> str | None:
+        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
+        blocked = set(seen_value) | set(mailbox.get("_apple_baseline_refs") or [])
+        deadline = time.monotonic() + self.conf["wait_timeout"]
+        failures = 0
+        while time.monotonic() < deadline:
+            try:
+                messages = self.fetch_recent_messages(mailbox, deadline=deadline)
+                failures = 0
+            except apple_mailbox.AppleMailboxError as error:
+                failures += 1
+                if 400 <= error.status_code < 500 or failures >= 3:
+                    raise
+                self._pause(deadline)
+                continue
+            apple_mailbox.check_cancelled()
+            if time.monotonic() >= deadline:
+                return None
+            for message in messages:
+                ref = apple_mailbox.message_ref(message)
+                if ref in blocked or not _message_after_code_request(message, mailbox, skew_seconds=5):
+                    continue
+                code = apple_mailbox.extract_code(message)
+                if code:
+                    seen_value.append(ref)
+                    return code
+            self._pause(deadline)
+        return None
+
+    def close(self) -> None:
+        self.session.close()
+
+
+def supports_passwordless(mailbox: dict) -> bool:
+    return str(mailbox.get("provider") or "") in {"outlook_token", "apple", "icloud"}
+
+
+def prepare_code_request(mail_config: dict, mailbox: dict) -> None:
+    if str(mailbox.get("provider") or "") not in {"apple", "icloud"}:
+        mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        return
+    provider = _create_provider(mail_config, "apple", str(mailbox.get("provider_ref") or ""))
+    try:
+        provider.prepare_code_request(mailbox)
+    finally:
+        provider.close()
 
 
 class CloudflareTempMailProvider(BaseMailProvider):
@@ -1760,6 +1863,8 @@ def _entries(mail_config: dict) -> list[dict]:
         item = dict(source)
         idx = len(result) + 1
         t = str(item.get("type") or "").strip()
+        if t == "icloud":
+            t = item["type"] = "apple"
         cnt = counters.get(t, 0) + 1
         counters[t] = cnt
         provider_id = str(item.get("id") or f"{t}#{idx}").strip()
@@ -1821,6 +1926,10 @@ def _available_entries(mail_config: dict) -> list[dict]:
     available: list[dict] = []
     for item in sorted(_enabled_entries(mail_config), key=lambda value: (int(value["priority"]), int(value["_config_index"]))):
         provider_type = str(item.get("type") or "")
+        if provider_type == AppleMailProvider.name:
+            if apple_mailbox.has_pending(apple_mailbox.parse_credentials(str(item.get("mailboxes") or ""))):
+                available.append(dict(item))
+            continue
         if provider_type == OutlookTokenProvider.name:
             if _outlook_entry_has_mailbox(item):
                 available.append(dict(item))
@@ -1842,6 +1951,8 @@ def _available_entries(mail_config: dict) -> list[dict]:
 
 
 def _provider_from_entry(entry: dict, conf: dict) -> BaseMailProvider:
+    if entry["type"] in {"apple", "icloud"}:
+        return AppleMailProvider(entry, conf)
     if entry["type"] == "cloudmail_gen":
         return CloudMailGenProvider(entry, conf)
     if entry["type"] == "cloudflare_temp_email":
@@ -1886,7 +1997,7 @@ def _mailbox_health_metadata(mail_config: dict, entry: dict) -> dict[str, Any]:
 
 
 def _record_health_metadata(metadata: dict[str, Any], *, success: bool, error: Exception | str | None = None) -> None:
-    if not metadata.get("_mail_auto_disable") or metadata.get("_mail_provider_type") == OutlookTokenProvider.name:
+    if not metadata.get("_mail_auto_disable") or metadata.get("_mail_provider_type") in {OutlookTokenProvider.name, AppleMailProvider.name}:
         return
     mail_health_store.record_result(
         str(metadata.get("_mail_provider_id") or ""),
@@ -1899,24 +2010,31 @@ def _record_health_metadata(metadata: dict[str, Any], *, success: bool, error: E
 
 
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
-    entries = _available_entries(mail_config)
-    for entry in entries:
-        metadata = _mailbox_health_metadata(mail_config, entry)
-        provider: BaseMailProvider | None = None
-        try:
-            provider = _provider_from_entry(entry, _config(mail_config))
-            mailbox = provider.create_mailbox(username)
-            mailbox.update(metadata)
-            return mailbox
-        except OutlookPoolUnavailableError:
-            continue
-        except Exception as error:
-            _record_health_metadata(metadata, success=False, error=error)
-            raise
-        finally:
-            if provider is not None:
-                provider.close()
-    raise AllMailProvidersUnavailableError("所有 Outlook 邮箱池均已耗尽，且没有其他可用邮箱渠道")
+    while True:
+        revision = apple_mailbox.revision()
+        entries = _available_entries(mail_config)
+        busy = False
+        for entry in entries:
+            metadata = _mailbox_health_metadata(mail_config, entry)
+            provider: BaseMailProvider | None = None
+            try:
+                provider = _provider_from_entry(entry, _config(mail_config))
+                mailbox = provider.create_mailbox(username)
+                mailbox.update(metadata)
+                return mailbox
+            except apple_mailbox.ApplePoolBusyError:
+                busy = True
+            except (OutlookPoolUnavailableError, apple_mailbox.ApplePoolUnavailableError):
+                continue
+            except Exception as error:
+                _record_health_metadata(metadata, success=False, error=error)
+                raise
+            finally:
+                if provider is not None:
+                    provider.close()
+        if not busy:
+            raise AllMailProvidersUnavailableError("邮箱池已耗尽，且没有其他可用邮箱渠道")
+        apple_mailbox.wait_available(revision)
 
 
 def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
@@ -1932,6 +2050,17 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
 
     Outlook 更新单邮箱状态，其他渠道更新自动禁用健康状态。Mailpit 的失败按域名统计。
     """
+    if str(mailbox.get("provider") or "") in {"apple", "icloud"}:
+        reason = str(error or "").lower()
+        if success:
+            apple_mailbox.finish(mailbox, "used")
+        elif isinstance(error, apple_mailbox.AppleMailboxCancelledError) or any(word in reason for word in ("cancel", "timeout", "超时")):
+            apple_mailbox.finish(mailbox, None)
+        elif mailbox.get("_apple_credential_error"):
+            apple_mailbox.finish(mailbox, "token_invalid", f"HTTP/API {mailbox['_apple_credential_error']}")
+        else:
+            apple_mailbox.finish(mailbox, "failed", "registration_failed")
+        return
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         _record_health_metadata(mailbox, success=success, error=error)
         return
@@ -1983,6 +2112,10 @@ def mail_config_with_health(mail_config: dict) -> dict:
                 for domain in domains
             ]
             health["disabled"] = bool(domains) and all(item["disabled"] for item in health["domains"])
+        elif provider_type == AppleMailProvider.name:
+            credentials = apple_mailbox.parse_credentials(str(entry.get("mailboxes") or ""))
+            stats = apple_mailbox.pool_stats(credentials)
+            health = {"disabled": False, "latched_disabled": False, "exhausted": not (stats["unused"] or stats["in_use"]), "mailboxes_stats": stats}
         elif provider_type == OutlookTokenProvider.name:
             credentials = _normalize_outlook_pool(entry.get("mailboxes") or entry.get("pool"), entry)
             health = {
@@ -1997,6 +2130,9 @@ def mail_config_with_health(mail_config: dict) -> dict:
 
 def release_mailbox(mailbox: dict) -> None:
     """把 outlook_token 邮箱从 in_use 释放回未使用（用于流程主动放弃且未消费验证码时）。"""
+    if str(mailbox.get("provider") or "") in {"apple", "icloud"}:
+        apple_mailbox.finish(mailbox, None)
+        return
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     _release_outlook_token_state(str(mailbox.get("address") or ""))

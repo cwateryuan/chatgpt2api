@@ -971,22 +971,22 @@ class PlatformRegistrar:
         return code == "invalid_state" or "sign-in session is no longer valid" in message
 
     def _passwordless_login(self, email: str, mailbox: dict, index: int) -> dict:
-        if str(mailbox.get("provider") or "") != "outlook_token":
-            raise RuntimeError("OpenAI 返回登录流，当前邮箱来源无法读取 Microsoft 登录验证码")
-        step(index, "OpenAI 返回登录流，转入 Microsoft passwordless 登录", "yellow")
+        if not mail_provider.supports_passwordless(mailbox):
+            raise RuntimeError("OpenAI 返回登录流，当前邮箱来源无法读取登录验证码")
+        step(index, "OpenAI 返回登录流，转入邮箱验证码登录", "yellow")
         for attempt in range(2):
             if attempt:
-                step(index, "Microsoft 登录会话失效，重新发起 passwordless 登录", "yellow")
+                step(index, "登录会话失效，重新发起邮箱验证码登录", "yellow")
                 self._reset_auth_cookies()
                 self._platform_authorize(email, index, screen_hint="login_or_signup")
+            mail_provider.prepare_code_request(_mail_config(self.proxy), mailbox)
             self._authorize_continue_login(email, index)
-            mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
             self._send_passwordless_otp(index)
-            step(index, "开始等待 Microsoft 登录验证码")
+            step(index, "开始等待邮箱登录验证码")
             code = wait_for_code(mailbox, proxy=self.proxy)
             if not code:
-                raise RuntimeError("等待 Microsoft 登录验证码超时")
-            step(index, f"收到 Microsoft 登录验证码: {code}")
+                raise RuntimeError("等待邮箱登录验证码超时")
+            step(index, f"收到邮箱登录验证码: {code}")
             resp, error = validate_otp(self.session, self.device_id, code, self.fingerprint)
             if resp is not None and resp.status_code == 200:
                 break
@@ -1002,14 +1002,14 @@ class PlatformRegistrar:
         continue_url = str(data.get("continue_url") or "").strip() or f"{auth_base}/sign-in-with-chatgpt/platform/consent"
         if _url_path(continue_url) == "/about-you":
             first_name, last_name = _random_name()
-            step(index, "Microsoft 登录验证完成，需要完善账号资料")
+            step(index, "邮箱登录验证完成，需要完善账号资料")
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
             return self._exchange_registered_tokens(index)
-        step(index, "Microsoft 登录验证完成，开始换 token")
+        step(index, "邮箱登录验证完成，开始换 token")
         tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier, self.fingerprint)
         if not tokens:
-            raise RuntimeError("Microsoft passwordless token 换取失败")
-        step(index, "Microsoft passwordless token 换取完成")
+            raise RuntimeError("邮箱验证码登录 token 换取失败")
+        step(index, "邮箱验证码登录 token 换取完成")
         return tokens
 
     def _exchange_registered_tokens(self, index: int) -> dict:
@@ -1039,10 +1039,10 @@ class PlatformRegistrar:
             if landed == "login":
                 tokens = self._passwordless_login(email, mailbox, index)
                 password = ""
-                source_type = "microsoft"
+                source_type = "microsoft" if mailbox.get("provider") == "outlook_token" else "web"
             else:
+                mail_provider.prepare_code_request(_mail_config(self.proxy), mailbox)
                 self._register_user(email, password, index)
-                mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
                 self._send_otp(index)
                 step(index, "开始等待注册验证码")
                 code = wait_for_code(mailbox, proxy=self.proxy)

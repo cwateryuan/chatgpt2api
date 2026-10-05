@@ -1281,6 +1281,7 @@ class BrowserRegistrar:
         expected_state = secrets.token_urlsafe(32)
         authorize_url = self._platform_authorize_url(email, expected_state, code_challenge)
         step(index, "浏览器注册完成，开始 Platform OAuth 授权")
+        self._prepare_code_request(mailbox)
         browser_devtools.navigate_to(port, authorize_url, self._devtools_timeout())
 
         email_submitted = False
@@ -1320,7 +1321,7 @@ class BrowserRegistrar:
                 )
                 otp_submitted = True
             elif _devtools_is_password_page(state) and not otp_entry_clicked:
-                mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+                self._prepare_code_request(mailbox)
                 browser_devtools.evaluate_json(
                     port,
                     DEVTOOLS_CLICK_ONE_TIME_CODE_JS,
@@ -1548,6 +1549,7 @@ class BrowserRegistrar:
                 )
 
                 step(index, "浏览器重复提交邮箱，直到页面状态改变")
+                self._prepare_code_request(mailbox)
                 state = browser_devtools.submit_until(
                     lambda: browser_devtools.evaluate_json(
                         port,
@@ -1563,6 +1565,7 @@ class BrowserRegistrar:
 
                 if _devtools_is_password_page(state):
                     step(index, "浏览器重复切换一次性验证码，直到验证码页出现")
+                    self._prepare_code_request(mailbox)
                     state = browser_devtools.submit_until(
                         lambda: browser_devtools.evaluate_json(
                             port,
@@ -1621,14 +1624,23 @@ class BrowserRegistrar:
                 if port:
                     browser_devtools.close_browser(port, process)
 
-    def _wait_for_otp(self, mailbox: dict, index: int, *, login: bool = False) -> str:
-        mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-        step(index, "等待浏览器登录验证码" if login else "等待浏览器注册验证码")
+    def _otp_mail_config(self) -> dict:
         mail_config = _mail_config(self.proxy)
-        mail_config["wait_timeout"] = max(1, min(
-            int(mail_config.get("wait_timeout") or 120),
-            int(max(1, self._deadline - time.monotonic())),
-        ))
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise BrowserRegistrationError("browser_otp_timeout")
+        mail_config["wait_timeout"] = min(float(mail_config.get("wait_timeout") or 120), remaining)
+        mail_config["request_timeout"] = min(float(mail_config.get("request_timeout") or 30), remaining)
+        return mail_config
+
+    def _prepare_code_request(self, mailbox: dict) -> None:
+        mail_provider.prepare_code_request(self._otp_mail_config(), mailbox)
+
+    def _wait_for_otp(self, mailbox: dict, index: int, *, login: bool = False) -> str:
+        if mailbox.get("provider") not in {"apple", "icloud"}:
+            mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        step(index, "等待浏览器登录验证码" if login else "等待浏览器注册验证码")
+        mail_config = self._otp_mail_config()
         code = mail_provider.wait_for_code(mail_config, mailbox)
         if not code:
             raise BrowserRegistrationError("browser_otp_timeout")
@@ -1697,8 +1709,9 @@ class BrowserRegistrar:
         raise BrowserRegistrationError(f"browser_one_time_code_transition_timeout:path={path}")
 
     def _handle_existing_outlook(self, page, mailbox: dict, index: int) -> None:
-        if str(mailbox.get("provider") or "") != "outlook_token":
+        if not mail_provider.supports_passwordless(mailbox):
             raise BrowserRegistrationError("browser_existing_account_login_unsupported")
+        self._prepare_code_request(mailbox)
         otp_selectors = (
             'input[autocomplete="one-time-code"]',
             'input[name="code"]',
@@ -1918,6 +1931,7 @@ class BrowserRegistrar:
                     raise BrowserRegistrationError(f"browser_state_stalled:{state}:path={path}")
 
             if state == "email":
+                self._prepare_code_request(mailbox)
                 self._submit_email(page, email, index)
                 email_done = True
             elif state == "password":
@@ -1930,14 +1944,15 @@ class BrowserRegistrar:
                     self._handle_existing_outlook(page, mailbox, index)
                     password = ""
                 else:
+                    self._prepare_code_request(mailbox)
                     password_input.fill(password, timeout=self._remaining_ms())
                     self._continue(page, "password")
                 password_done = True
             elif state == "one_time_code":
                 is_login = "log-in" in url_lower or "login" in url_lower
-                if is_login and str(mailbox.get("provider") or "") != "outlook_token":
+                if is_login and not mail_provider.supports_passwordless(mailbox):
                     raise BrowserRegistrationError("browser_existing_account_login_unsupported")
-                mailbox["_code_requested_at"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+                self._prepare_code_request(mailbox)
                 self._switch_to_one_time_code(page, index, login=is_login)
                 password = ""
                 password_done = True
@@ -2073,7 +2088,7 @@ class BrowserRegistrar:
             "email": email,
             "password": password,
             **tokens,
-            "source_type": "microsoft" if not password else "web",
+            "source_type": "web" if mailbox.get("provider") in {"apple", "icloud"} else "microsoft" if not password else "web",
             "registration_engine": "browser",
             "fp": dict(self.fingerprint),
             "status": "正常",

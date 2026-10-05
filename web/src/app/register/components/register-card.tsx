@@ -33,6 +33,7 @@ export function RegisterCard() {
   const toggle = useSettingsStore((state) => state.toggleRegister);
   const reset = useSettingsStore((state) => state.resetRegister);
   const resetOutlookPool = useSettingsStore((state) => state.resetOutlookPool);
+  const resetApplePool = useSettingsStore((state) => state.resetApplePool);
   const resetMailHealth = useSettingsStore((state) => state.resetRegisterMailHealth);
 
   if (isLoading) {
@@ -70,6 +71,7 @@ export function RegisterCard() {
       ...(type === "ddg_mail" ? { ddg_token: "", cf_inbox_jwt: "", cf_domain: [], admin_password: "" } : {}),
       ...(type === "outlook_token" ? { mailboxes: "", mode: "graph", imap_host: "outlook.office365.com", message_limit: 10, alias_enabled: false, alias_per_email: 5, alias_prefix: "c2api", alias_include_original: true } : {}),
       ...(type === "mailpit" ? { api_url: "", domain: [], domain_mode: "round_robin" } : {}),
+      ...(type === "apple" ? { mailboxes: "", mailboxes_count: 0, mailboxes_preview: [], mailboxes_stats: {} } : {}),
     });
   };
 
@@ -226,7 +228,7 @@ export function RegisterCard() {
                         <Checkbox checked={Boolean(provider.enable)} onCheckedChange={(checked) => updateProvider(index, { enable: Boolean(checked) })} disabled={isRuntimeBusy} />
                         启用
                       </label>
-                      {!provider.enable ? <Badge variant="secondary" className="rounded-md">手动停用</Badge> : type === "outlook_token" && Boolean(health.exhausted) ? <Badge variant="warning" className="rounded-md">邮箱池已耗尽</Badge> : disabledByHealth ? <Badge variant="danger" className="rounded-md">已自动禁用</Badge> : latchedDisabled ? <Badge variant="warning" className="rounded-md">禁用状态已暂停</Badge> : Number(health.consecutive_failures || 0) > 0 ? <Badge variant="warning" className="rounded-md">连续失败 {Number(health.consecutive_failures)}</Badge> : <Badge variant="success" className="rounded-md">可用</Badge>}
+                      {!provider.enable ? <Badge variant="secondary" className="rounded-md">手动停用</Badge> : (type === "outlook_token" || type === "apple") && Boolean(health.exhausted) ? <Badge variant="warning" className="rounded-md">邮箱池已耗尽</Badge> : disabledByHealth ? <Badge variant="danger" className="rounded-md">已自动禁用</Badge> : latchedDisabled ? <Badge variant="warning" className="rounded-md">禁用状态已暂停</Badge> : Number(health.consecutive_failures || 0) > 0 ? <Badge variant="warning" className="rounded-md">连续失败 {Number(health.consecutive_failures)}</Badge> : <Badge variant="success" className="rounded-md">可用</Badge>}
                       <button type="button" className="rounded-lg p-2 text-stone-400 transition hover:bg-rose-50 hover:text-rose-500 disabled:opacity-50" onClick={() => deleteProvider(index)} disabled={isRuntimeBusy || providers.length <= 1} title="删除 provider">
                         <Trash2 className="size-4" />
                       </button>
@@ -250,6 +252,7 @@ export function RegisterCard() {
                             <SelectItem value="yyds_mail">yyds_mail</SelectItem>
                             <SelectItem value="ddg_mail">ddg_mail (DDG邮箱+CF中转)</SelectItem>
                             <SelectItem value="outlook_token">outlook_token (Outlook/Hotmail 邮箱池)</SelectItem>
+                            <SelectItem value="apple">iCloud（导入邮箱/API 取件）</SelectItem>
                             <SelectItem value="mailpit">mailpit (本地 Mailpit)</SelectItem>
                           </SelectContent>
                         </Select>
@@ -399,7 +402,7 @@ export function RegisterCard() {
                       ) : null}
                     </div>
 
-                    {type !== "outlook_token" && (latchedDisabled || Number(health.consecutive_failures || 0) > 0 || healthDomains.length > 0) ? (
+                    {type !== "outlook_token" && type !== "apple" && (latchedDisabled || Number(health.consecutive_failures || 0) > 0 || healthDomains.length > 0) ? (
                       <div className="space-y-2 border-t border-stone-100 pt-3 text-xs">
                         {healthDomains.length ? healthDomains.map((item) => (
                           <div key={String(item.domain)} className="flex flex-wrap items-center justify-between gap-2">
@@ -423,6 +426,36 @@ export function RegisterCard() {
                         ) : null}
                       </div>
                     ) : null}
+
+                    {type === "apple" ? (() => {
+                      const stats = (provider.mailboxes_stats || {}) as Record<string, number>;
+                      const preview = Array.isArray(provider.mailboxes_preview) ? provider.mailboxes_preview as string[] : [];
+                      return (
+                        <div className="space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-stone-700">
+                            <label htmlFor={`apple-pool-${index}`}>iCloud 邮箱池导入</label>
+                            <span className="text-xs text-stone-500">已保存 {Number(provider.mailboxes_count || 0)} 个</span>
+                          </div>
+                          <Textarea id={`apple-pool-${index}`} value={String(provider.mailboxes || "")} onChange={(event) => updateProvider(index, { mailboxes: event.target.value })} placeholder={"邮箱----取件 API URL\n邮箱----分享 URL----取件 API URL\n或完整 WDMail/Ourmail URL"} className="min-h-32 rounded-lg border-stone-200 bg-white font-mono text-xs" disabled={isRuntimeBusy || isSaving} />
+                          <div className="flex flex-wrap gap-2 text-xs">
+                            <span className="text-stone-600">未使用 {stats.unused ?? 0}</span>
+                            <span className="text-blue-600">占用中 {stats.in_use ?? 0}</span>
+                            <span className="text-emerald-700">已用 {stats.used ?? 0}</span>
+                            <span className="text-amber-700">凭据异常 {stats.token_invalid ?? 0}</span>
+                            <span className="text-rose-600">失败 {stats.failed ?? 0}</span>
+                          </div>
+                          {preview.length ? <p className="break-all text-xs text-stone-400">{preview.join("、")}</p> : null}
+                          <div className="flex flex-wrap gap-2">
+                            <Button type="button" variant="outline" className="h-8 rounded-lg px-3 text-xs" disabled={isRuntimeBusy || isSaving || !providerId} onClick={() => { if (window.confirm("重置此 iCloud 邮箱池的失败、凭据异常和遗留占用状态？已用邮箱将保留。")) void resetApplePool(providerId, "failed"); }}>
+                              <RotateCcw className="size-3.5" />重置失败项
+                            </Button>
+                            <Button type="button" variant="outline" className="h-8 rounded-lg border-rose-200 px-3 text-xs text-rose-600" disabled={isRuntimeBusy || isSaving || !providerId} onClick={() => { if (window.confirm("重置此 iCloud 邮箱池的全部状态？已用邮箱也会恢复可用。")) void resetApplePool(providerId, "all"); }}>
+                              <RotateCcw className="size-3.5" />重置全部
+                            </Button>
+                          </div>
+                        </div>
+                      );
+                    })() : null}
 
                     {type === "outlook_token" ? (() => {
                       const stats = (provider.mailboxes_stats || {}) as Record<string, number>;

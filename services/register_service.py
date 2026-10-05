@@ -12,7 +12,7 @@ from pathlib import Path
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.memory import trim_memory
-from services.register import browser_register, mail_provider, openai_register
+from services.register import apple_mailbox, browser_register, mail_provider, openai_register
 from services.runtime_state import is_multi_worker_runtime, runtime_state
 from utils.log import logger
 
@@ -85,6 +85,8 @@ def _normalize_mail_config(value: object) -> dict:
         provider = dict(raw_provider)
         provider.pop("health", None)
         provider_type = str(provider.get("type") or "").strip()
+        if provider_type == "icloud":
+            provider_type = provider["type"] = "apple"
         provider_id = str(provider.get("id") or f"{provider_type}#{index + 1}").strip()
         if provider_id in seen_ids:
             provider_id = f"{provider_id}-{index + 1}"
@@ -97,6 +99,10 @@ def _normalize_mail_config(value: object) -> dict:
         if provider_type == "mailpit":
             provider["domain"] = mail_provider.normalize_mailpit_domains(provider.get("domain") or provider.get("suffix"))
             provider["domain_mode"] = "sequential" if str(provider.get("domain_mode")) == "sequential" else "round_robin"
+        elif provider_type == "apple":
+            provider["mailboxes"] = apple_mailbox.serialize_credentials(apple_mailbox.parse_credentials(str(provider.get("mailboxes") or "")))
+            for key in ("pool", "mail_api_url", "share_url", "mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
+                provider.pop(key, None)
         elif provider_type == "outlook_token":
             provider["alias_enabled"] = mail_provider._normalize_bool(provider.get("alias_enabled"), False)
             provider["alias_per_email"] = mail_provider._normalize_int(provider.get("alias_per_email"), 5, 0, 200)
@@ -298,8 +304,16 @@ class RegisterService:
 
     def _start_runner_locked(self, *, reset_runtime: bool, recovered: bool) -> None:
         self._lock_lost = False
-        self._config["enabled"] = True
         self._drop_mail_proxy()
+        if any(item.get("type") == "apple" for item in self._config.get("mail", {}).get("providers", [])):
+            try:
+                apple_mailbox.begin_run(self._lock_owner, lambda: self._lock_lost or self._stop_requested())
+            except Exception:
+                runtime_state.release_lock(REGISTER_RUN_LOCK, self._lock_owner)
+                self._lock_owner = ""
+                self._config["enabled"] = False
+                raise
+        self._config["enabled"] = True
         if reset_runtime:
             self._config["logs"] = []
             metrics = self._pool_metrics()
@@ -457,6 +471,13 @@ class RegisterService:
         if not isinstance(providers, list):
             return
         for provider in providers:
+            if isinstance(provider, dict) and provider.get("type") == "apple":
+                credentials = apple_mailbox.parse_credentials(str(provider.get("mailboxes") or ""))
+                provider["mailboxes"] = ""
+                provider["mailboxes_count"] = len(credentials)
+                provider["mailboxes_preview"] = [self._mask_email(item["email"]) for item in credentials[:8]]
+                provider["mailboxes_stats"] = apple_mailbox.pool_stats(credentials)
+                continue
             if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
                 continue
             pool_text = str(provider.get("mailboxes") or "")
@@ -501,14 +522,31 @@ class RegisterService:
             return
         old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
         old_providers = old_mail.get("providers") if isinstance(old_mail.get("providers"), list) else []
-        for index, provider in enumerate(mail["providers"]):
-            if not isinstance(provider, dict) or index >= len(old_providers) or not isinstance(old_providers[index], dict):
+        by_id = {item.get("id"): item for item in old_providers if isinstance(item, dict)}
+        for provider in mail["providers"]:
+            if not isinstance(provider, dict):
                 continue
-            old_type = str(old_providers[index].get("type") or "")
+            old = by_id.get(provider.get("id"), {})
+            old_type = str(old.get("type") or "")
             new_type = str(provider.get("type") or "")
+            new_type = "apple" if new_type == "icloud" else new_type
             if old_type and new_type and old_type != new_type:
                 provider.pop("id", None)
                 provider.pop("health", None)
+
+    def _merge_apple_pools(self, updates: dict) -> None:
+        mail = updates.get("mail")
+        if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
+            return
+        old = {item.get("id"): item for item in self._config.get("mail", {}).get("providers", []) if item.get("type") == "apple"}
+        for provider in mail["providers"]:
+            if not isinstance(provider, dict) or provider.get("type") not in {"apple", "icloud"}:
+                continue
+            provider["type"] = "apple"
+            provider_id = str(provider.get("id") or "").strip()
+            if not provider_id:
+                provider_id = provider["id"] = f"apple-{uuid.uuid4().hex}"
+            provider["mailboxes"] = apple_mailbox.merge_credentials(str(old.get(provider_id, {}).get("mailboxes") or ""), str(provider.get("mailboxes") or ""))
 
     def _prune_unused_outlook_pools(self) -> int:
         mail = self._config.get("mail")
@@ -537,6 +575,7 @@ class RegisterService:
                 self._config = loaded
             self._drop_changed_provider_ids(updates)
             self._merge_outlook_pools(updates)
+            self._merge_apple_pools(updates)
             self._config = _normalize({**self._config, **updates})
             self._drop_mail_proxy()
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "mode", "engine", "browser_token_mode")})
@@ -625,6 +664,30 @@ class RegisterService:
                 "yellow",
             )
         return self.get()
+
+    def reset_apple_pool(self, provider_id: str, scope: str = "failed") -> dict:
+        if scope not in {"failed", "all"}:
+            raise ValueError("Invalid Apple pool reset scope")
+        with self._lock:
+            if not self._lock_owner:
+                loaded = self._load()
+                if loaded:
+                    self._config = loaded
+                self._refresh_persisted_runtime_locked()
+            if self._config.get("enabled") or self._runner_alive_locked() or int(self._config.get("stats", {}).get("running") or 0):
+                raise RuntimeError("Stop registration before resetting Apple pool")
+            provider = next((item for item in self._config.get("mail", {}).get("providers", []) if item.get("id") == provider_id and item.get("type") == "apple"), None)
+            if provider is None:
+                raise ValueError("Apple provider not found")
+            owner = runtime_state.acquire_lock(REGISTER_RUN_LOCK, ttl_seconds=REGISTER_RUN_LOCK_TTL_SECONDS, allow_memory_fallback=not is_multi_worker_runtime())
+            if not owner:
+                raise RuntimeError("Stop registration before resetting Apple pool")
+            try:
+                cleared = apple_mailbox.reset(apple_mailbox.parse_credentials(str(provider.get("mailboxes") or "")), scope)
+            finally:
+                runtime_state.release_lock(REGISTER_RUN_LOCK, owner)
+            self._append_log(f"已重置 iCloud 邮箱池，清除 {cleared} 条状态记录", "yellow")
+            return self._snapshot()
 
     def reset_mail_health(self, provider_id: str = "", domain: str = "") -> dict:
         from services.register.mail_health import mail_health_store

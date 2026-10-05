@@ -347,6 +347,22 @@ curl http://localhost:8000/v1/responses \
 </details>
 </details>
 
+## iCloud 邮箱注册
+
+注册后台支持 `iCloud（导入邮箱/API 取件）`，渠道类型为 `apple`（兼容 `icloud`）。每行导入一个完整地址，已有 `+别名` 会原样保留，不自动生成别名：
+
+```text
+user+tag@icloud.com----https://api.wdmail.top/m?f=json&key=<KEY>&e=user@icloud.com:<TOKEN>
+user@icloud.com----https://example.com/share/<KEY>----https://example.com/mail-api/<KEY>
+https://ourmail.top/api/v1/mailboxes/messages?format=json&key=<KEY>&email=user@icloud.com
+```
+
+取件 API URL 原样保存并使用，注册和任务内 OAuth 都不改写链接或自动请求分享链接。已保存的取件凭据不回显，空导入框表示保留原池，同名地址的新导入覆盖旧凭据。成功地址标记为已用；同一母邮箱的别名串行注册，不同母邮箱可并发。状态保存在 `data/apple_mailbox_state.json`，只在领取、结束、重启恢复或重置时保存，不在验证码轮询时写盘。
+
+管理员停止注册后，可重置当前渠道的失败项或全部邮箱池状态，也可调用 `POST /api/register/apple-pool/reset`，请求体为 `{"provider_id":"<CHANNEL_ID>","scope":"failed"}`（`scope` 也支持 `all`）。普通失败与 API 4xx 凭据异常分别隔离；取消或验证码超时释放地址，下次可再使用。
+
+HTTP 注册已通过带 `offline_access` 的 OAuth 流程保存上游返回的 RT。浏览器注册默认 Session Token，选择 OAuth Token 后尝试取得 AT/RT，失败可回退 Session。账号来源的“本地”前缀表示由本机注册，与 RT 是否存在、账号是否正常无关；账户列表“类型”中的“本地”筛选可与状态和日期筛选组合使用。
+
 ## 社区支持
 
 学 AI , 上 L 站：[LinuxDO](https://linux.do)
