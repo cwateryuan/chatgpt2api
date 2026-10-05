@@ -144,10 +144,17 @@ def _sleep_with_deadline(request: "ConversationRequest", seconds: float) -> None
 IMAGE_RETRY_WINDOW_SECONDS = 20.0
 IMAGE_RETRY_BACKOFF_SECONDS = (0.1, 0.25, 0.5, 1.0)
 IMAGE_ERROR_COOLDOWN_MESSAGE = "I wasn't able to generate the image due to an error on my side."
+IMAGE_FILE_UPLOAD_COOLDOWN_MESSAGE = "All attempted accounts have reached the file upload limit. Please try again later."
+IMAGE_USAGE_COOLDOWN_MESSAGE = "This model reached its usage limit before I could respond. Send your message again to continue with an available model."
+IMAGE_ERROR_COOLDOWN_MESSAGES = frozenset({
+    IMAGE_ERROR_COOLDOWN_MESSAGE,
+    IMAGE_FILE_UPLOAD_COOLDOWN_MESSAGE,
+    IMAGE_USAGE_COOLDOWN_MESSAGE,
+})
 
 
 def _matches_image_error_cooldown(message: str) -> bool:
-    return config.image_account_cooldown_minutes > 0 and message.strip() == IMAGE_ERROR_COOLDOWN_MESSAGE
+    return config.image_account_cooldown_minutes > 0 and message.strip() in IMAGE_ERROR_COOLDOWN_MESSAGES
 
 
 class _ImageRetrySelectionDeadline(ImageRequestDeadline):
@@ -2154,6 +2161,29 @@ def _generate_single_image(
                 )
                 slot_released = True
                 raise image_timeout_error(deadline, account_email=account_email) from exc
+            file_upload_throttled = not emitted_for_token and is_file_upload_throttled_error(exc)
+            file_upload_retry = False
+            file_upload_error: ImageGenerationError | None = None
+            if file_upload_throttled:
+                last_file_upload_throttle = exc
+                excluded_tokens.add(token)
+                file_upload_throttle_retry_count += 1
+                retry_count += 1
+                file_upload_retry = _retry_image_attempt(request, retry_started_at, retry_count)
+                if not file_upload_retry:
+                    file_upload_error = ImageGenerationError(
+                        IMAGE_FILE_UPLOAD_COOLDOWN_MESSAGE,
+                        status_code=429,
+                        error_type="rate_limit_error",
+                        code="throttled",
+                        account_email=account_email,
+                    )
+                    if _matches_image_error_cooldown(IMAGE_FILE_UPLOAD_COOLDOWN_MESSAGE):
+                        account_service.cooldown_image_account(token, started_at=time.time())
+                        # The service owns release, including retaining the lease on a
+                        # failed write. Never release it again in finally.
+                        slot_released = True
+                        raise file_upload_error from exc
             if not proxy_network_failure and (failure.account_failure or failure.scope != "delivery"):
                 account_service.mark_image_result(
                     token,
@@ -2186,12 +2216,8 @@ def _generate_single_image(
                         "error": last_error[:200],
                     })
                     continue
-            if not emitted_for_token and is_file_upload_throttled_error(exc):
-                last_file_upload_throttle = exc
-                excluded_tokens.add(token)
-                file_upload_throttle_retry_count += 1
-                retry_count += 1
-                if _retry_image_attempt(request, retry_started_at, retry_count):
+            if file_upload_throttled:
+                if file_upload_retry:
                     logger.warning({
                         "event": "image_file_upload_throttled_retry",
                         "request_token": token,
@@ -2201,13 +2227,7 @@ def _generate_single_image(
                         "index": index,
                     })
                     continue
-                raise ImageGenerationError(
-                    "All attempted accounts have reached the file upload limit. Please try again later.",
-                    status_code=429,
-                    error_type="rate_limit_error",
-                    code="throttled",
-                    account_email=account_email,
-                ) from exc
+                raise file_upload_error from exc
             if is_http2_stream_error(last_error):
                 logger.warning({
                     "event": "image_stream_http2_error",

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from threading import Barrier, Lock
 from types import SimpleNamespace
-from unittest.mock import Mock, PropertyMock, patch
+from unittest.mock import ANY, Mock, PropertyMock, patch
 
 from services.image_cooldown import ImageSchedulingUnavailable
 from services.image_failure import ImageFailureError, ImageGenerationError, image_failure
@@ -20,6 +20,8 @@ from utils.helper import UpstreamHTTPError
 
 
 MESSAGE = conversation.IMAGE_ERROR_COOLDOWN_MESSAGE
+FILE_UPLOAD_MESSAGE = conversation.IMAGE_FILE_UPLOAD_COOLDOWN_MESSAGE
+USAGE_MESSAGE = conversation.IMAGE_USAGE_COOLDOWN_MESSAGE
 
 
 def error(message=MESSAGE, error_class=ImageGenerationError):
@@ -113,22 +115,26 @@ class ImageErrorCooldownFlowTests(unittest.IsolatedAsyncioTestCase):
             backend.close.assert_called_once()
 
     def test_exact_match_and_error_representations(self):
-        variants = [
-            error(" \n" + MESSAGE + "\t"), error(error_class=ImageFailureError),
-            UpstreamHTTPError("/backend-api/f/conversation", 400, {"error": {"message": MESSAGE}}),
-            ImageContentPolicyError(MESSAGE),
-            [conversation.ImageOutput(kind="message", model="gpt-image-2", index=1, total=1, text=MESSAGE)],
-        ]
-        for variant in variants:
-            with self.subTest(variant=type(variant)):
-                self.actions = [variant, [result()]]
-                self.tokens = iter(["a", "b"])
-                self.service.cooldown_image_account.reset_mock()
-                self.assertEqual(self.generate()[0].kind, "result")
-                self.service.cooldown_image_account.assert_called_once()
+        for message in (MESSAGE, FILE_UPLOAD_MESSAGE, USAGE_MESSAGE):
+            variants = [
+                error(" \n" + message + "\t"), error(message, error_class=ImageFailureError),
+                UpstreamHTTPError("/backend-api/f/conversation", 400, {"error": {"message": message}}),
+                ImageContentPolicyError(message),
+                [conversation.ImageOutput(kind="message", model="gpt-image-2", index=1, total=1, text=message)],
+            ]
+            for variant in variants:
+                with self.subTest(message=message, variant=type(variant)):
+                    self.actions = [variant, [result()]]
+                    self.tokens = iter(["a", "b"])
+                    self.service.cooldown_image_account.reset_mock()
+                    self.assertEqual(self.generate()[0].kind, "result")
+                    self.service.cooldown_image_account.assert_called_once()
 
     def test_other_messages_do_not_cool_or_retry(self):
         for message in [MESSAGE + " Try later.", MESSAGE.lower(), MESSAGE[:-1], MESSAGE[:-1] + "。",
+                        FILE_UPLOAD_MESSAGE + " Try later.", FILE_UPLOAD_MESSAGE.lower(), FILE_UPLOAD_MESSAGE[:-1],
+                        USAGE_MESSAGE + " Try later.", USAGE_MESSAGE.lower(), USAGE_MESSAGE[:-1],
+                        "All available accounts have reached the file upload limit. Please try again later.",
                         "We're so sorry, but the image we created may violate our content policies."]:
             with self.subTest(message=message):
                 self.tokens = iter(["a", "b"])
@@ -137,14 +143,17 @@ class ImageErrorCooldownFlowTests(unittest.IsolatedAsyncioTestCase):
                     self.generate()
         self.service.cooldown_image_account.assert_not_called()
         self.service.mark_image_result.assert_not_called()
-        self.assertEqual(len(self.visited), 5)
+        self.assertEqual(len(self.visited), 12)
 
     def test_disabled_setting_keeps_original_400_behavior(self):
-        self.actions = [error()]
-        with patch.dict(conversation.config.data, {"image_account_cooldown_minutes": 0}):
-            with self.assertRaises(ImageGenerationError):
-                self.generate()
-        self.assertEqual(self.visited, ["a"])
+        for message in (MESSAGE, FILE_UPLOAD_MESSAGE, USAGE_MESSAGE):
+            with self.subTest(message=message):
+                self.actions = [error(message)]
+                self.tokens = iter(["a"])
+                with patch.dict(conversation.config.data, {"image_account_cooldown_minutes": 0}):
+                    with self.assertRaises(ImageGenerationError):
+                        self.generate()
+        self.assertEqual(self.visited, ["a", "a", "a"])
         self.service.cooldown_image_account.assert_not_called()
 
     def test_b_matching_failure_cools_b_without_trying_c(self):
@@ -154,6 +163,36 @@ class ImageErrorCooldownFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.account_email, "b@example.test")
         self.assertEqual(self.visited, ["a", "b"])
         self.assertEqual([c.args[0] for c in self.service.cooldown_image_account.call_args_list], ["a", "b"])
+        self.service.mark_image_result.assert_not_called()
+
+    def test_b_additional_matching_failure_cools_b_without_trying_c(self):
+        for message in (FILE_UPLOAD_MESSAGE, USAGE_MESSAGE):
+            with self.subTest(message=message):
+                self.tokens = iter(["a", "b", "c"])
+                self.actions = [error(), error(message)]
+                self.service.cooldown_image_account.reset_mock()
+                with self.assertRaises(ImageGenerationError) as caught:
+                    self.generate()
+                self.assertEqual(caught.exception.account_email, "b@example.test")
+                self.assertEqual(self.visited[-2:], ["a", "b"])
+                self.assertEqual([c.args[0] for c in self.service.cooldown_image_account.call_args_list], ["a", "b"])
+                self.service.mark_image_result.assert_not_called()
+
+    def test_file_upload_summary_cools_only_final_account_without_failure_counters(self):
+        def exhausted_file_upload():
+            self.advance(conversation.IMAGE_RETRY_WINDOW_SECONDS)
+            return UpstreamHTTPError("/backend-api/files", 429, {"code": "throttled"})
+
+        self.tokens = iter(["a", "b"])
+        self.actions = [exhausted_file_upload]
+        with self.assertRaises(ImageGenerationError) as caught:
+            self.generate()
+        self.assertEqual(caught.exception.public_error, FILE_UPLOAD_MESSAGE)
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(caught.exception.code, "throttled")
+        self.assertEqual(caught.exception.account_email, "a@example.test")
+        self.assertEqual(self.visited, ["a"])
+        self.service.cooldown_image_account.assert_called_once_with("a", started_at=ANY)
         self.service.mark_image_result.assert_not_called()
 
     def test_b_other_errors_do_not_enter_legacy_retries(self):

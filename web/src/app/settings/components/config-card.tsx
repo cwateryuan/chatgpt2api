@@ -204,7 +204,7 @@ export function ConfigCard() {
               onChange={(event) => setImageAccountCooldownMinutes(event.target.value)}
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位分钟，默认 30；0 为关闭。生图成功，或上游消息完全等于“I wasn&apos;t able to generate the image due to an error on my side.”时，账号进入冷却。指定错误在本张图片的 20 秒重试窗口内最多换号一次；换号后的生成仍使用原请求总超时。修改分钟数会按原触发时间重算尚未结束的冷却。</p>
+            <p className="text-xs text-stone-500">单位分钟，默认 30；0 为关闭。除生图成功外，以下上游消息完全匹配时也会冷却账号：“I wasn&apos;t able to generate the image due to an error on my side.”、“All attempted accounts have reached the file upload limit. Please try again later.”、“This model reached its usage limit before I could respond. Send your message again to continue with an available model.” 指定错误在本张图片的 20 秒重试窗口内最多换号一次；换号后的生成仍使用原请求总超时。修改分钟数会按原触发时间重算尚未结束的冷却。</p>
           </div>
           <div className="space-y-2">
             <div className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
