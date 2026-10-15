@@ -26,16 +26,22 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import importlib.util
 import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-try:
-    from egress_timezone import resolve_page_timezone
-except ImportError:  # imported as sentinel_solver.app from the main service tree
-    from sentinel_solver.egress_timezone import resolve_page_timezone
+# Loaded from this file's directory so `python /app/app.py` works inside the
+# solver image. The image copies the file next to app.py; it is not a package.
+_EGRESS_PATH = Path(__file__).with_name("egress_timezone.py")
+_egress_spec = importlib.util.spec_from_file_location("egress_timezone", _EGRESS_PATH)
+if _egress_spec is None or _egress_spec.loader is None:
+    raise ModuleNotFoundError(f"egress timezone module not found at {_EGRESS_PATH}")
+_egress_module = importlib.util.module_from_spec(_egress_spec)
+_egress_spec.loader.exec_module(_egress_module)
+resolve_page_timezone = _egress_module.resolve_page_timezone
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
