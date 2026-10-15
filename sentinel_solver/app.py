@@ -15,7 +15,9 @@ Environment:
 - SENTINEL_SOLVER_KEY: when set, requests must send `Authorization: Bearer <key>`
 - SENTINEL_SOLVER_PROXY: outbound proxy for the browser, should match the main service egress
 - SENTINEL_SOLVER_USER_AGENT: optional, defaults to a Linux Chrome UA built from the bundled Chromium
-- SENTINEL_SOLVER_TIMEZONE: optional page timezone (e.g. Asia/Shanghai), should match the egress IP
+- SENTINEL_SOLVER_TIMEZONE: optional page timezone. When empty, the browser egress IP is
+  looked up (through SENTINEL_SOLVER_PROXY) and mapped to an IANA timezone. An explicit
+  value always wins, so a bad lookup cannot override a known site.
 - SENTINEL_SOLVER_REFRESH_SECONDS: how often the page is reopened, default 1800
 - SENTINEL_SOLVER_HEADLESS: default true, set false to debug
 - PORT: listen port, default 8080
@@ -29,6 +31,11 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+try:
+    from egress_timezone import resolve_page_timezone
+except ImportError:  # imported as sentinel_solver.app from the main service tree
+    from sentinel_solver.egress_timezone import resolve_page_timezone
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
@@ -124,7 +131,9 @@ _SOLVE_VIA_VM = "([dx, p]) => window.__sentinelVM.turnstile(dx, p)"
 SOLVER_KEY = os.getenv("SENTINEL_SOLVER_KEY", "").strip()
 PROXY = os.getenv("SENTINEL_SOLVER_PROXY", "").strip()
 USER_AGENT = os.getenv("SENTINEL_SOLVER_USER_AGENT", "").strip()
-TIMEZONE = os.getenv("SENTINEL_SOLVER_TIMEZONE", "").strip()
+# Empty means "follow the browser egress". A non-empty value is explicit and wins
+# over whatever the IP lookup returns.
+CONFIGURED_TIMEZONE = os.getenv("SENTINEL_SOLVER_TIMEZONE", "").strip()
 REFRESH_SECONDS = max(60, int(os.getenv("SENTINEL_SOLVER_REFRESH_SECONDS", "1800")))
 HEADLESS = os.getenv("SENTINEL_SOLVER_HEADLESS", "true").strip().lower() not in {"0", "false", "no"}
 # Turnstile runs on a 500ms budget in the frontend and reports the step count on
@@ -148,9 +157,13 @@ class SolverPage:
         self._lock = asyncio.Lock()
         self._turnstile_asset = ""
         self.user_agent = USER_AGENT
+        self.timezone = CONFIGURED_TIMEZONE
+        self.timezone_source = "configured" if CONFIGURED_TIMEZONE else ""
+        self.egress_ip = ""
         self.last_error = ""
 
     async def start(self) -> None:
+        await self._resolve_timezone()
         self._playwright = await async_playwright().start()
         launch_kwargs = {
             "headless": HEADLESS,
@@ -174,6 +187,22 @@ class SolverPage:
             # A page that cannot open yet is not fatal; the first request retries.
             self.last_error = str(exc)
             print(f"[sentinel-solver] initial page open failed: {exc}", flush=True)
+
+    async def _resolve_timezone(self) -> None:
+        """Pin the page timezone to the browser egress unless one was configured."""
+        timezone_id, source, ip = await asyncio.to_thread(resolve_page_timezone, CONFIGURED_TIMEZONE, PROXY)
+        self.timezone = timezone_id
+        self.timezone_source = source
+        self.egress_ip = ip
+        if source == "configured":
+            print(f"[sentinel-solver] timezone={self.timezone} source=configured", flush=True)
+        elif source == "egress":
+            print(
+                f"[sentinel-solver] timezone={timezone_id} source=egress ip={ip or 'unknown'}",
+                flush=True,
+            )
+        else:
+            print("[sentinel-solver] egress timezone lookup failed; page keeps the container timezone", flush=True)
 
     async def stop(self) -> None:
         if self._context is not None:
@@ -208,8 +237,8 @@ class SolverPage:
             "viewport": {"width": 1280, "height": 800},
             "user_agent": self.user_agent,
         }
-        if TIMEZONE:
-            context_kwargs["timezone_id"] = TIMEZONE
+        if self.timezone:
+            context_kwargs["timezone_id"] = self.timezone
         context = await self._browser.new_context(**context_kwargs)
         # page.evaluate has no per-call timeout, so widen the context default; the
         # page's own module can take a moment on first use.
@@ -315,7 +344,9 @@ class SolverPage:
             "page_age_seconds": int(time.monotonic() - self._opened_at) if self._opened_at else None,
             "browser_version": self._browser.version if self._browser else None,
             "user_agent": self.user_agent,
-            "timezone": TIMEZONE or None,
+            "timezone": self.timezone or None,
+            "timezone_source": self.timezone_source or None,
+            "egress_ip": self.egress_ip or None,
             "last_error": self.last_error or None,
         }
 

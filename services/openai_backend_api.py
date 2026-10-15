@@ -45,7 +45,7 @@ from utils.helper import (
     split_image_model,
 )
 from utils.log import logger
-from services.sentinel_solver_client import solve_turnstile, solver_user_agent
+from services.sentinel_solver_client import solve_turnstile, solver_timezone, solver_user_agent
 from utils.pow import (
     build_legacy_requirements_token,
     build_proof_token,
@@ -261,8 +261,15 @@ class OpenAIBackendAPI:
         self.user_agent = self.fp["user_agent"]
         self.device_id = self.fp["device_id"]
         self.session_id = self.fp["session_id"]
-        self.timezone = str(self.fp.get("timezone") or "Asia/Shanghai")
-        self.timezone_offset_min = self._fp_int("timezone_offset_min", -480)
+        # Account fingerprints default to Asia/Shanghai. The solver page follows
+        # the shared egress IP, so its zone wins; otherwise a Los Angeles WARP
+        # exit would still announce Shanghai in the conversation payload.
+        solver_zone = solver_timezone()
+        if solver_zone:
+            self.timezone, self.timezone_offset_min = solver_zone
+        else:
+            self.timezone = str(self.fp.get("timezone") or "Asia/Shanghai")
+            self.timezone_offset_min = self._fp_int("timezone_offset_min", -480)
         self.language = str(self.fp.get("language") or self.fp["accept_language"].split(",", 1)[0] or "zh-CN")
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""

@@ -12,8 +12,11 @@ The solver only ever receives challenge parameters (`dx` and the requirements
 
 from __future__ import annotations
 
+import re
 import threading
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from curl_cffi import requests
 
@@ -27,9 +30,16 @@ USER_AGENT_CACHE_SECONDS = 600
 # A failed health probe is cached briefly too, so a solver that is down does not
 # get probed once per request.
 USER_AGENT_FAILURE_CACHE_SECONDS = 30
+_IANA_TIMEZONE = re.compile(r"^[A-Za-z]+(?:[-+][A-Za-z0-9]+)?(?:/[A-Za-z0-9_+-]+){1,2}$")
 
 _user_agent_lock = threading.Lock()
-_user_agent_cache: dict[str, object] = {"url": "", "value": "", "expires_at": 0.0}
+_user_agent_cache: dict[str, object] = {
+    "url": "",
+    "value": "",
+    "timezone": "",
+    "timezone_offset_min": None,
+    "expires_at": 0.0,
+}
 
 
 class SentinelSolverError(RuntimeError):
@@ -43,21 +53,33 @@ def _solver_headers() -> dict[str, str]:
     return headers
 
 
-def solver_user_agent() -> str:
-    """User agent of the page that computes the Turnstile token, or "" when unset.
+def js_timezone_offset_min(timezone_id: str) -> int | None:
+    """`Date.getTimezoneOffset()` for an IANA zone: UTC+8 is -480, UTC-7 is 420."""
+    name = str(timezone_id or "").strip()
+    if not _IANA_TIMEZONE.fullmatch(name):
+        return None
+    try:
+        offset = datetime.now(ZoneInfo(name)).utcoffset()
+    except (ZoneInfoNotFoundError, KeyError, ValueError, OSError):
+        return None
+    if offset is None:
+        return None
+    return -int(offset.total_seconds() // 60)
 
-    The requirements/proof tokens embed the UA, and it has to match the browser
-    environment that solved the challenge; otherwise the conversation endpoint
-    answers `404 {"detail": "Model not found"}`.
-    """
+
+def _cached_solver_health() -> tuple[str, str, int | None]:
+    """Return (user agent, timezone, JS offset minutes) from the solver health probe."""
     base_url = config.sentinel_solver_url
     if not base_url:
-        return ""
+        return "", "", None
     with _user_agent_lock:
         now = time.monotonic()
         if _user_agent_cache["url"] == base_url and now < float(_user_agent_cache["expires_at"]):
-            return str(_user_agent_cache["value"])
+            offset = _user_agent_cache["timezone_offset_min"]
+            return str(_user_agent_cache["value"]), str(_user_agent_cache["timezone"]), offset if isinstance(offset, int) else None
         value = ""
+        timezone_id = ""
+        offset_min: int | None = None
         try:
             response = requests.get(
                 f"{base_url}/health",
@@ -65,12 +87,46 @@ def solver_user_agent() -> str:
                 timeout=SOLVER_TIMEOUT_SECONDS,
             )
             if response.status_code == 200:
-                value = str((response.json() or {}).get("user_agent") or "")
+                payload = response.json() or {}
+                value = str(payload.get("user_agent") or "")
+                timezone_id = str(payload.get("timezone") or "").strip()
+                offset_min = js_timezone_offset_min(timezone_id)
+                if offset_min is None:
+                    timezone_id = ""
         except Exception as exc:  # noqa: BLE001
             logger.warning({"event": "sentinel_solver_health_error", "error": str(exc)})
-        ttl = USER_AGENT_CACHE_SECONDS if value else USER_AGENT_FAILURE_CACHE_SECONDS
-        _user_agent_cache.update(url=base_url, value=value, expires_at=now + ttl)
-        return value
+        ttl = USER_AGENT_CACHE_SECONDS if value or timezone_id else USER_AGENT_FAILURE_CACHE_SECONDS
+        _user_agent_cache.update(
+            url=base_url,
+            value=value,
+            timezone=timezone_id,
+            timezone_offset_min=offset_min,
+            expires_at=now + ttl,
+        )
+        return value, timezone_id, offset_min
+
+
+def solver_user_agent() -> str:
+    """User agent of the page that computes the Turnstile token, or "" when unset.
+
+    The requirements/proof tokens embed the UA, and it has to match the browser
+    environment that solved the challenge; otherwise the conversation endpoint
+    answers `404 {"detail": "Model not found"}`.
+    """
+    value, _, _ = _cached_solver_health()
+    return value
+
+
+def solver_timezone() -> tuple[str, int] | None:
+    """Timezone of the solver page, which follows the browser egress IP.
+
+    The conversation payload has to report the same zone and JS offset as that
+    page. Returns None when the solver is unset or its zone is not usable.
+    """
+    _, timezone_id, offset_min = _cached_solver_health()
+    if not timezone_id or offset_min is None:
+        return None
+    return timezone_id, offset_min
 
 
 def solve_turnstile(dx: str, p: str, requirements: dict | None = None) -> str:

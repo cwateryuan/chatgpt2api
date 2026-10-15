@@ -39,7 +39,8 @@ services:
     environment:
       # 浏览器访问 chatgpt.com 的代理，出口应与主服务一致
       - SENTINEL_SOLVER_PROXY=${SENTINEL_SOLVER_PROXY:-http://host.docker.internal:10808}
-      - SENTINEL_SOLVER_TIMEZONE=${SENTINEL_SOLVER_TIMEZONE:-Asia/Shanghai}
+      # 留空时按浏览器代理的出口 IP 自动选时区。显式填写则不再查询。
+      - SENTINEL_SOLVER_TIMEZONE=${SENTINEL_SOLVER_TIMEZONE:-}
       - SENTINEL_SOLVER_KEY=${SENTINEL_SOLVER_KEY:-}
       - PORT=8080
 

@@ -59,7 +59,7 @@ Docker 镜像不包含 Chromium；容器启动时由入口脚本下载完整 Chr
 | `SENTINEL_SOLVER_KEY` | 空 | 访问密钥 |
 | `SENTINEL_SOLVER_PROXY` | 空 | 浏览器出网代理，应与主服务访问 chatgpt.com 的出口一致 |
 | `SENTINEL_SOLVER_USER_AGENT` | 按内置 Chromium 版本生成 | 页面 UA |
-| `SENTINEL_SOLVER_TIMEZONE` | 跟随系统 | 页面时区（如 `Asia/Shanghai`），应与出口 IP 所在地一致 |
+| `SENTINEL_SOLVER_TIMEZONE` | 按出口 IP 自动选择 | 页面时区。留空时经 `SENTINEL_SOLVER_PROXY` 查询出口 IP 并映射成 IANA 时区（Cloudflare WARP 在洛杉矶附近常见 `America/Los_Angeles`）。显式填写则不再查询。`/health` 同时返回 `timezone`、`timezone_source`（`configured` / `egress`）和 `egress_ip`，主服务出图请求使用同一时区和 JS 偏移。 |
 | `SENTINEL_SOLVER_REFRESH_SECONDS` | 1800 | 页面定期重开的间隔 |
 | `SENTINEL_SOLVER_HEADLESS` | true | 调试时可设为 false |
 | `PORT` | 8080 | 监听端口 |
