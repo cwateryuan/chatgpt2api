@@ -16,7 +16,7 @@ from utils.log import logger
 
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 WEB_IMAGE_MODEL_SLUGS = {
-    "gpt-image-2": "gpt-5-3",
+    "gpt-image-2": "gpt-5-3-mini",
     "gpt-image-2.5": "gpt-image-2.5",
     "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare": "gpt-image-2.5-flare",

@@ -149,7 +149,7 @@ class OpenAIBackendImageTimeoutTests(unittest.TestCase):
 
     def test_image_model_slug_maps_web_image_models(self):
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
-        self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-3")
+        self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-3-mini")
         self.assertEqual(backend._image_model_slug("gpt-image-2.5"), "gpt-image-2.5")
         self.assertEqual(backend._image_model_slug("gpt-image-2.5-sunburst"), "gpt-image-2.5-sunburst")
         self.assertEqual(backend._image_model_slug("gpt-image-2.5-flare"), "gpt-image-2.5-flare")
