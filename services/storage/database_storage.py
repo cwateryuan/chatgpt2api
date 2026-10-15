@@ -1113,18 +1113,26 @@ class DatabaseStorageBackend(StorageBackend):
                 "updated_at": timestamp_type,
             },
         }
-        with self.engine.begin() as conn:
-            if "accounts" in table_columns:
-                self._ensure_account_token_schema(conn, dialect, table_columns["accounts"])
-            for table, columns in additions.items():
-                existing = table_columns.get(table)
-                if not existing:
+        def _execute_schema(statement: str, parameters: dict[str, Any] | None = None) -> None:
+            # DDL errors abort the surrounding transaction on PostgreSQL. Commit
+            # each statement so a later index failure cannot roll back a column
+            # that was already added, and so the logged SQL is the one that failed.
+            with self.engine.begin() as conn:
+                conn.execute(text(statement), parameters or {})
+
+        if "accounts" in table_columns:
+            self._ensure_account_token_schema(_execute_schema, dialect, table_columns["accounts"])
+        for table, columns in additions.items():
+            existing = table_columns.get(table)
+            if not existing:
+                continue
+            for column, column_type in columns.items():
+                if column in existing:
                     continue
-                for column, column_type in columns.items():
-                    if column in existing:
-                        continue
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
-            if "accounts" in table_columns:
+                _execute_schema(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+                existing.add(column)
+        if "accounts" in table_columns:
+            with self.engine.begin() as conn:
                 try:
                     rows = conn.execute(text("SELECT id, data FROM accounts WHERE image_quota_unknown IS NULL")).fetchall()
                     for row_id, raw_data in rows:
@@ -1149,35 +1157,43 @@ class DatabaseStorageBackend(StorageBackend):
                 except Exception:
                     pass
 
-            index_specs = [
-                ("idx_accounts_status", "accounts", "status"),
-                ("idx_accounts_source_type", "accounts", "source_type"),
-                ("idx_accounts_type", "accounts", "type"),
-                ("idx_accounts_image_candidates", "accounts", "status, source_type, type, quota"),
-                ("idx_accounts_image_cooldown", "accounts", "image_cooldown_until, access_token_hash"),
-                ("idx_images_date_created_at", "images", "date, created_at"),
-                ("idx_logs_type_time", "logs", "type, time"),
-            ]
-            for index_name, table, columns in index_specs:
-                if table in table_columns:
-                    conn.execute(text(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({columns})"))
+        index_specs = [
+            ("idx_accounts_status", "accounts", "status"),
+            ("idx_accounts_source_type", "accounts", "source_type"),
+            ("idx_accounts_type", "accounts", "type"),
+            ("idx_accounts_image_candidates", "accounts", "status, source_type, type, quota"),
+            ("idx_accounts_image_cooldown", "accounts", "image_cooldown_until, access_token_hash"),
+            ("idx_images_date_created_at", "images", "date, created_at"),
+            ("idx_logs_type_time", "logs", "type, time"),
+        ]
+        for index_name, table, columns in index_specs:
+            if table in table_columns:
+                try:
+                    _execute_schema(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({columns})")
+                except Exception as exc:
+                    logger.warning({
+                        "event": "storage_schema_index_skipped",
+                        "index": index_name,
+                        "error": str(exc),
+                    })
 
-    def _ensure_account_token_schema(self, conn, dialect: str, columns: set[str]) -> None:
+    def _ensure_account_token_schema(self, execute, dialect: str, columns: set[str]) -> None:
         if dialect == "postgresql":
-            conn.execute(text("DROP INDEX IF EXISTS ix_accounts_access_token"))
-            conn.execute(text("DROP INDEX IF EXISTS idx_accounts_access_token"))
-            conn.execute(text("ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_access_token_key"))
-            conn.execute(text("ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT"))
+            execute("DROP INDEX IF EXISTS ix_accounts_access_token")
+            execute("DROP INDEX IF EXISTS idx_accounts_access_token")
+            execute("ALTER TABLE accounts DROP CONSTRAINT IF EXISTS accounts_access_token_key")
+            execute("ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT")
         if "access_token_hash" not in columns:
-            conn.execute(text("ALTER TABLE accounts ADD COLUMN access_token_hash VARCHAR(64)"))
+            execute("ALTER TABLE accounts ADD COLUMN access_token_hash VARCHAR(64)")
             columns.add("access_token_hash")
-        rows = conn.execute(text("SELECT id, access_token FROM accounts WHERE access_token_hash IS NULL OR access_token_hash = ''")).fetchall()
-        for row_id, token in rows:
-            conn.execute(
-                text("UPDATE accounts SET access_token_hash = :token_hash WHERE id = :id"),
-                {"token_hash": _token_hash(token), "id": row_id},
-            )
+        with self.engine.begin() as conn:
+            rows = conn.execute(text("SELECT id, access_token FROM accounts WHERE access_token_hash IS NULL OR access_token_hash = ''")).fetchall()
+            for row_id, token in rows:
+                conn.execute(
+                    text("UPDATE accounts SET access_token_hash = :token_hash WHERE id = :id"),
+                    {"token_hash": _token_hash(token), "id": row_id},
+                )
         try:
-            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_accounts_access_token_hash ON accounts (access_token_hash)"))
+            execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_accounts_access_token_hash ON accounts (access_token_hash)")
         except Exception:
             pass

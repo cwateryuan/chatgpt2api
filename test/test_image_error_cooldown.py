@@ -130,6 +130,16 @@ class ImageErrorCooldownFlowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.generate()[0].kind, "result")
                     self.service.cooldown_image_account.assert_called_once()
 
+    def test_model_not_found_does_not_rotate_accounts(self):
+        self.actions = [UpstreamHTTPError(
+            "/backend-api/f/conversation", 404, {"detail": "Model not found"},
+        )]
+        with self.assertRaises(ImageGenerationError) as caught:
+            self.generate()
+        self.assertEqual(self.visited, ["a"])
+        self.assertIn("Model not found", str(caught.exception))
+        self.service.cooldown_image_account.assert_not_called()
+
     def test_other_messages_do_not_cool_or_retry(self):
         for message in [MESSAGE + " Try later.", MESSAGE.lower(), MESSAGE[:-1], MESSAGE[:-1] + "。",
                         FILE_UPLOAD_MESSAGE + " Try later.", FILE_UPLOAD_MESSAGE.lower(), FILE_UPLOAD_MESSAGE[:-1],

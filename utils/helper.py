@@ -16,7 +16,7 @@ from utils.log import logger
 
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 WEB_IMAGE_MODEL_SLUGS = {
-    "gpt-image-2": "gpt-5-3-mini",
+    "gpt-image-2": "gpt-5-5",
     "gpt-image-2.5": "gpt-image-2.5",
     "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare": "gpt-image-2.5-flare",
@@ -182,14 +182,41 @@ class UpstreamHTTPError(RuntimeError):
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
-def ensure_ok(response: requests.Response, context: str) -> None:
-    if 200 <= response.status_code < 300:
-        return
-    body: Any = response.text
+def _response_error_body(response: requests.Response) -> Any:
+    """Read an error body, including one still buffered by a streaming response.
+
+    curl_cffi leaves ``content`` empty when ``stream=True``. Reading ``text``
+    first therefore turns a real upstream payload such as
+    ``{"detail":"Model not found"}`` into an empty log line.
+    """
+    content = getattr(response, "content", b"") or b""
+    if not content and getattr(response, "queue", None) is not None:
+        chunks: list[bytes] = []
+        try:
+            for chunk in response.iter_content():
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", "replace")
+                if chunk:
+                    chunks.append(chunk)
+        except Exception:
+            pass
+        content = b"".join(chunks)
+        if content:
+            response.content = content
+            if hasattr(response, "_text"):
+                delattr(response, "_text")
+    body: Any = content.decode("utf-8", "replace") if isinstance(content, (bytes, bytearray)) else str(content or "")
     try:
         body = response.json()
     except Exception:
         pass
+    return body
+
+
+def ensure_ok(response: requests.Response, context: str) -> None:
+    if 200 <= response.status_code < 300:
+        return
+    body: Any = _response_error_body(response)
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
     retry_after: int | None = None
     if retry_after_header is not None:

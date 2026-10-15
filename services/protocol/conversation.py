@@ -2339,6 +2339,19 @@ def _generate_single_image(
                         "error": last_error[:200],
                     })
                     continue
+            # A missing model is a request/configuration error. Rotating accounts
+            # sends the same slug again and only hides the upstream detail.
+            if (
+                not emitted_for_token
+                and isinstance(exc, UpstreamHTTPError)
+                and exc.status_code == 404
+                and "model not found" in str(exc).lower()
+            ):
+                raise ImageGenerationError(
+                    image_stream_error_message(last_error),
+                    account_email=account_email,
+                    conversation_id="",
+                ) from exc
             if not emitted_for_token:
                 retry_count += 1
                 if _retry_image_attempt(request, retry_started_at, retry_count):
