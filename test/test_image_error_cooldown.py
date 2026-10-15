@@ -68,6 +68,7 @@ class ImageErrorCooldownFlowTests(unittest.IsolatedAsyncioTestCase):
         self.service.get_available_access_token.side_effect = select
         self.service.get_account.side_effect = lambda token: {"email": f"{token}@example.test"}
         self.service.cooldown_image_account.side_effect = lambda token, **_: self.service.release_image_slot(token)
+        self.service.sideline_image_account.side_effect = lambda token, *_a, **_kw: self.service.release_image_slot(token)
         self.service.mark_image_result.side_effect = lambda token, *_a, **_kw: self.service.release_image_slot(token)
         self.stack.enter_context(patch.object(conversation, "account_service", self.service))
         self.stack.enter_context(patch.object(conversation.proxy_settings, "next_upstream_proxy", return_value=""))
@@ -130,15 +131,18 @@ class ImageErrorCooldownFlowTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.generate()[0].kind, "result")
                     self.service.cooldown_image_account.assert_called_once()
 
-    def test_model_not_found_does_not_rotate_accounts(self):
-        self.actions = [UpstreamHTTPError(
-            "/backend-api/f/conversation", 404, {"detail": "Model not found"},
-        )]
-        with self.assertRaises(ImageGenerationError) as caught:
-            self.generate()
-        self.assertEqual(self.visited, ["a"])
-        self.assertIn("Model not found", str(caught.exception))
+    def test_exact_model_not_found_sidelines_and_tries_another_account(self):
+        self.actions = [
+            UpstreamHTTPError("/backend-api/f/conversation", 404, {"detail": "Model not found"}),
+            [result()],
+        ]
+        self.assertEqual(self.generate()[0].kind, "result")
+        self.assertEqual(self.visited, ["a", "b"])
+        self.service.sideline_image_account.assert_called_once_with(
+            "a", conversation.IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS,
+        )
         self.service.cooldown_image_account.assert_not_called()
+        self.service.mark_image_result.assert_called_once_with("b", True)
 
     def test_other_messages_do_not_cool_or_retry(self):
         for message in [MESSAGE + " Try later.", MESSAGE.lower(), MESSAGE[:-1], MESSAGE[:-1] + "。",

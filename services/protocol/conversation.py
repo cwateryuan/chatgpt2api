@@ -50,6 +50,23 @@ from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
 
 
+IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS = 10 * 60
+
+
+def is_image_model_not_found_error(error: Exception | str) -> bool:
+    """仅匹配图片对话接口返回的精确 Model not found 404。"""
+    if not isinstance(error, UpstreamHTTPError):
+        return False
+    if error.status_code != 404:
+        return False
+    if error.context != "/backend-api/f/conversation":
+        return False
+    body = error.body
+    if not isinstance(body, dict):
+        return False
+    return body.get("detail") == "Model not found"
+
+
 def is_token_invalid_error(message: str) -> bool:
     return is_auth_invalid_error(message)
 
@@ -2236,7 +2253,12 @@ def _generate_single_image(
                         # failed write. Never release it again in finally.
                         slot_released = True
                         raise file_upload_error from exc
-            if not proxy_network_failure and (failure.account_failure or failure.scope != "delivery"):
+            exact_model_not_found = not emitted_for_token and is_image_model_not_found_error(exc)
+            if exact_model_not_found:
+                # Handshake quality is rejected as this exact 404. Keep the account
+                # out of rotation without treating it as quota or validity failure.
+                account_service.sideline_image_account(token, IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS)
+            elif not proxy_network_failure and (failure.account_failure or failure.scope != "delivery"):
                 account_service.mark_image_result(
                     token,
                     False,
@@ -2339,14 +2361,22 @@ def _generate_single_image(
                         "error": last_error[:200],
                     })
                     continue
-            # A missing model is a request/configuration error. Rotating accounts
-            # sends the same slug again and only hides the upstream detail.
-            if (
-                not emitted_for_token
-                and isinstance(exc, UpstreamHTTPError)
-                and exc.status_code == 404
-                and "model not found" in str(exc).lower()
-            ):
+            # Exact Model-not-found is a flagged account, not a bad slug.
+            # The account was already sidelined above; try another one.
+            if exact_model_not_found:
+                slot_released = True
+                excluded_tokens.add(token)
+                retry_count += 1
+                if _retry_image_attempt(request, retry_started_at, retry_count):
+                    logger.warning({
+                        "event": "image_model_not_found_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": retry_count,
+                        "cooldown_secs": IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS,
+                        "index": index,
+                    })
+                    continue
                 raise ImageGenerationError(
                     image_stream_error_message(last_error),
                     account_email=account_email,

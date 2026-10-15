@@ -142,20 +142,29 @@ class OpenAIBackendImageTimeoutTests(unittest.TestCase):
         for payload in (prepare_payload, image_payload):
             self.assertEqual(payload["timezone"], "UTC")
             self.assertEqual(payload["timezone_offset_min"], 0)
-            self.assertEqual(payload["client_contextual_info"]["screen_width"], 1365)
-            self.assertEqual(payload["client_contextual_info"]["page_height"], 681)
+            self.assertEqual(payload["model"], "auto")
+            self.assertEqual(payload["client_contextual_info"]["app_name"], "chatgpt.com")
+        self.assertEqual(image_payload["parent_message_id"], "client-created-root")
+        self.assertEqual(prepare_payload["parent_message_id"], "client-created-root")
+        self.assertEqual(
+            backend.session.post_calls[0][1]["headers"]["X-Oai-Turn-Trace-Id"],
+            backend.session.post_calls[1][1]["headers"]["X-Oai-Turn-Trace-Id"],
+        )
         self.assertEqual(backend.session.headers["OAI-Device-Id"], "browser-device-id")
         self.assertEqual(backend.session.headers["User-Agent"], "Registered Chrome UA")
 
-    def test_image_model_slug_maps_web_image_models(self):
+    def test_image_model_settings_use_server_auto(self):
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
-        self.assertEqual(backend._image_model_slug("gpt-image-2"), "gpt-5-5")
-        self.assertEqual(backend._image_model_slug("gpt-image-2.5"), "gpt-image-2.5")
-        self.assertEqual(backend._image_model_slug("gpt-image-2.5-sunburst"), "gpt-image-2.5-sunburst")
-        self.assertEqual(backend._image_model_slug("gpt-image-2.5-flare"), "gpt-image-2.5-flare")
-        self.assertEqual(backend._image_model_slug("gpt-image-3.0"), "gpt-image-3.0")
-        self.assertEqual(backend._image_model_slug("codex-gpt-image-2"), "codex-gpt-image-2")
-        self.assertEqual(backend._image_model_slug("unknown"), "auto")
+        for model in (
+            "gpt-image-2",
+            "gpt-image-2.5",
+            "gpt-image-2.5-sunburst",
+            "gpt-image-2.5-flare",
+            "gpt-image-3.0",
+            "unknown",
+        ):
+            self.assertEqual(backend._image_model_settings(model), ("auto", ""))
+        self.assertEqual(backend._image_model_settings("codex-gpt-image-2"), ("codex-gpt-image-2", ""))
 
 
 if __name__ == "__main__":

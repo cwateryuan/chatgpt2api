@@ -1,4 +1,3 @@
-import hashlib
 import json
 import random
 import re
@@ -16,6 +15,13 @@ from utils.helper import new_uuid
 CORES = [8, 16, 24, 32]
 DOCUMENT_KEYS = ["__reactContainer$fzelfjyxej8", "_reactListening5dehydibo78", "location"]
 SCREEN_RESOLUTIONS = [[1920, 1080], [1440, 900], [2560, 1440], [3840, 2160]]
+
+# Sentinel proof-of-work: FNV-1a 32-bit with the avalanche finalizer, compared as
+# hex against the difficulty the prepare response hands back. The solved token is
+# base64 of the 25-field config with a "~S" suffix, which is what the current web
+# client emits.
+POW_MAX_ATTEMPTS = 500_000
+POW_ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
 
 class ScriptSrcParser(HTMLParser):
@@ -191,20 +197,33 @@ def build_pow_config(
     ]
 
 
-def _pow_generate(seed: str, difficulty: str, config: list[Any], limit: int = 500000) -> tuple[str, bool]:
-    target = bytes.fromhex(difficulty)
-    diff_len = len(difficulty) // 2
-    seed_bytes = seed.encode()
-    static_1 = (json.dumps(config[:3], separators=(",", ":"), ensure_ascii=False)[:-1] + ",").encode()
-    static_2 = ("," + json.dumps(config[4:9], separators=(",", ":"), ensure_ascii=False)[1:-1] + ",").encode()
-    static_3 = ("," + json.dumps(config[10:], separators=(",", ":"), ensure_ascii=False)[1:]).encode()
+def _fnv1a_32(text: str) -> str:
+    """FNV-1a 32-bit with the avalanche finalizer, rendered as lowercase hex."""
+    h = 2166136261
+    for ch in text:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    h ^= h >> 16
+    h = (h * 2246822507) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * 3266489909) & 0xFFFFFFFF
+    h ^= h >> 16
+    return format(h & 0xFFFFFFFF, "08x")
+
+
+def _pow_generate(seed: str, difficulty: str, config: list[Any], limit: int = POW_MAX_ATTEMPTS) -> tuple[str, bool]:
+    """Solve the sentinel proof: bump the counter until the FNV-1a digest meets the difficulty."""
+    target = str(difficulty or "0")
+    started = time.time()
     for i in range(limit):
-        final_json = static_1 + str(i).encode() + static_2 + str(i >> 1).encode() + static_3
-        encoded = pybase64.b64encode(final_json)
-        digest = hashlib.sha3_512(seed_bytes + encoded).digest()
-        if digest[:diff_len] <= target:
-            return encoded.decode(), True
-    fallback = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + pybase64.b64encode(f'"{seed}"'.encode()).decode()
+        config[3] = i
+        config[9] = round((time.time() - started) * 1000)
+        payload = pybase64.b64encode(
+            json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
+        ).decode()
+        if _fnv1a_32(seed + payload)[: len(target)] <= target:
+            return payload, True
+    fallback = POW_ERROR_PREFIX + pybase64.b64encode(json.dumps(None).encode()).decode()
     return fallback, False
 
 
@@ -230,4 +249,4 @@ def build_proof_token(
     answer, solved = _pow_generate(seed, difficulty, config)
     if not solved:
         raise RuntimeError(f"failed to solve proof token: difficulty={difficulty}")
-    return "gAAAAAB" + answer
+    return "gAAAAAB" + answer + "~S"

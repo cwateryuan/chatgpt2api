@@ -2087,6 +2087,23 @@ class AccountService:
         self.release_image_slot(access_token)
         return dict(account) if account is not None else None
 
+    def sideline_image_account(self, access_token: str, seconds: float) -> dict | None:
+        """Locally pause one account for an exact image Model-not-found 404.
+
+        This does not change quota, validity or proxy health. The handshake fix
+        cannot revive an account that upstream has already flagged.
+        """
+        if not access_token or seconds <= 0:
+            return None
+        started_at = time.time()
+        minutes = max(1, int((seconds + 59) // 60))
+        previous = config.image_account_cooldown_minutes
+        config.data["image_account_cooldown_minutes"] = minutes
+        try:
+            return self.cooldown_image_account(access_token, started_at=started_at)
+        finally:
+            config.data["image_account_cooldown_minutes"] = previous
+
     def mark_image_result(
         self,
         access_token: str,
