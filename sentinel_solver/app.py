@@ -64,13 +64,28 @@ _DISCOVER_TURNSTILE_ASSET = """
 _SCAN_ASSET_IN_SCRIPTS = """
 async (pattern) => {
   const re = new RegExp(pattern);
-  for (const script of Array.from(document.scripts)) {
-    if (!script.src) continue;
+  const seen = new Set();
+  const queue = performance.getEntriesByType('resource').map((entry) => entry.name)
+    .concat(Array.from(document.scripts).map((script) => script.src))
+    .filter(Boolean);
+  const imports = /(?:from|import)\\s*\\(?\\s*["']([^"']+)["']/g;
+  let scanned = 0;
+  while (queue.length && scanned < 180) {
+    const src = queue.shift();
+    if (!src || seen.has(src) || !src.startsWith(location.origin)) continue;
+    seen.add(src);
+    scanned += 1;
+    let text = '';
     try {
-      const text = await (await fetch(script.src)).text();
-      const hit = text.match(re);
-      if (hit) return hit[0];
-    } catch (err) {}
+      text = await (await fetch(src)).text();
+    } catch (err) {
+      continue;
+    }
+    const hit = text.match(re);
+    if (hit) return hit[0].replace(/^['"`]/, '');
+    for (const match of text.matchAll(imports)) {
+      try { queue.push(new URL(match[1], src).href); } catch (err) {}
+    }
   }
   return null;
 }
@@ -83,11 +98,16 @@ async ([requirements, key, asset]) => {
     if (!turnstile || typeof turnstile.getEnforcementToken !== 'function') {
       return 'ERR:getEnforcementToken missing';
     }
-    // The SDK looks its seed up in a WeakMap keyed by the requirements object;
-    // hand it the p token instead.
+    // The SDK stores the requirements seed in its own WeakMap. A blanket override
+    // also hits tokenCache and returns the seed unchanged, so exclude those maps.
     const original = WeakMap.prototype.get;
+    const ignored = new Set([turnstile.tokenCache, turnstile.dxCache]);
     WeakMap.prototype.get = function (target) {
-      return target === requirements ? key : original.call(this, target);
+      if (target === requirements && !ignored.has(this)) {
+        const existing = original.call(this, target);
+        return existing === undefined ? key : existing;
+      }
+      return original.call(this, target);
     };
     try {
       return String(await turnstile.getEnforcementToken(requirements));
