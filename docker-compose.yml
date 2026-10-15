@@ -26,8 +26,28 @@ services:
       timeout: 5s
       retries: 10
 
+  sentinel-solver:
+    build:
+      context: ./sentinel_solver
+      dockerfile: Dockerfile
+    image: chatgpt2api-sentinel-solver:local
+    container_name: chatgpt2api-sentinel-solver
+    restart: unless-stopped
+    shm_size: 1gb
+    volumes:
+      - sentinel_playwright:/ms-playwright
+    environment:
+      # 浏览器访问 chatgpt.com 的代理，出口应与主服务一致
+      - SENTINEL_SOLVER_PROXY=${SENTINEL_SOLVER_PROXY:-http://host.docker.internal:10808}
+      - SENTINEL_SOLVER_TIMEZONE=${SENTINEL_SOLVER_TIMEZONE:-Asia/Shanghai}
+      - SENTINEL_SOLVER_KEY=${SENTINEL_SOLVER_KEY:-}
+      - PORT=8080
+
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatgpt2api:local
     container_name: chatgpt2api
     restart: unless-stopped
     depends_on:
@@ -35,6 +55,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      sentinel-solver:
+        condition: service_started
     ports:
       - "3000:80"
     volumes:
@@ -58,8 +80,12 @@ services:
       - APP_MEMORY_RECYCLE_INTERVAL_SECS=${APP_MEMORY_RECYCLE_INTERVAL_SECS:-30}
       - APP_MEMORY_RECYCLE_MIN_AGE_SECS=${APP_MEMORY_RECYCLE_MIN_AGE_SECS:-300}
       - APP_MEMORY_RECYCLE_REQUIRE_GLOBAL_IDLE=${APP_MEMORY_RECYCLE_REQUIRE_GLOBAL_IDLE:-false}
+      # solver 的容器内地址。不要填 chatgpt.com，也不要填宿主机的 127.0.0.1。
+      - CHATGPT2API_SENTINEL_SOLVER_URL=http://sentinel-solver:8080
+      - CHATGPT2API_SENTINEL_SOLVER_KEY=${SENTINEL_SOLVER_KEY:-}
       # - CHATGPT2API_AUTH_KEY=your_secret_key
       # - CHATGPT2API_BASE_URL=https://your-domain.com
 
 volumes:
   postgres_data:
+  sentinel_playwright:
